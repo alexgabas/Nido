@@ -219,6 +219,8 @@ function mapTransaction(id: string, d: DocumentData): Transaction {
     splitPctA: clampSplitPct(d.splitPctA, 50),
     isSettlement: Boolean(d.isSettlement),
     settlementTo: String(d.settlementTo ?? ''),
+    isPrivate: Boolean(d.isPrivate),
+    createdBy: String(d.createdBy ?? ''),
     notes: String(d.notes ?? ''),
     createdAt: tsToIso(d.createdAt),
     updatedAt: tsToIso(d.updatedAt),
@@ -844,25 +846,41 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
-  subscribeTransactionsByMonth(
+  private subscribeVisibleTransactions(
     householdId: string,
-    monthKey: string,
+    viewerUid: string,
+    predicate: (t: Transaction) => boolean,
     onData: (items: Transaction[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe {
     const path = `households/${householdId}/transactions`;
-    const q = query(
-      collection(db, 'households', householdId, 'transactions'),
-      where('monthKey', '==', monthKey)
-    );
-    return onSnapshot(
-      q,
-      (snap) =>
-        onData(
-          snap.docs
-            .map((d) => mapTransaction(d.id, d.data()))
-            .sort((a, b) => b.date.localeCompare(a.date))
-        ),
+    const colRef = collection(db, 'households', householdId, 'transactions');
+    const sharedMap = new Map<string, Transaction>();
+    const ownMap = new Map<string, Transaction>();
+    let readyShared = false;
+    let readyOwn = !viewerUid;
+
+    const emit = () => {
+      if (!readyShared || !readyOwn) return;
+      const merged = new Map<string, Transaction>(sharedMap);
+      for (const [id, tx] of ownMap) merged.set(id, tx);
+      onData(
+        Array.from(merged.values())
+          .filter((t) => predicate(t) && (!t.isPrivate || t.createdBy === viewerUid))
+          .sort((a, b) => b.date.localeCompare(a.date))
+      );
+    };
+
+    const unsubShared = onSnapshot(
+      query(colRef, where('isPrivate', '==', false)),
+      (snap) => {
+        sharedMap.clear();
+        for (const d of snap.docs) {
+          sharedMap.set(d.id, mapTransaction(d.id, d.data()));
+        }
+        readyShared = true;
+        emit();
+      },
       (err) => {
         try {
           handleFirestoreError(err, OperationType.LIST, path);
@@ -870,35 +888,79 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           onError(wrapped as Error);
         }
       }
+    );
+
+    const unsubOwn = viewerUid
+      ? onSnapshot(
+          query(colRef, where('createdBy', '==', viewerUid)),
+          (snap) => {
+            ownMap.clear();
+            for (const d of snap.docs) {
+              ownMap.set(d.id, mapTransaction(d.id, d.data()));
+            }
+            readyOwn = true;
+            emit();
+          },
+          (err) => {
+            try {
+              handleFirestoreError(err, OperationType.LIST, path);
+            } catch (wrapped) {
+              onError(wrapped as Error);
+            }
+          }
+        )
+      : () => {};
+
+    return () => {
+      unsubShared();
+      unsubOwn();
+    };
+  }
+
+  subscribeTransactionsByMonth(
+    householdId: string,
+    viewerUid: string,
+    monthKey: string,
+    onData: (items: Transaction[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    return this.subscribeVisibleTransactions(
+      householdId,
+      viewerUid,
+      (t) => t.monthKey === monthKey,
+      onData,
+      onError
     );
   }
 
   subscribeTransactionsRecentMonths(
     householdId: string,
+    viewerUid: string,
     minMonthKey: string,
     onData: (items: Transaction[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe {
-    const path = `households/${householdId}/transactions`;
-    const q = query(
-      collection(db, 'households', householdId, 'transactions'),
-      where('monthKey', '>=', minMonthKey)
+    return this.subscribeVisibleTransactions(
+      householdId,
+      viewerUid,
+      (t) => t.monthKey >= minMonthKey,
+      onData,
+      onError
     );
-    return onSnapshot(
-      q,
-      (snap) =>
-        onData(
-          snap.docs
-            .map((d) => mapTransaction(d.id, d.data()))
-            .sort((a, b) => b.date.localeCompare(a.date))
-        ),
-      (err) => {
-        try {
-          handleFirestoreError(err, OperationType.LIST, path);
-        } catch (wrapped) {
-          onError(wrapped as Error);
-        }
-      }
+  }
+
+  subscribeAllTransactions(
+    householdId: string,
+    viewerUid: string,
+    onData: (items: Transaction[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    return this.subscribeVisibleTransactions(
+      householdId,
+      viewerUid,
+      () => true,
+      onData,
+      onError
     );
   }
 
@@ -1453,6 +1515,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
             splitPctA,
             isSettlement: false,
             settlementTo: '',
+            isPrivate: false,
+            createdBy: actor.uid,
             notes: 'Generado desde plantilla recurrente',
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
@@ -1486,17 +1550,18 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const id = tx.id || doc(collection(db, 'households', householdId, 'transactions')).id;
     const path = `households/${householdId}/transactions/${id}`;
     const concept = clampStr(tx.concept, MAX_LENGTHS.concept);
-    const payload = {
+    const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
+    const ownerUid = tx.id ? (tx.createdBy || actor.uid) : actor.uid;
+    const safePaidBy = isPrivate ? ownerUid : normalizePayerValue(tx.paidBy);
+    const basePayload = {
       monthKey: tx.monthKey,
       concept,
       category: tx.category,
       amount: Math.max(0, Number(tx.amount) || 0),
       date: tx.date,
-      paidBy: normalizePayerValue(tx.paidBy),
-      recurringId: tx.recurringId ?? null,
+      paidBy: safePaidBy,
       splitPctA: clampSplitPct(tx.splitPctA, 50),
-      isSettlement: Boolean(tx.isSettlement),
-      settlementTo: tx.settlementTo || '',
+      isPrivate,
       notes: clampStr(tx.notes || '', MAX_LENGTHS.notes),
       updatedAt: serverTimestamp(),
     };
@@ -1504,20 +1569,33 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       const batch = writeBatch(db);
       const ref = doc(db, 'households', householdId, 'transactions', id);
       if (tx.id) {
-        const { recurringId: _r, isSettlement: _s, settlementTo: _st, ...updateFields } = payload;
+        const updateFields = tx.createdBy
+          ? basePayload
+          : { ...basePayload, createdBy: actor.uid };
         batch.update(ref, updateFields);
-        this.addActivityToBatch(batch, householdId, actor, 'update', 'gasto', id, `Editó "${concept}" (${payload.amount} €)`);
+        if (!isPrivate) {
+          this.addActivityToBatch(batch, householdId, actor, 'update', 'gasto', id, `Editó "${concept}" (${basePayload.amount} €)`);
+        }
       } else {
-        batch.set(ref, { ...payload, createdAt: serverTimestamp() });
-        this.addActivityToBatch(
-          batch,
-          householdId,
-          actor,
-          'create',
-          tx.isSettlement ? 'liquidacion' : 'gasto',
-          id,
-          `${tx.isSettlement ? 'Registró liquidación' : 'Añadió gasto'} "${concept}" (${payload.amount} €)`
-        );
+        batch.set(ref, {
+          ...basePayload,
+          recurringId: tx.recurringId ?? null,
+          isSettlement: Boolean(tx.isSettlement),
+          settlementTo: isPrivate ? '' : tx.settlementTo || '',
+          createdBy: actor.uid,
+          createdAt: serverTimestamp(),
+        });
+        if (!isPrivate) {
+          this.addActivityToBatch(
+            batch,
+            householdId,
+            actor,
+            'create',
+            tx.isSettlement ? 'liquidacion' : 'gasto',
+            id,
+            `${tx.isSettlement ? 'Registró liquidación' : 'Añadió gasto'} "${concept}" (${basePayload.amount} €)`
+          );
+        }
       }
       await batch.commit();
       return id;
@@ -1532,6 +1610,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     actor: UserProfileInput
   ): Promise<void> {
     const path = `households/${householdId}/transactions/${tx.id}`;
+    const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
+    const safePaidBy = isPrivate ? actor.uid : normalizePayerValue(tx.paidBy);
     try {
       const batch = writeBatch(db);
       batch.set(doc(db, 'households', householdId, 'transactions', tx.id), {
@@ -1540,16 +1620,20 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         category: tx.category,
         amount: Math.max(0, tx.amount),
         date: tx.date,
-        paidBy: normalizePayerValue(tx.paidBy),
+        paidBy: safePaidBy,
         recurringId: tx.recurringId,
         splitPctA: clampSplitPct(tx.splitPctA, 50),
-        isSettlement: tx.isSettlement,
-        settlementTo: tx.settlementTo,
+        isSettlement: isPrivate ? false : tx.isSettlement,
+        settlementTo: isPrivate ? '' : tx.settlementTo,
+        isPrivate,
+        createdBy: actor.uid,
         notes: clampStr(tx.notes, MAX_LENGTHS.notes),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      this.addActivityToBatch(batch, householdId, actor, 'create', 'gasto', tx.id, `Restauró "${tx.concept}"`);
+      if (!isPrivate) {
+        this.addActivityToBatch(batch, householdId, actor, 'create', 'gasto', tx.id, `Restauró "${tx.concept}"`);
+      }
       await batch.commit();
     } catch (error) {
       handleFirestoreError(error, OperationType.CREATE, path);
@@ -1560,13 +1644,16 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     householdId: string,
     id: string,
     concept: string,
-    actor: UserProfileInput
+    actor: UserProfileInput,
+    options?: { isPrivate?: boolean }
   ): Promise<void> {
     const path = `households/${householdId}/transactions/${id}`;
     try {
       const batch = writeBatch(db);
       batch.delete(doc(db, 'households', householdId, 'transactions', id));
-      this.addActivityToBatch(batch, householdId, actor, 'delete', 'gasto', id, `Eliminó "${concept}"`);
+      if (!options?.isPrivate) {
+        this.addActivityToBatch(batch, householdId, actor, 'delete', 'gasto', id, `Eliminó "${concept}"`);
+      }
       await batch.commit();
     } catch (error) {
       handleFirestoreError(error, OperationType.DELETE, path);
@@ -1575,7 +1662,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
   async deleteTransactionsBulk(
     householdId: string,
-    items: Array<{ id: string; concept: string }>,
+    items: Array<{ id: string; concept: string; isPrivate?: boolean }>,
     actor: UserProfileInput
   ): Promise<void> {
     if (items.length === 0) return;
@@ -1585,19 +1672,22 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         apply: (batch) => batch.delete(doc(db, 'households', householdId, 'transactions', tx.id)),
       })
     );
-    ops.push({
-      path: `households/${householdId}/activity`,
-      apply: (batch) =>
-        this.addActivityToBatch(
-          batch,
-          householdId,
-          actor,
-          'delete',
-          'gasto',
-          items[0].id,
-          `Eliminó ${items.length} movimientos`
-        ),
-    });
+    const publicItems = items.filter((item) => !item.isPrivate);
+    if (publicItems.length > 0) {
+      ops.push({
+        path: `households/${householdId}/activity`,
+        apply: (batch) =>
+          this.addActivityToBatch(
+            batch,
+            householdId,
+            actor,
+            'delete',
+            'gasto',
+            publicItems[0].id,
+            `Eliminó ${publicItems.length} movimientos`
+          ),
+      });
+    }
     await this.commitBatchOps(
       ops,
       OperationType.DELETE,
@@ -1784,16 +1874,31 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
-  async exportBackup(householdId: string): Promise<NidoBackupV1> {
+  private async fetchVisibleTransactionsMap(
+    householdId: string,
+    viewerUid: string
+  ): Promise<Map<string, DocumentData>> {
+    const colRef = collection(db, 'households', householdId, 'transactions');
+    const [sharedSnap, ownSnap] = await Promise.all([
+      getDocs(query(colRef, where('isPrivate', '==', false))),
+      getDocs(query(colRef, where('createdBy', '==', viewerUid))),
+    ]);
+    const map = new Map<string, DocumentData>();
+    for (const d of sharedSnap.docs) map.set(d.id, d.data());
+    for (const d of ownSnap.docs) map.set(d.id, d.data());
+    return map;
+  }
+
+  async exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1> {
     try {
-      const [hSnap, icSnap, clSnap, itSnap, recSnap, txSnap, budSnap, mcSnap, gSnap, gmSnap] =
+      const [hSnap, icSnap, clSnap, itSnap, recSnap, txMap, budSnap, mcSnap, gSnap, gmSnap] =
         await Promise.all([
           getDoc(doc(db, 'households', householdId)),
           getDocs(collection(db, 'households', householdId, 'initialCosts')),
           getDocs(collection(db, 'households', householdId, 'checklist')),
           getDocs(collection(db, 'households', householdId, 'items')),
           getDocs(collection(db, 'households', householdId, 'recurring')),
-          getDocs(collection(db, 'households', householdId, 'transactions')),
+          this.fetchVisibleTransactionsMap(householdId, viewerUid),
           getDocs(collection(db, 'households', householdId, 'budgets')),
           getDocs(collection(db, 'households', householdId, 'monthClosures')),
           getDocs(collection(db, 'households', householdId, 'goals')),
@@ -1830,10 +1935,12 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           const { createdAt: _c, updatedAt: _u, ...rest } = mapRecurring(d.id, d.data());
           return rest;
         }),
-        transactions: txSnap.docs.map((d) => {
-          const { createdAt: _c, updatedAt: _u, ...rest } = mapTransaction(d.id, d.data());
-          return rest;
-        }),
+        transactions: Array.from(txMap.entries())
+          .map(([id, data]) => {
+            const { createdAt: _c, updatedAt: _u, ...rest } = mapTransaction(id, data);
+            return rest;
+          })
+          .filter((t) => !t.isPrivate || t.createdBy === viewerUid),
         budgets: budSnap.docs.map((d) => ({
           monthKey: String(d.data().monthKey ?? d.id),
           limits: (d.data().limits ?? {}) as MonthlyBudget['limits'],
@@ -1871,15 +1978,15 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
   ): Promise<void> {
     const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
 
-    let hSnap, icEx, clEx, itEx, recEx, txEx, budEx, mcEx, gEx, gmEx;
+    let hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx;
     try {
-      [hSnap, icEx, clEx, itEx, recEx, txEx, budEx, mcEx, gEx, gmEx] = await Promise.all([
+      [hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx] = await Promise.all([
         getDoc(doc(db, 'households', householdId)),
         getDocs(collection(db, 'households', householdId, 'initialCosts')),
         getDocs(collection(db, 'households', householdId, 'checklist')),
         getDocs(collection(db, 'households', householdId, 'items')),
         getDocs(collection(db, 'households', householdId, 'recurring')),
-        getDocs(collection(db, 'households', householdId, 'transactions')),
+        this.fetchVisibleTransactionsMap(householdId, actor.uid),
         getDocs(collection(db, 'households', householdId, 'budgets')),
         getDocs(collection(db, 'households', householdId, 'monthClosures')),
         getDocs(collection(db, 'households', householdId, 'goals')),
@@ -1910,7 +2017,6 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const clSet = existsSet(clEx);
     const itSet = existsSet(itEx);
     const recSet = existsSet(recEx);
-    const txSet = existsSet(txEx);
     const budSet = existsSet(budEx);
     const mcSet = existsSet(mcEx);
     const gSet = existsSet(gEx);
@@ -1984,34 +2090,65 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     for (const item of backup.transactions) {
       const { id, ...fields } = item;
-      const safePaidBy = resolvePayer(fields.paidBy);
+      const existingDoc = txExistingMap.get(id);
       const safeSplitPctA = clampSplitPct(fields.splitPctA, 50);
-      const safeSettlementTo = fields.settlementTo ? resolveMemberUid(fields.settlementTo) : '';
       const ref = doc(db, 'households', householdId, 'transactions', id);
-      ops.push({
-        path: `households/${householdId}/transactions/${id}`,
-        apply: (b) =>
-          txSet.has(id)
-            ? b.update(ref, {
-                monthKey: fields.monthKey,
-                concept: fields.concept,
-                category: fields.category,
-                amount: fields.amount,
-                date: fields.date,
-                paidBy: safePaidBy,
-                splitPctA: safeSplitPctA,
-                notes: fields.notes,
-                updatedAt: serverTimestamp(),
-              })
-            : b.set(ref, {
-                ...fields,
-                paidBy: safePaidBy,
-                splitPctA: safeSplitPctA,
-                settlementTo: safeSettlementTo,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              }),
-      });
+      if (existingDoc) {
+        const existingCreatedBy =
+          typeof existingDoc.createdBy === 'string' && existingDoc.createdBy
+            ? existingDoc.createdBy
+            : '';
+        const canBePrivate =
+          Boolean(fields.isPrivate) &&
+          !existingDoc.isSettlement &&
+          (!existingCreatedBy || existingCreatedBy === actor.uid);
+        const safePaidBy = canBePrivate ? actor.uid : resolvePayer(fields.paidBy);
+        ops.push({
+          path: `households/${householdId}/transactions/${id}`,
+          apply: (b) => {
+            const updatePayload: Record<string, unknown> = {
+              monthKey: fields.monthKey,
+              concept: fields.concept,
+              category: canBePrivate && fields.category === 'liquidacion' ? 'otros' : fields.category,
+              amount: fields.amount,
+              date: fields.date,
+              paidBy: safePaidBy,
+              splitPctA: safeSplitPctA,
+              isPrivate: canBePrivate,
+              notes: fields.notes,
+              updatedAt: serverTimestamp(),
+            };
+            if (!existingCreatedBy) {
+              updatePayload.createdBy = actor.uid;
+            }
+            b.update(ref, updatePayload);
+          },
+        });
+      } else {
+        const isPrivate = Boolean(fields.isPrivate) && !fields.isSettlement;
+        const safePaidBy = isPrivate ? actor.uid : resolvePayer(fields.paidBy);
+        const safeSettlementTo = isPrivate
+          ? ''
+          : fields.settlementTo
+            ? resolveMemberUid(fields.settlementTo)
+            : '';
+        ops.push({
+          path: `households/${householdId}/transactions/${id}`,
+          apply: (b) =>
+            b.set(ref, {
+              ...fields,
+              category: isPrivate && fields.category === 'liquidacion' ? 'otros' : fields.category,
+              isSettlement: isPrivate ? false : Boolean(fields.isSettlement),
+              paidBy: safePaidBy,
+              splitPctA: safeSplitPctA,
+              settlementTo: safeSettlementTo,
+              isPrivate,
+              createdBy: actor.uid,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            }),
+        });
+      }
     }
 
     for (const item of backup.budgets) {

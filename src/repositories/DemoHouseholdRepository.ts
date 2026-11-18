@@ -134,15 +134,15 @@ function buildInitialDemoState(): DemoState {
   ];
 
   const transactions: Transaction[] = [
-    { id: 'tx_1', monthKey: currentMonth, concept: 'Alquiler piso', category: 'alquiler', amount: 850, date: clampDateForMonth(currentMonth, 1), paidBy: 'cuenta_comun', recurringId: 'rec_rent', splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_2', monthKey: currentMonth, concept: 'Fibra y móviles', category: 'internet', amount: 48, date: clampDateForMonth(currentMonth, 5), paidBy: uidA, recurringId: 'rec_fiber', splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_3', monthKey: currentMonth, concept: 'Compra semanal Bonpreu', category: 'supermercado', amount: 142.6, date: clampDateForMonth(currentMonth, 8), paidBy: uidA, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_4', monthKey: currentMonth, concept: 'Frutería y mercado', category: 'supermercado', amount: 64.2, date: clampDateForMonth(currentMonth, 14), paidBy: uidB, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_5', monthKey: currentMonth, concept: 'Cena cava Sant Sadurní', category: 'ocio', amount: 56, date: clampDateForMonth(currentMonth, 16), paidBy: uidA, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_p1', monthKey: prevMonth, concept: 'Alquiler piso', category: 'alquiler', amount: 850, date: clampDateForMonth(prevMonth, 1), paidBy: 'cuenta_comun', recurringId: 'rec_rent', splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_p2', monthKey: prevMonth, concept: 'Compra mensual', category: 'supermercado', amount: 310, date: clampDateForMonth(prevMonth, 10), paidBy: uidB, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_p3', monthKey: prevMonth2, concept: 'Alquiler piso', category: 'alquiler', amount: 850, date: clampDateForMonth(prevMonth2, 1), paidBy: 'cuenta_comun', recurringId: 'rec_rent', splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'tx_p4', monthKey: prevMonth2, concept: 'Supermercado', category: 'supermercado', amount: 265, date: clampDateForMonth(prevMonth2, 11), paidBy: uidA, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_1', monthKey: currentMonth, concept: 'Alquiler piso', category: 'alquiler', amount: 850, date: clampDateForMonth(currentMonth, 1), paidBy: 'cuenta_comun', recurringId: 'rec_rent', splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_2', monthKey: currentMonth, concept: 'Fibra y móviles', category: 'internet', amount: 48, date: clampDateForMonth(currentMonth, 5), paidBy: uidA, recurringId: 'rec_fiber', splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_3', monthKey: currentMonth, concept: 'Compra semanal Bonpreu', category: 'supermercado', amount: 142.6, date: clampDateForMonth(currentMonth, 8), paidBy: uidA, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_4', monthKey: currentMonth, concept: 'Frutería y mercado', category: 'supermercado', amount: 64.2, date: clampDateForMonth(currentMonth, 14), paidBy: uidB, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidB, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_5', monthKey: currentMonth, concept: 'Cena cava Sant Sadurní', category: 'ocio', amount: 56, date: clampDateForMonth(currentMonth, 16), paidBy: uidA, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_p1', monthKey: prevMonth, concept: 'Alquiler piso', category: 'alquiler', amount: 850, date: clampDateForMonth(prevMonth, 1), paidBy: 'cuenta_comun', recurringId: 'rec_rent', splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_p2', monthKey: prevMonth, concept: 'Compra mensual', category: 'supermercado', amount: 310, date: clampDateForMonth(prevMonth, 10), paidBy: uidB, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidB, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_p3', monthKey: prevMonth2, concept: 'Alquiler piso', category: 'alquiler', amount: 850, date: clampDateForMonth(prevMonth2, 1), paidBy: 'cuenta_comun', recurringId: 'rec_rent', splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'tx_p4', monthKey: prevMonth2, concept: 'Supermercado', category: 'supermercado', amount: 265, date: clampDateForMonth(prevMonth2, 11), paidBy: uidA, recurringId: null, splitPctA: 55, isSettlement: false, settlementTo: '', isPrivate: false, createdBy: uidA, notes: '', createdAt: ts, updatedAt: ts },
   ];
 
   const goals: SavingsGoal[] = DEFAULT_GOALS.map((g, idx) => ({
@@ -228,6 +228,19 @@ export class DemoHouseholdRepository implements HouseholdRepository {
           loaded.initialCosts = loaded.initialCosts.map((ic) => ({
             ...ic,
             paidBy: ic.paidBy === 'comun' ? COMMON_ACCOUNT_ID : ic.paidBy,
+          }));
+        }
+        if (loaded && Array.isArray(loaded.transactions)) {
+          loaded.transactions = loaded.transactions.map((tx) => ({
+            ...tx,
+            paidBy: tx.paidBy === 'comun' ? COMMON_ACCOUNT_ID : tx.paidBy,
+            isPrivate: Boolean(tx.isPrivate),
+            createdBy:
+              typeof tx.createdBy === 'string' && tx.createdBy
+                ? tx.createdBy
+                : tx.paidBy === 'demo_marta'
+                  ? 'demo_marta'
+                  : 'demo_alex',
           }));
         }
       }
@@ -427,13 +440,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
 
   subscribeTransactionsByMonth(
     _hid: string,
+    viewerUid: string,
     monthKey: string,
     onData: (items: Transaction[]) => void
   ): Unsubscribe {
     return this.subscribe(() =>
       onData(
         this.state.transactions
-          .filter((t) => t.monthKey === monthKey)
+          .filter((t) => t.monthKey === monthKey && (!t.isPrivate || t.createdBy === viewerUid))
           .sort((a, b) => b.date.localeCompare(a.date))
       )
     );
@@ -441,13 +455,28 @@ export class DemoHouseholdRepository implements HouseholdRepository {
 
   subscribeTransactionsRecentMonths(
     _hid: string,
+    viewerUid: string,
     minMonthKey: string,
     onData: (items: Transaction[]) => void
   ): Unsubscribe {
     return this.subscribe(() =>
       onData(
         this.state.transactions
-          .filter((t) => t.monthKey >= minMonthKey)
+          .filter((t) => t.monthKey >= minMonthKey && (!t.isPrivate || t.createdBy === viewerUid))
+          .sort((a, b) => b.date.localeCompare(a.date))
+      )
+    );
+  }
+
+  subscribeAllTransactions(
+    _hid: string,
+    viewerUid: string,
+    onData: (items: Transaction[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        this.state.transactions
+          .filter((t) => !t.isPrivate || t.createdBy === viewerUid)
           .sort((a, b) => b.date.localeCompare(a.date))
       )
     );
@@ -694,6 +723,8 @@ export class DemoHouseholdRepository implements HouseholdRepository {
             : clampSplitPct(defaultSplitPctA, 50),
         isSettlement: false,
         settlementTo: '',
+        isPrivate: false,
+        createdBy: actor.uid,
         notes: 'Generado desde plantilla recurrente',
         createdAt: now,
         updatedAt: now,
@@ -717,57 +748,95 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   ): Promise<string> {
     const now = new Date().toISOString();
     const id = tx.id || `tx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
+    const ownerUid = tx.id ? (tx.createdBy || actor.uid) : actor.uid;
     const normalizedTx = {
       ...tx,
       splitPctA: clampSplitPct(tx.splitPctA, 50),
-      paidBy: tx.paidBy === 'comun' || !tx.paidBy ? COMMON_ACCOUNT_ID : tx.paidBy,
+      isPrivate,
+      createdBy: ownerUid,
+      paidBy: isPrivate
+        ? ownerUid
+        : tx.paidBy === 'comun' || !tx.paidBy
+          ? COMMON_ACCOUNT_ID
+          : tx.paidBy,
+      settlementTo: isPrivate ? '' : tx.settlementTo,
     };
     if (tx.id) {
       this.state.transactions = this.state.transactions.map((t) =>
         t.id === id ? { ...t, ...normalizedTx, id, updatedAt: now } : t
       );
-      this.logActivity(actor, 'update', 'gasto', id, `Editó "${tx.concept}" (${tx.amount} €)`);
+      if (!isPrivate) {
+        this.logActivity(actor, 'update', 'gasto', id, `Editó "${tx.concept}" (${tx.amount} €)`);
+      }
     } else {
       this.state.transactions.push({ ...normalizedTx, id, createdAt: now, updatedAt: now });
-      this.logActivity(
-        actor,
-        'create',
-        tx.isSettlement ? 'liquidacion' : 'gasto',
-        id,
-        `${tx.isSettlement ? 'Registró liquidación' : 'Añadió gasto'} "${tx.concept}" (${tx.amount} €)`
-      );
+      if (!isPrivate) {
+        this.logActivity(
+          actor,
+          'create',
+          tx.isSettlement ? 'liquidacion' : 'gasto',
+          id,
+          `${tx.isSettlement ? 'Registró liquidación' : 'Añadió gasto'} "${tx.concept}" (${tx.amount} €)`
+        );
+      }
     }
     this.emit();
     return id;
   }
 
   async restoreTransaction(_hid: string, tx: Transaction, actor: UserProfileInput): Promise<void> {
-    this.state.transactions.push(tx);
-    this.logActivity(actor, 'create', 'gasto', tx.id, `Restauró "${tx.concept}"`);
+    const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
+    const restored: Transaction = {
+      ...tx,
+      isPrivate,
+      createdBy: tx.createdBy || actor.uid,
+      paidBy: isPrivate ? (tx.createdBy || actor.uid) : tx.paidBy,
+    };
+    this.state.transactions.push(restored);
+    if (!isPrivate) {
+      this.logActivity(actor, 'create', 'gasto', tx.id, `Restauró "${tx.concept}"`);
+    }
     this.emit();
   }
 
-  async deleteTransaction(_hid: string, id: string, concept: string, actor: UserProfileInput): Promise<void> {
+  async deleteTransaction(
+    _hid: string,
+    id: string,
+    concept: string,
+    actor: UserProfileInput,
+    options?: { isPrivate?: boolean }
+  ): Promise<void> {
+    const existing = this.state.transactions.find((t) => t.id === id);
+    const wasPrivate = options?.isPrivate ?? Boolean(existing?.isPrivate);
     this.state.transactions = this.state.transactions.filter((t) => t.id !== id);
-    this.logActivity(actor, 'delete', 'gasto', id, `Eliminó "${concept}"`);
+    if (!wasPrivate) {
+      this.logActivity(actor, 'delete', 'gasto', id, `Eliminó "${concept}"`);
+    }
     this.emit();
   }
 
   async deleteTransactionsBulk(
     _hid: string,
-    items: Array<{ id: string; concept: string }>,
+    items: Array<{ id: string; concept: string; isPrivate?: boolean }>,
     actor: UserProfileInput
   ): Promise<void> {
     if (items.length === 0) return;
     const ids = new Set(items.map((tx) => tx.id));
+    const publicItems = items.filter((item) => {
+      const existing = this.state.transactions.find((t) => t.id === item.id);
+      return !(item.isPrivate ?? existing?.isPrivate);
+    });
     this.state.transactions = this.state.transactions.filter((t) => !ids.has(t.id));
-    this.logActivity(
-      actor,
-      'delete',
-      'gasto',
-      items[0].id,
-      `Eliminó ${items.length} movimientos`
-    );
+    if (publicItems.length > 0) {
+      this.logActivity(
+        actor,
+        'delete',
+        'gasto',
+        publicItems[0].id,
+        `Eliminó ${publicItems.length} movimientos`
+      );
+    }
     this.emit();
   }
 
@@ -861,7 +930,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
-  async exportBackup(): Promise<NidoBackupV1> {
+  async exportBackup(_hid: string, viewerUid: string): Promise<NidoBackupV1> {
     return {
       schemaVersion: 1,
       app: 'nido',
@@ -872,7 +941,9 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       checklist: this.state.checklist.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       items: this.state.items.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       recurring: this.state.recurring.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
-      transactions: this.state.transactions.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
+      transactions: this.state.transactions
+        .filter((t) => !t.isPrivate || t.createdBy === viewerUid)
+        .map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       budgets: Object.values(this.state.budgets).map(({ updatedAt: _u, ...r }) => r),
       monthClosures: this.state.monthClosures.map(({ closedAt: _c, ...r }) => r),
       goals: this.state.goals.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
@@ -888,7 +959,21 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.state.checklist = backup.checklist.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.items = backup.items.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.recurring = backup.recurring.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
-    this.state.transactions = backup.transactions.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
+    const preservedPrivateFromPartner = this.state.transactions.filter(
+      (t) => t.isPrivate && t.createdBy !== actor.uid
+    );
+    const importedTxs = backup.transactions.map((c) => ({
+      ...c,
+      isPrivate: Boolean(c.isPrivate),
+      createdBy: c.createdBy || actor.uid,
+      createdAt: now,
+      updatedAt: now,
+    }));
+    const importedIds = new Set(importedTxs.map((t) => t.id));
+    this.state.transactions = [
+      ...preservedPrivateFromPartner.filter((t) => !importedIds.has(t.id)),
+      ...importedTxs,
+    ];
     this.state.budgets = Object.fromEntries(
       backup.budgets.map((b) => [b.monthKey, { ...b, updatedAt: now }])
     );

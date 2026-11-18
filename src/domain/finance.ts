@@ -1,3 +1,4 @@
+import { TRANSACTION_CATEGORY_LABELS } from './presets';
 import type {
   ExpenseCategory,
   FurnitureItem,
@@ -9,7 +10,9 @@ import type {
   RecurrenceFrequency,
   RecurringExpense,
   SavingsGoal,
+  SplitPresetChoice,
   Transaction,
+  TransactionCategory,
 } from '../types/nido';
 
 // ─── Local Calendar Date Helpers (NEVER derive local day from UTC ISO slice) ──
@@ -136,6 +139,47 @@ export function computeEffectiveSplitPctA(settings: HouseholdSettings): number {
   return clampSplitPct(settings.presetA, 50);
 }
 
+export function resolveSplitPctForChoice(
+  choice: SplitPresetChoice,
+  viewerIsMemberA: boolean,
+  effectiveSplitPctA: number,
+  customSplitPctA?: unknown
+): number {
+  switch (choice) {
+    case 'segun_reparto':
+      return clampSplitPct(effectiveSplitPctA, 50);
+    case 'a_medias':
+      return 50;
+    case 'solo_yo':
+      return viewerIsMemberA ? 100 : 0;
+    case 'solo_pareja':
+      return viewerIsMemberA ? 0 : 100;
+    case 'personalizado':
+      return clampSplitPct(customSplitPctA, effectiveSplitPctA);
+  }
+}
+
+export function inferSplitChoice(
+  splitPctA: number,
+  viewerIsMemberA: boolean,
+  effectiveSplitPctA: number
+): SplitPresetChoice {
+  const clean = clampSplitPct(splitPctA, effectiveSplitPctA);
+  if (Math.abs(clean - clampSplitPct(effectiveSplitPctA, 50)) < 0.05) {
+    return 'segun_reparto';
+  }
+  if (Math.abs(clean - 50) < 0.05) {
+    return 'a_medias';
+  }
+  if (clean === 100) {
+    return viewerIsMemberA ? 'solo_yo' : 'solo_pareja';
+  }
+  if (clean === 0) {
+    return viewerIsMemberA ? 'solo_pareja' : 'solo_yo';
+  }
+  return 'personalizado';
+}
+
 // ─── Couple Balance & Settlement Calculation ─────────────────────────────────
 
 export interface CoupleBalanceResult {
@@ -172,6 +216,7 @@ export function calculateCoupleBalance(
   let settlementDeltaA = 0;
 
   for (const tx of transactions) {
+    if (tx.isPrivate) continue;
     const amount = Math.max(0, Number(tx.amount) || 0);
     if (tx.isSettlement) {
       // If A pays settlement to B, A's balance increases (+amount). If B pays A, A's balance decreases (-amount).
@@ -344,6 +389,63 @@ export function getUpcomingCharges(
   return upcoming.sort((a, b) => a.dueDate.localeCompare(b.dueDate)).slice(0, limit);
 }
 
+export function localDaysBetween(fromISO: string, toISO: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromISO) || !/^\d{4}-\d{2}-\d{2}$/.test(toISO)) {
+    return NaN;
+  }
+  const [fy, fm, fd] = fromISO.split('-').map(Number);
+  const [ty, tm, td] = toISO.split('-').map(Number);
+  const fromUtc = Date.UTC(fy, fm - 1, fd);
+  const toUtc = Date.UTC(ty, tm - 1, td);
+  return Math.round((toUtc - fromUtc) / 86_400_000);
+}
+
+export interface UpcomingAlertCharge extends UpcomingCharge {
+  daysUntil: number;
+  alreadyGenerated: boolean;
+}
+
+export function getUpcomingChargesWithinDays(
+  recurringList: RecurringExpense[],
+  todayISO: string,
+  maxDays = 3,
+  transactions: Transaction[] = []
+): UpcomingAlertCharge[] {
+  const currentMonth = todayISO.slice(0, 7);
+  const nextMonth = shiftMonthKey(currentMonth, 1);
+  const existingKeys = new Set(
+    transactions
+      .filter((t) => Boolean(t.recurringId))
+      .map((t) => `${t.monthKey}::${t.recurringId}`)
+  );
+
+  const alerts: UpcomingAlertCharge[] = [];
+  for (const rec of recurringList) {
+    if (!rec.active) continue;
+    const candidates = [currentMonth, nextMonth];
+    for (const targetMonth of candidates) {
+      const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
+      const diff = localDaysBetween(todayISO, dueDate);
+      if (Number.isFinite(diff) && diff >= 0 && diff <= maxDays) {
+        alerts.push({
+          recurringId: rec.id,
+          concept: rec.concept,
+          category: rec.category,
+          amount: rec.amount,
+          dayOfMonth: rec.dayOfMonth,
+          dueDate,
+          frequency: rec.frequency,
+          daysUntil: diff,
+          alreadyGenerated: existingKeys.has(`${targetMonth}::${rec.id}`),
+        });
+        break;
+      }
+    }
+  }
+
+  return alerts.sort((a, b) => a.daysUntil - b.daysUntil || a.dueDate.localeCompare(b.dueDate));
+}
+
 export type BudgetTrafficLight = 'sin_limite' | 'verde' | 'ambar' | 'rojo';
 
 export interface CategoryBudgetProgress {
@@ -360,7 +462,7 @@ export function computeBudgetProgress(
 ): CategoryBudgetProgress[] {
   const spentMap = new Map<ExpenseCategory, number>();
   for (const tx of transactions) {
-    if (tx.isSettlement || tx.category === 'liquidacion') continue;
+    if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
     spentMap.set(tx.category, (spentMap.get(tx.category) ?? 0) + tx.amount);
   }
 
@@ -387,6 +489,183 @@ export function computeBudgetProgress(
   }
 
   return result.sort((a, b) => b.spent - a.spent);
+}
+
+export interface BudgetThresholdAlert {
+  category: ExpenseCategory;
+  spent: number;
+  limit: number;
+  pct: number;
+  exceeded: boolean;
+}
+
+export function getBudgetThresholdAlerts(
+  transactions: Transaction[],
+  budget: MonthlyBudget | null,
+  thresholdPct = 80
+): BudgetThresholdAlert[] {
+  const progress = computeBudgetProgress(transactions, budget);
+  return progress
+    .filter((bp) => bp.limit > 0 && (bp.spent / bp.limit) * 100 > thresholdPct)
+    .map((bp) => ({
+      category: bp.category,
+      spent: bp.spent,
+      limit: bp.limit,
+      pct: Math.round((bp.spent / bp.limit) * 100),
+      exceeded: bp.spent > bp.limit,
+    }))
+    .sort((a, b) => b.spent / b.limit - a.spent / a.limit);
+}
+
+// ─── Global Transaction Search & 6-Month Category Comparison ─────────────────
+
+function normalizeSearchText(val: string): string {
+  return val
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+export interface GlobalSearchCriteria {
+  text: string;
+  amountQuery: string;
+  category: TransactionCategory | 'todas';
+}
+
+export function filterGlobalTransactions(
+  transactions: Transaction[],
+  criteria: GlobalSearchCriteria
+): Transaction[] {
+  const qText = normalizeSearchText(criteria.text);
+  const qAmtRaw = criteria.amountQuery.trim().replace(/\s+/g, '').replace('€', '');
+  const qAmtNormalized = qAmtRaw.replace(',', '.');
+  const qAmtNumeric = qAmtNormalized !== '' ? Number(qAmtNormalized) : NaN;
+  const hasNumericAmt = qAmtNormalized !== '' && Number.isFinite(qAmtNumeric);
+
+  return [...transactions]
+    .filter((tx) => {
+      if (criteria.category !== 'todas' && tx.category !== criteria.category) return false;
+      if (qText) {
+        const hay = normalizeSearchText(
+          `${tx.concept} ${tx.notes} ${TRANSACTION_CATEGORY_LABELS[tx.category] || tx.category}`
+        );
+        if (!hay.includes(qText)) return false;
+      }
+      if (qAmtRaw) {
+        const amtFixedDot = tx.amount.toFixed(2);
+        const amtFixedComma = amtFixedDot.replace('.', ',');
+        const amtRawStr = String(tx.amount);
+        const exactMatch = hasNumericAmt && Math.abs(tx.amount - qAmtNumeric) < 0.005;
+        const partialMatch =
+          amtFixedComma.includes(qAmtRaw.replace('.', ',')) ||
+          amtFixedDot.includes(qAmtNormalized) ||
+          amtRawStr.includes(qAmtNormalized);
+        if (!exactMatch && !partialMatch) return false;
+      }
+      return true;
+    })
+    .sort((a, b) => b.date.localeCompare(a.date));
+}
+
+export type ComparisonDirection = 'up' | 'down' | 'flat';
+
+export interface CategoryComparisonRow {
+  category: ExpenseCategory;
+  current: number;
+  prev: number;
+  avg6: number;
+  vsPrevPct: number | null;
+  vsPrevDir: ComparisonDirection;
+  vsAvg6Pct: number | null;
+  vsAvg6Dir: ComparisonDirection;
+}
+
+export interface CategoryComparisonResult {
+  activePriorMonths: number;
+  rows: CategoryComparisonRow[];
+}
+
+function calcDelta(
+  current: number,
+  baseline: number
+): { pct: number | null; dir: ComparisonDirection } {
+  const diff = roundCents(current - baseline);
+  if (Math.abs(diff) < 0.01) {
+    return { pct: 0, dir: 'flat' };
+  }
+  const dir: ComparisonDirection = diff > 0 ? 'up' : 'down';
+  if (baseline <= 0) {
+    return { pct: null, dir };
+  }
+  const pct = Math.round(((current - baseline) / baseline) * 1000) / 10;
+  return { pct, dir };
+}
+
+export function computeCategoryComparison(
+  transactions: Transaction[],
+  targetMonthKey: string
+): CategoryComparisonResult {
+  const prevMonthKey = shiftMonthKey(targetMonthKey, -1);
+  const prior6Keys = new Set<string>();
+  for (let i = 1; i <= 6; i++) {
+    prior6Keys.add(shiftMonthKey(targetMonthKey, -i));
+  }
+
+  const currentMap = new Map<ExpenseCategory, number>();
+  const prevMap = new Map<ExpenseCategory, number>();
+  const prior6SumMap = new Map<ExpenseCategory, number>();
+  const activeMonthsSet = new Set<string>();
+
+  for (const tx of transactions) {
+    if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
+    const amt = Math.max(0, Number(tx.amount) || 0);
+    const cat = tx.category;
+    if (tx.monthKey === targetMonthKey) {
+      currentMap.set(cat, (currentMap.get(cat) ?? 0) + amt);
+    }
+    if (tx.monthKey === prevMonthKey) {
+      prevMap.set(cat, (prevMap.get(cat) ?? 0) + amt);
+    }
+    if (prior6Keys.has(tx.monthKey)) {
+      prior6SumMap.set(cat, (prior6SumMap.get(cat) ?? 0) + amt);
+      if (amt > 0) activeMonthsSet.add(tx.monthKey);
+    }
+  }
+
+  const activePriorMonths = activeMonthsSet.size;
+  const allCats = new Set<ExpenseCategory>([
+    ...currentMap.keys(),
+    ...prevMap.keys(),
+    ...prior6SumMap.keys(),
+  ]);
+
+  const rows: CategoryComparisonRow[] = [];
+  for (const category of allCats) {
+    const current = roundCents(currentMap.get(category) ?? 0);
+    const prev = roundCents(prevMap.get(category) ?? 0);
+    const sum6 = prior6SumMap.get(category) ?? 0;
+    const avg6 = activePriorMonths > 0 ? roundCents(sum6 / activePriorMonths) : 0;
+
+    if (current === 0 && prev === 0 && avg6 === 0) continue;
+
+    const vsPrev = calcDelta(current, prev);
+    const vsAvg6 = activePriorMonths > 0 ? calcDelta(current, avg6) : { pct: null, dir: current > 0 ? ('up' as const) : ('flat' as const) };
+
+    rows.push({
+      category,
+      current,
+      prev,
+      avg6,
+      vsPrevPct: vsPrev.pct,
+      vsPrevDir: vsPrev.dir,
+      vsAvg6Pct: vsAvg6.pct,
+      vsAvg6Dir: vsAvg6.dir,
+    });
+  }
+
+  rows.sort((a, b) => b.current - a.current || b.avg6 - a.avg6);
+  return { activePriorMonths, rows };
 }
 
 // ─── Mudanza Summaries ───────────────────────────────────────────────────────

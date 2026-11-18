@@ -86,7 +86,9 @@ interface NidoContextValue {
   recurring: RecurringExpense[];
   monthTransactions: Transaction[];
   recentTransactions: Transaction[];
+  allTransactions: Transaction[];
   budget: MonthlyBudget | null;
+  currentMonthBudget: MonthlyBudget | null;
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
@@ -138,7 +140,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [recurring, setRecurring] = useState<RecurringExpense[]>([]);
   const [monthTransactions, setMonthTransactions] = useState<Transaction[]>([]);
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
+  const [allTransactions, setAllTransactions] = useState<Transaction[]>([]);
   const [budget, setBudget] = useState<MonthlyBudget | null>(null);
+  const [currentMonthBudget, setCurrentMonthBudget] = useState<MonthlyBudget | null>(null);
   const [monthClosures, setMonthClosures] = useState<MonthClosure[]>([]);
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
   const [goalMovements, setGoalMovements] = useState<GoalMovement[]>([]);
@@ -263,12 +267,14 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setSeedPending(repo.hasPendingDefaultSeed(householdId));
   }, [householdId, repo]);
 
+  const viewerUid = isDemoMode ? 'demo_alex' : authUser?.uid || '';
+
   // Real-time household & collections subscriptions
   useEffect(() => {
-    if (!householdId) return;
-    if (!isDemoMode && !authUser) return;
+    if (!householdId || !viewerUid) return;
 
-    const minRecentMonth = shiftMonthKey(getCurrentMonthKeyLocal(), -11);
+    const currentMonthKey = getCurrentMonthKeyLocal();
+    const minRecentMonth = shiftMonthKey(currentMonthKey, -11);
     const onErr = (e: Error) => {
       setHouseholdError(
         toUserFriendlyErrorMessage(e, 'No se pudieron sincronizar los datos del hogar.')
@@ -283,7 +289,8 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       repo.subscribeChecklist(householdId, setChecklist, onErr),
       repo.subscribeFurniture(householdId, setFurnitureItems, onErr),
       repo.subscribeRecurring(householdId, setRecurring, onErr),
-      repo.subscribeTransactionsRecentMonths(householdId, minRecentMonth, setRecentTransactions, onErr),
+      repo.subscribeTransactionsRecentMonths(householdId, viewerUid, minRecentMonth, setRecentTransactions, onErr),
+      repo.subscribeBudget(householdId, currentMonthKey, setCurrentMonthBudget, onErr),
       repo.subscribeMonthClosures(householdId, setMonthClosures, onErr),
       repo.subscribeGoals(householdId, setGoals, onErr),
       repo.subscribeGoalMovements(householdId, setGoalMovements, onErr),
@@ -292,12 +299,11 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => {
       for (const u of unsubs) u();
     };
-  }, [householdId, isDemoMode, authUser, repo]);
+  }, [householdId, viewerUid, repo]);
 
   // Month-scoped subscriptions (optimized reads by monthKey)
   useEffect(() => {
-    if (!householdId) return;
-    if (!isDemoMode && !authUser) return;
+    if (!householdId || !viewerUid) return;
 
     const onErr = (e: Error) =>
       setHouseholdError(
@@ -305,6 +311,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       );
     const unsubTx = repo.subscribeTransactionsByMonth(
       householdId,
+      viewerUid,
       selectedMonthKey,
       setMonthTransactions,
       onErr
@@ -314,7 +321,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       unsubTx();
       unsubBudget();
     };
-  }, [householdId, selectedMonthKey, isDemoMode, authUser, repo]);
+  }, [householdId, viewerUid, selectedMonthKey, repo]);
 
   const currentUserProfile: UserProfileInput | null = useMemo(() => {
     if (isDemoMode) {
@@ -342,6 +349,18 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [members, currentUserProfile]);
 
   const uiMode: UiMode = currentMember?.uiMode ?? 'sencillo';
+
+  useEffect(() => {
+    if (!householdId || !viewerUid || uiMode !== 'avanzado') {
+      setAllTransactions([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudo cargar el historial de movimientos.')
+      );
+    return repo.subscribeAllTransactions(householdId, viewerUid, setAllTransactions, onErr);
+  }, [householdId, viewerUid, uiMode, repo]);
 
   const effectiveSplitPctA = useMemo(() => {
     if (!household) return 50;
@@ -468,7 +487,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     recurring,
     monthTransactions,
     recentTransactions,
+    allTransactions,
     budget,
+    currentMonthBudget,
     monthClosures,
     goals,
     goalMovements,

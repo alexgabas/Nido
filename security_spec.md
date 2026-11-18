@@ -7,10 +7,11 @@
 4. **No PII Leakage**: `/users/{uid}` is strictly private (`uid == request.auth.uid`). `/invites/{inviteCode}` forbids `list` queries so invite codes cannot be scraped.
 5. **Non-Negative Financial Amounts & Valid Budgets**: `initialCosts.amount`, `items.unitPrice`, `recurring.amount`, `transactions.amount`, `goals.targetAmount`, and each `budgets/{monthKey}.limits[cat]` must all be `number >= 0`. Budget `limits` keys are restricted to the 13 known `ExpenseCategory` keys. `settings.presetA + settings.presetB == 100` is enforced. Only `goalMovements.amount` (deposits `+` / withdrawals `-`) and `monthClosures.balanceA` may be negative.
 6. **Payer Identity Validation**: `initialCosts.paidBy`, `recurring.paidByDefault`, `transactions.paidBy`, and `goalMovements.by` must be either `'cuenta_comun'` or a UID present in the household's `memberUids`.
-7. **Immutable Audit & Timestamps**: `activity` entries cannot be updated or deleted once written (`uid == request.auth.uid`, `timestamp == request.time`). `createdAt` is immutable on update and validated against `request.time` on create.
-8. **Strict Schema Keys**: Every `create` validates `keys().hasAll(...) && keys().hasOnly(...)`; every `update` validates `diff().affectedKeys().hasOnly(...)` per named action.
+7. **Immutable Audit & Timestamps**: `activity` entries cannot be updated or deleted once written (`uid == request.auth.uid`, `timestamp == request.time`). `createdAt` is immutable on update and validated against `request.time` on create. `transactions.createdBy` is validated against `request.auth.uid` on create and immutable thereafter.
+8. **Private Expenses (`isPrivate` + `createdBy`)**: Transactions with `isPrivate == true` are readable (`get`, `list`), updatable, and deletable ONLY when `resource.data.createdBy == request.auth.uid`. Client queries on `transactions` MUST filter (`isPrivate == false` or `createdBy == request.auth.uid`) so Firestore `list` rules reject unfiltered queries. Private transactions cannot be settlements (`isSettlement == false`, `category != 'liquidacion'`, `settlementTo == ''`) and `paidBy` must equal `createdBy`. Only `createdBy` can mark their own expense as private.
+9. **Strict Schema Keys**: Every `create` validates `keys().hasAll(...) && keys().hasOnly(...)`; every `update` validates `diff().affectedKeys().hasOnly(...)` per named action.
 
-## 2. The "Dirty Dozen" Payloads (Expected: PERMISSION_DENIED)
+## 2. The "Dirty Dozen" + Privacy Payloads (Expected: PERMISSION_DENIED)
 1. **Unauthenticated read/write** on `/households/h1` -> Denied (`request.auth == null`).
 2. **Unverified email spoofing** (`email_verified: false`) writing `/households/h1` -> Denied.
 3. **Non-member read** on `/households/h1/transactions/t1` by UID `intruder` -> Denied (not in `memberUids`).
@@ -23,3 +24,5 @@
 10. **Activity tampering**: Updating or deleting `/households/h1/activity/a1` -> Denied (`allow update, delete: if false`).
 11. **Activity impersonation**: Creating `/households/h1/activity/a1` with `uid: 'other_uid'` -> Denied (`uid == request.auth.uid`).
 12. **Resource poisoning**: Writing `/households/h1/items/{1500_char_id}` or `notes` > 500 chars -> Denied (`isValidId` + `.size()` limits).
+13. **Partner private expense read / unfiltered list**: Partner B calls `get` on Partner A's `isPrivate == true` transaction OR runs an unfiltered `collection('transactions').get()` -> Denied.
+14. **Private expense hijacking / spoofing**: Partner B tries to create a transaction with `createdBy: uid_alex`, flip Partner A's shared transaction to `isPrivate: true`, delete Partner A's private transaction, or mark a private transaction as `paidBy: 'cuenta_comun'` / `isSettlement: true` -> Denied.

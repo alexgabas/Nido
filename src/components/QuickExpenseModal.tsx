@@ -6,6 +6,7 @@ import {
   Delete,
   Droplets,
   Home,
+  Lock,
   ShoppingCart,
   Tag,
   UtensilsCrossed,
@@ -15,10 +16,21 @@ import {
   Zap,
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
-import { clampSplitPct, formatEUR, getTodayLocalISO } from '../domain/finance';
+import {
+  clampSplitPct,
+  formatEUR,
+  getTodayLocalISO,
+  inferSplitChoice,
+  resolveSplitPctForChoice,
+} from '../domain/finance';
 import { EXPENSE_CATEGORY_LABELS } from '../domain/presets';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
-import { COMMON_ACCOUNT_ID, type ExpenseCategory, type Transaction } from '../types/nido';
+import {
+  COMMON_ACCOUNT_ID,
+  type ExpenseCategory,
+  type SplitPresetChoice,
+  type Transaction,
+} from '../types/nido';
 
 interface QuickExpenseModalProps {
   open: boolean;
@@ -43,6 +55,14 @@ const SENCILLO_CATEGORIES: Array<{
 
 const KEYPAD_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', ',', '0', 'BACK'] as const;
 
+const AVANZADO_SPLIT_OPTIONS: Array<{ id: SplitPresetChoice; label: string }> = [
+  { id: 'segun_reparto', label: 'Según reparto' },
+  { id: 'a_medias', label: 'A medias' },
+  { id: 'solo_yo', label: 'Solo yo' },
+  { id: 'solo_pareja', label: 'Solo mi pareja' },
+  { id: 'personalizado', label: 'Personalizado' },
+];
+
 function getInitials(name: string | undefined): string {
   const clean = (name || 'U').trim();
   if (!clean) return 'U';
@@ -59,6 +79,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   const {
     householdId,
     currentUserProfile,
+    currentMember,
     memberA,
     memberB,
     effectiveSplitPctA,
@@ -69,6 +90,10 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     showToast,
   } = useNido();
 
+  const viewerIsMemberA = currentMember
+    ? currentMember.role !== 'member_b'
+    : !memberB || currentUserProfile?.uid !== memberB.uid;
+
   const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
   const [amount, setAmount] = useState('');
   const [concept, setConcept] = useState('');
@@ -76,12 +101,22 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   const [category, setCategory] = useState<ExpenseCategory>('supermercado');
   const [paidBy, setPaidBy] = useState<string>(COMMON_ACCOUNT_ID);
   const [date, setDate] = useState(getTodayLocalISO());
+  const [splitChoice, setSplitChoice] = useState<SplitPresetChoice>('segun_reparto');
   const [splitPctInput, setSplitPctInput] = useState(() => String(effectiveSplitPctA));
+  const [isPrivate, setIsPrivate] = useState(false);
   const [notes, setNotes] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const isSimpleWizard = uiMode === 'sencillo' && !editingTx;
+  const isSimpleEdit = uiMode === 'sencillo' && Boolean(editingTx);
+
+  const createdByPartner = Boolean(
+    editingTx?.id &&
+      editingTx.createdBy &&
+      currentUserProfile?.uid &&
+      editingTx.createdBy !== currentUserProfile.uid
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -89,12 +124,15 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     setWizardStep(1);
     setConceptTouched(false);
     if (editingTx) {
+      const clampedSplit = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
       setAmount(String(editingTx.amount));
       setConcept(editingTx.concept);
       setCategory(editingTx.category === 'liquidacion' ? 'otros' : editingTx.category);
       setPaidBy(editingTx.paidBy === 'comun' ? COMMON_ACCOUNT_ID : editingTx.paidBy);
       setDate(editingTx.date);
-      setSplitPctInput(String(clampSplitPct(editingTx.splitPctA, effectiveSplitPctA)));
+      setSplitPctInput(String(clampedSplit));
+      setSplitChoice(inferSplitChoice(clampedSplit, viewerIsMemberA, effectiveSplitPctA));
+      setIsPrivate(Boolean(editingTx.isPrivate));
       setNotes(editingTx.notes);
     } else {
       const today = getTodayLocalISO();
@@ -104,15 +142,27 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
           : today.startsWith(selectedMonthKey)
             ? today
             : `${selectedMonthKey}-01`;
+      const defaultSplit = clampSplitPct(effectiveSplitPctA, 50);
       setAmount('');
       setConcept(uiMode === 'sencillo' ? EXPENSE_CATEGORY_LABELS.supermercado : '');
       setCategory('supermercado');
       setPaidBy(currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID);
       setDate(defaultDate);
-      setSplitPctInput(String(clampSplitPct(effectiveSplitPctA, 50)));
+      setSplitChoice('segun_reparto');
+      setSplitPctInput(String(defaultSplit));
+      setIsPrivate(false);
       setNotes('');
     }
-  }, [open, editingTx, selectedMonthKey, currentUserProfile, memberA, effectiveSplitPctA, uiMode]);
+  }, [
+    open,
+    editingTx,
+    selectedMonthKey,
+    currentUserProfile,
+    memberA,
+    effectiveSplitPctA,
+    uiMode,
+    viewerIsMemberA,
+  ]);
 
   const appendKeypadChar = (key: string) => {
     setError(null);
@@ -164,7 +214,11 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
 
   const targetDate = isSimpleWizard ? getTodayLocalISO() : date;
   const targetMonthKey = targetDate.slice(0, 7);
-  const isClosed = monthClosures.some((c) => c.monthKey === targetMonthKey);
+  const isTargetClosed = monthClosures.some((c) => c.monthKey === targetMonthKey);
+  const isOriginClosed = Boolean(
+    editingTx && monthClosures.some((c) => c.monthKey === editingTx.monthKey)
+  );
+  const isClosed = isTargetClosed || isOriginClosed;
 
   const numericAmount = Number(amount.replace(',', '.'));
   const hasValidAmount = Number.isFinite(numericAmount) && numericAmount > 0;
@@ -176,6 +230,22 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     }
     setError(null);
     setWizardStep(3);
+  };
+
+  const handleSelectSplitChoice = (choice: SplitPresetChoice) => {
+    setSplitChoice(choice);
+    if (choice !== 'personalizado') {
+      const resolved = resolveSplitPctForChoice(choice, viewerIsMemberA, effectiveSplitPctA);
+      setSplitPctInput(String(resolved));
+    }
+  };
+
+  const handleTogglePrivate = (nextPrivate: boolean) => {
+    if (nextPrivate && createdByPartner) return;
+    setIsPrivate(nextPrivate);
+    if (nextPrivate && currentUserProfile) {
+      setPaidBy(currentUserProfile.uid);
+    }
   };
 
   const saveTransaction = async () => {
@@ -192,24 +262,39 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     if (isClosed) {
       setError(
         uiMode === 'sencillo'
-          ? 'Este mes está cerrado y no admite nuevos gastos.'
-          : `El mes ${targetMonthKey} está cerrado. Desbloquéalo antes para editar.`
+          ? 'Este mes está cerrado y no admite cambios.'
+          : `El mes ${isOriginClosed ? editingTx?.monthKey : targetMonthKey} está cerrado. Desbloquéalo antes para editar.`
       );
       return;
     }
 
     let safeSplitPctA = clampSplitPct(effectiveSplitPctA, 50);
-    if (!isSimpleWizard) {
+    if (isPrivate) {
+      safeSplitPctA = viewerIsMemberA ? 100 : 0;
+    } else if (splitChoice === 'personalizado' && !isSimpleWizard && !isSimpleEdit) {
       const rawSplit = splitPctInput.trim().replace(',', '.');
-      if (rawSplit !== '') {
-        const numSplit = Number(rawSplit);
-        if (!Number.isFinite(numSplit) || numSplit < 0 || numSplit > 100) {
-          setError('El reparto debe estar entre 0 % y 100 %.');
-          return;
-        }
-        safeSplitPctA = clampSplitPct(numSplit, effectiveSplitPctA);
+      if (rawSplit === '') {
+        setError('Introduce un porcentaje entre 0 % y 100 %.');
+        return;
       }
+      const numSplit = Number(rawSplit);
+      if (!Number.isFinite(numSplit) || numSplit < 0 || numSplit > 100) {
+        setError('El reparto debe estar entre 0 % y 100 %.');
+        return;
+      }
+      safeSplitPctA = clampSplitPct(numSplit, effectiveSplitPctA);
+    } else if (isSimpleEdit && splitChoice !== 'segun_reparto' && splitChoice !== 'solo_yo' && editingTx) {
+      safeSplitPctA = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
+    } else {
+      safeSplitPctA = resolveSplitPctForChoice(
+        splitChoice,
+        viewerIsMemberA,
+        effectiveSplitPctA,
+        splitPctInput
+      );
     }
+
+    const safePaidBy = isPrivate ? (editingTx?.createdBy || currentUserProfile.uid) : paidBy;
 
     setSaving(true);
     setError(null);
@@ -223,11 +308,13 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
           category,
           amount: Math.round(numericAmount * 100) / 100,
           date: targetDate,
-          paidBy,
+          paidBy: safePaidBy,
           recurringId: editingTx?.recurringId ?? null,
           splitPctA: safeSplitPctA,
           isSettlement: false,
           settlementTo: '',
+          isPrivate,
+          createdBy: editingTx?.createdBy || currentUserProfile.uid,
           notes: isSimpleWizard ? '' : notes,
         },
         currentUserProfile
@@ -249,12 +336,19 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   const fullNameA = memberA?.displayName?.trim() || 'Alex';
   const fullNameB = memberB?.displayName?.trim() || 'Pareja';
   const shortNameA = fullNameA.split(' ')[0];
+  const shortNameB = fullNameB.split(' ')[0];
+
+  const previewSplitPctA = resolveSplitPctForChoice(
+    splitChoice,
+    viewerIsMemberA,
+    effectiveSplitPctA,
+    splitPctInput
+  );
+  const previewSplitPctB = Math.round((100 - previewSplitPctA) * 10) / 10;
 
   // ─── MODO SENCILLO: FULL-SCREEN 3-STEP WIZARD ──────────────────────────────
   if (isSimpleWizard) {
-    const formattedAmountDisplay = amount
-      ? `${amount.endsWith(',') ? amount : amount} €`
-      : '0 €';
+    const formattedAmountDisplay = amount ? `${amount} €` : '0 €';
 
     return (
       <div
@@ -411,98 +505,145 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           )}
 
-          {/* PASO 3: QUIÉN PAGÓ (2 AVATARES + CUENTA COMÚN) + CONCEPTO OPCIONAL */}
+          {/* PASO 3: QUIÉN PAGÓ + OPCIÓN SECUNDARIA REPARTO/PERSONAL + CONCEPTO */}
           {wizardStep === 3 && (
             <div className="flex-1 flex flex-col justify-between gap-5">
-              <div className="space-y-5">
+              <div className="space-y-4">
                 <div className="text-center space-y-1">
                   <p className="font-mono-num text-lg font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
                     {formatEUR(numericAmount)} · {EXPENSE_CATEGORY_LABELS[category]}
                   </p>
-                  <h2 className="font-display text-2xl font-bold">¿Quién lo ha pagado?</h2>
+                  <h2 className="font-display text-2xl font-bold">
+                    {isPrivate ? 'Gasto solo tuyo' : '¿Quién lo ha pagado?'}
+                  </h2>
                 </div>
 
-                <div className="space-y-3">
-                  {memberA && (
-                    <button
-                      type="button"
-                      onClick={() => setPaidBy(memberA.uid)}
-                      className={`w-full min-h-[72px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
-                        paidBy === memberA.uid
-                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
-                          : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3.5 min-w-0">
-                        {memberA.photoURL ? (
-                          <img
-                            src={memberA.photoURL}
-                            alt={fullNameA}
-                            className="w-11 h-11 rounded-full object-cover shrink-0"
-                          />
-                        ) : (
-                          <span className="w-11 h-11 rounded-full bg-[#0E5A64] text-white text-sm font-bold flex items-center justify-center shrink-0">
-                            {getInitials(fullNameA)}
-                          </span>
+                {!isPrivate && (
+                  <div className="space-y-2.5">
+                    {memberA && (
+                      <button
+                        type="button"
+                        onClick={() => setPaidBy(memberA.uid)}
+                        className={`w-full min-h-[68px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
+                          paidBy === memberA.uid
+                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
+                            : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-3.5 min-w-0">
+                          {memberA.photoURL ? (
+                            <img
+                              src={memberA.photoURL}
+                              alt={fullNameA}
+                              className="w-10 h-10 rounded-full object-cover shrink-0"
+                            />
+                          ) : (
+                            <span className="w-10 h-10 rounded-full bg-[#0E5A64] text-white text-sm font-bold flex items-center justify-center shrink-0">
+                              {getInitials(fullNameA)}
+                            </span>
+                          )}
+                          <span className="text-base font-bold truncate">{fullNameA}</span>
+                        </div>
+                        {paidBy === memberA.uid && (
+                          <Check className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
                         )}
-                        <span className="text-base font-bold truncate">{fullNameA}</span>
-                      </div>
-                      {paidBy === memberA.uid && (
-                        <Check className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
-                      )}
-                    </button>
-                  )}
-
-                  {memberB && (
-                    <button
-                      type="button"
-                      onClick={() => setPaidBy(memberB.uid)}
-                      className={`w-full min-h-[72px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
-                        paidBy === memberB.uid
-                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
-                          : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3.5 min-w-0">
-                        {memberB.photoURL ? (
-                          <img
-                            src={memberB.photoURL}
-                            alt={fullNameB}
-                            className="w-11 h-11 rounded-full object-cover shrink-0"
-                          />
-                        ) : (
-                          <span className="w-11 h-11 rounded-full bg-[#15803D] text-white text-sm font-bold flex items-center justify-center shrink-0">
-                            {getInitials(fullNameB)}
-                          </span>
-                        )}
-                        <span className="text-base font-bold truncate">{fullNameB}</span>
-                      </div>
-                      {paidBy === memberB.uid && (
-                        <Check className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
-                      )}
-                    </button>
-                  )}
-
-                  <button
-                    type="button"
-                    onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
-                    className={`w-full min-h-[72px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
-                      paidBy === COMMON_ACCOUNT_ID
-                        ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
-                        : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-3.5 min-w-0">
-                      <span className="w-11 h-11 rounded-full bg-slate-200 dark:bg-slate-800 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
-                        <Wallet className="w-5 h-5" />
-                      </span>
-                      <span className="text-base font-bold">Cuenta común</span>
-                    </div>
-                    {paidBy === COMMON_ACCOUNT_ID && (
-                      <Check className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
+                      </button>
                     )}
-                  </button>
-                </div>
+
+                    {memberB && (
+                      <button
+                        type="button"
+                        onClick={() => setPaidBy(memberB.uid)}
+                        className={`w-full min-h-[68px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
+                          paidBy === memberB.uid
+                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
+                            : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-3.5 min-w-0">
+                          {memberB.photoURL ? (
+                            <img
+                              src={memberB.photoURL}
+                              alt={fullNameB}
+                              className="w-10 h-10 rounded-full object-cover shrink-0"
+                            />
+                          ) : (
+                            <span className="w-10 h-10 rounded-full bg-[#15803D] text-white text-sm font-bold flex items-center justify-center shrink-0">
+                              {getInitials(fullNameB)}
+                            </span>
+                          )}
+                          <span className="text-base font-bold truncate">{fullNameB}</span>
+                        </div>
+                        {paidBy === memberB.uid && (
+                          <Check className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
+                        )}
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
+                      className={`w-full min-h-[68px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
+                        paidBy === COMMON_ACCOUNT_ID
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
+                          : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3.5 min-w-0">
+                        <span className="w-10 h-10 rounded-full bg-slate-200 dark:bg-slate-800 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+                          <Wallet className="w-5 h-5" />
+                        </span>
+                        <span className="text-base font-bold">Cuenta común</span>
+                      </div>
+                      {paidBy === COMMON_ACCOUNT_ID && (
+                        <Check className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
+                      )}
+                    </button>
+                  </div>
+                )}
+
+                {/* Secondary split option in Sencillo: ONLY "Según reparto" and "Solo yo" */}
+                {!isPrivate && (
+                  <div className="space-y-1.5">
+                    <span className="block text-xs font-semibold text-slate-500 dark:text-slate-400">
+                      ¿Cómo se reparte?
+                    </span>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(
+                        [
+                          { id: 'segun_reparto', label: 'Según reparto' },
+                          { id: 'solo_yo', label: 'Solo yo' },
+                        ] as const
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => handleSelectSplitChoice(opt.id)}
+                          className={`min-h-[44px] px-3 rounded-xl border text-xs font-bold transition-colors ${
+                            splitChoice === opt.id
+                              ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                              : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-slate-600 dark:text-slate-300'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <label className="min-h-[46px] px-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] flex items-center justify-between gap-3 cursor-pointer">
+                  <span className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
+                    <Lock className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>Gasto personal (solo para mí)</span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={isPrivate}
+                    onChange={(e) => handleTogglePrivate(e.target.checked)}
+                    className="w-5 h-5 accent-[#0E5A64]"
+                  />
+                </label>
 
                 <div>
                   <label
@@ -544,7 +685,208 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     );
   }
 
-  // ─── MODO AVANZADO (Y EDICIÓN DE MOVIMIENTOS): MODAL DETALLADO ─────────────
+  // ─── MODO SENCILLO: EDICIÓN SIMPLIFICADA (SIN % NI URL NI CAMPOS TÉCNICOS) ─
+  if (isSimpleEdit) {
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-xs p-0 sm:p-4"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="simple-edit-expense-title"
+      >
+        <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-4 max-h-[92vh] overflow-y-auto">
+          <div className="flex items-center justify-between">
+            <h2 id="simple-edit-expense-title" className="font-display text-lg font-bold">
+              Editar gasto
+            </h2>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Cerrar ventana"
+              className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          {error && (
+            <div role="alert" className="rounded-xl bg-[#DC4C3E]/10 text-[#B42318] dark:text-[#FCA5A5] px-3.5 py-2.5 text-sm">
+              {error}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="simple-edit-amount" className="block text-xs font-medium mb-1">
+                  Importe (€)
+                </label>
+                <input
+                  id="simple-edit-amount"
+                  type="text"
+                  inputMode="decimal"
+                  required
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-xl font-bold"
+                />
+              </div>
+              <div>
+                <label htmlFor="simple-edit-concept" className="block text-xs font-medium mb-1">
+                  Concepto
+                </label>
+                <input
+                  id="simple-edit-concept"
+                  type="text"
+                  required
+                  maxLength={120}
+                  value={concept}
+                  onChange={(e) => setConcept(e.target.value)}
+                  className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label htmlFor="simple-edit-cat" className="block text-xs font-medium mb-1">
+                Categoría
+              </label>
+              <select
+                id="simple-edit-cat"
+                value={category}
+                onChange={(e) => setCategory(e.target.value as ExpenseCategory)}
+                className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              >
+                {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
+                  <option key={cat} value={cat}>
+                    {EXPENSE_CATEGORY_LABELS[cat]}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {!isPrivate && (
+              <>
+                <div>
+                  <span className="block text-xs font-medium mb-1.5">Quién pagó</span>
+                  <div className="grid grid-cols-3 gap-2">
+                    {memberA && (
+                      <button
+                        type="button"
+                        onClick={() => setPaidBy(memberA.uid)}
+                        className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
+                          paidBy === memberA.uid
+                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                            : 'border-slate-200 dark:border-slate-700'
+                        }`}
+                      >
+                        {fullNameA}
+                      </button>
+                    )}
+                    {memberB && (
+                      <button
+                        type="button"
+                        onClick={() => setPaidBy(memberB.uid)}
+                        className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
+                          paidBy === memberB.uid
+                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                            : 'border-slate-200 dark:border-slate-700'
+                        }`}
+                      >
+                        {fullNameB}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
+                      className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
+                        paidBy === COMMON_ACCOUNT_ID
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      Cuenta común
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="block text-xs font-medium mb-1.5">Cómo se reparte</span>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(
+                      [
+                        { id: 'segun_reparto', label: 'Según reparto' },
+                        { id: 'solo_yo', label: 'Solo yo' },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => handleSelectSplitChoice(opt.id)}
+                        className={`min-h-[44px] px-3 rounded-xl border text-xs font-bold ${
+                          splitChoice === opt.id
+                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                            : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+
+            <label
+              className={`min-h-[46px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 ${
+                createdByPartner ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+              }`}
+            >
+              <span className="flex items-center gap-2 text-xs font-semibold">
+                <Lock className="w-4 h-4 text-slate-500 shrink-0" />
+                <span>
+                  {createdByPartner
+                    ? 'Solo quien lo creó puede marcarlo como personal'
+                    : 'Gasto personal (solo visible para mí)'}
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                disabled={createdByPartner}
+                checked={isPrivate}
+                onChange={(e) => handleTogglePrivate(e.target.checked)}
+                className="w-5 h-5 accent-[#0E5A64]"
+              />
+            </label>
+
+            <div>
+              <label htmlFor="simple-edit-date" className="block text-xs font-medium mb-1">
+                Fecha
+              </label>
+              <input
+                id="simple-edit-date"
+                type="date"
+                required
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={saving || isClosed}
+              className="w-full min-h-[48px] rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-50 text-white text-sm font-bold"
+            >
+              {saving ? 'Guardando...' : 'Guardar cambios'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── MODO AVANZADO: MODAL COMPLETO CON REPARTO PUNTUAL Y GASTO PERSONAL ────
   return (
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-xs p-0 sm:p-4"
@@ -631,50 +973,129 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           </div>
 
-          <div>
-            <span className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
-              Quién pagó
-            </span>
-            <div className="grid grid-cols-3 gap-2">
-              {memberA && (
-                <button
-                  type="button"
-                  onClick={() => setPaidBy(memberA.uid)}
-                  className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border transition-colors truncate ${
-                    paidBy === memberA.uid
-                      ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                      : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
-                  }`}
-                >
-                  {fullNameA}
-                </button>
-              )}
-              {memberB && (
-                <button
-                  type="button"
-                  onClick={() => setPaidBy(memberB.uid)}
-                  className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border transition-colors truncate ${
-                    paidBy === memberB.uid
-                      ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                      : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
-                  }`}
-                >
-                  {fullNameB}
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
-                className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border transition-colors truncate ${
-                  paidBy === COMMON_ACCOUNT_ID
-                    ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                    : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
-                }`}
-              >
-                Cuenta común
-              </button>
+          {/* Gasto personal toggle */}
+          <label
+            className={`min-h-[48px] px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/60 flex items-center justify-between gap-3 ${
+              createdByPartner ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+            }`}
+          >
+            <div className="flex items-start gap-2.5 min-w-0">
+              <Lock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-[#0F1F24] dark:text-[#F0F5F6]">
+                  Gasto personal (solo visible para mí)
+                </p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {createdByPartner
+                    ? 'Solo quien creó este gasto puede marcarlo como personal.'
+                    : 'Excluido del reparto, saldos, totales del hogar y exportaciones de tu pareja.'}
+                </p>
+              </div>
             </div>
-          </div>
+            <input
+              type="checkbox"
+              disabled={createdByPartner}
+              checked={isPrivate}
+              onChange={(e) => handleTogglePrivate(e.target.checked)}
+              className="w-5 h-5 accent-[#0E5A64] shrink-0"
+            />
+          </label>
+
+          {!isPrivate && (
+            <>
+              <div>
+                <span className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                  Quién pagó
+                </span>
+                <div className="grid grid-cols-3 gap-2">
+                  {memberA && (
+                    <button
+                      type="button"
+                      onClick={() => setPaidBy(memberA.uid)}
+                      className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border transition-colors truncate ${
+                        paidBy === memberA.uid
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                          : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                      }`}
+                    >
+                      {fullNameA}
+                    </button>
+                  )}
+                  {memberB && (
+                    <button
+                      type="button"
+                      onClick={() => setPaidBy(memberB.uid)}
+                      className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border transition-colors truncate ${
+                        paidBy === memberB.uid
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                          : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                      }`}
+                    >
+                      {fullNameB}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
+                    className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border transition-colors truncate ${
+                      paidBy === COMMON_ACCOUNT_ID
+                        ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                        : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                    }`}
+                  >
+                    Cuenta común
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                    Reparto puntual de este gasto
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                    {shortNameA} {previewSplitPctA}% · {shortNameB} {previewSplitPctB}%
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {AVANZADO_SPLIT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => handleSelectSplitChoice(opt.id)}
+                      className={`min-h-[40px] px-3 rounded-xl text-xs font-semibold border transition-colors ${
+                        splitChoice === opt.id
+                          ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
+                          : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                {splitChoice === 'personalizado' && (
+                  <div className="pt-1">
+                    <label
+                      htmlFor="tx-split"
+                      className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
+                    >
+                      Porcentaje para {shortNameA} (%)
+                    </label>
+                    <input
+                      id="tx-split"
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.5}
+                      value={splitPctInput}
+                      onChange={(e) => setSplitPctInput(e.target.value)}
+                      className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm tabular-nums"
+                    />
+                  </div>
+                )}
+              </div>
+            </>
+          )}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
             <div>
@@ -691,23 +1112,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
               />
             </div>
             <div>
-              <label htmlFor="tx-split" className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
-                Reparto {shortNameA} (%)
-              </label>
-              <input
-                id="tx-split"
-                type="number"
-                min={0}
-                max={100}
-                step={0.5}
-                value={splitPctInput}
-                onChange={(e) => setSplitPctInput(e.target.value)}
-                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm tabular-nums"
-              />
-            </div>
-            <div className="sm:col-span-2">
               <label htmlFor="tx-notes" className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
-                Notas o enlace de ticket (sin subida de archivo)
+                Notas o enlace de ticket
               </label>
               <input
                 id="tx-notes"

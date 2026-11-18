@@ -199,8 +199,8 @@ service cloud.firestore {
     }
 
     function isValidTransaction(data, hid) {
-      return data.keys().hasAll(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'notes', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'notes', 'createdAt', 'updatedAt'])
+      return data.keys().hasAll(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'isPrivate', 'createdBy', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'isPrivate', 'createdBy', 'notes', 'createdAt', 'updatedAt'])
         && isValidMonthKey(data.monthKey)
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
         && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros', 'liquidacion'])
@@ -211,6 +211,9 @@ service cloud.firestore {
         && isFiniteNumber(data.splitPctA) && data.splitPctA >= 0 && data.splitPctA <= 100
         && data.isSettlement is bool
         && (data.settlementTo == '' || (data.settlementTo is string && exists(/databases/$(database)/documents/households/$(hid)) && (data.settlementTo in get(/databases/$(database)/documents/households/$(hid)).data.memberUids)))
+        && data.isPrivate is bool
+        && data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128
+        && (!data.isPrivate || (data.isSettlement == false && data.category != 'liquidacion' && data.settlementTo == '' && data.paidBy == data.createdBy))
         && data.notes is string && data.notes.size() <= 500
         && data.createdAt is timestamp
         && data.updatedAt == request.time;
@@ -465,18 +468,38 @@ service cloud.firestore {
 
       // ─── /households/{hid}/transactions/{txId} ────────────────────────────
       match /transactions/{txId} {
-        allow get: if isValidId(hid) && isValidId(txId) && isHouseholdMember(hid);
-        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow get: if isValidId(hid) && isValidId(txId)
+          && isHouseholdMember(hid)
+          && (!('isPrivate' in existing()) || existing().isPrivate == false || existing().createdBy == request.auth.uid);
+        allow list: if isValidId(hid)
+          && isHouseholdMember(hid)
+          && (resource.data.isPrivate == false || resource.data.createdBy == request.auth.uid);
         allow create: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
           && isValidTransaction(incoming(), hid)
+          && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time;
         allow update: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
           && isValidTransaction(incoming(), hid)
           && incoming().createdAt == existing().createdAt
-          && incoming().diff(existing()).affectedKeys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'splitPctA', 'notes', 'updatedAt']);
-        allow delete: if isValidId(hid) && isValidId(txId) && isHouseholdMember(hid);
+          && (!('isPrivate' in existing()) || existing().isPrivate == false || existing().createdBy == request.auth.uid)
+          && (!incoming().isPrivate || incoming().createdBy == request.auth.uid)
+          && (
+            (
+              ('createdBy' in existing())
+              && incoming().createdBy == existing().createdBy
+              && incoming().diff(existing()).affectedKeys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'splitPctA', 'isPrivate', 'notes', 'updatedAt'])
+            )
+            || (
+              !('createdBy' in existing())
+              && incoming().createdBy == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'splitPctA', 'isPrivate', 'createdBy', 'notes', 'updatedAt'])
+            )
+          );
+        allow delete: if isValidId(hid) && isValidId(txId)
+          && isHouseholdMember(hid)
+          && (!('isPrivate' in existing()) || existing().isPrivate == false || existing().createdBy == request.auth.uid);
       }
 
       // ─── /households/{hid}/budgets/{monthKey} ─────────────────────────────

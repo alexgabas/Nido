@@ -257,6 +257,14 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     if (typeof item.isSettlement !== 'boolean') {
       throw new Error(`isSettlement inválido en transactions[${idx}].`);
     }
+    if (item.isPrivate !== undefined && typeof item.isPrivate !== 'boolean') {
+      throw new Error(`isPrivate inválido en transactions[${idx}].`);
+    }
+    const isPrivate = Boolean(item.isPrivate);
+    const createdBy =
+      item.createdBy !== undefined
+        ? assertStr(item.createdBy, `transactions[${idx}].createdBy`, 128)
+        : '';
     return {
       id: assertStr(item.id, `transactions[${idx}].id`, 128, 1),
       monthKey: assertMonthKey(item.monthKey, `transactions[${idx}].monthKey`),
@@ -272,6 +280,8 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       splitPctA,
       isSettlement: item.isSettlement,
       settlementTo: assertStr(item.settlementTo ?? '', `transactions[${idx}].settlementTo`, 128),
+      isPrivate,
+      createdBy,
       notes: assertStr(item.notes ?? '', `transactions[${idx}].notes`, 500),
     };
   });

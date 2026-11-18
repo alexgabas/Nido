@@ -166,6 +166,13 @@ export interface RecurringExpense {
   updatedAt: string;
 }
 
+export type SplitPresetChoice =
+  | 'segun_reparto'
+  | 'a_medias'
+  | 'solo_yo'
+  | 'solo_pareja'
+  | 'personalizado';
+
 export interface Transaction {
   id: string;
   monthKey: string; // YYYY-MM
@@ -178,6 +185,8 @@ export interface Transaction {
   splitPctA: number;
   isSettlement: boolean;
   settlementTo: string;
+  isPrivate: boolean;
+  createdBy: string; // creator uid
   notes: string;
   createdAt: string;
   updatedAt: string;

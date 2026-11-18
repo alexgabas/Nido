@@ -392,6 +392,16 @@
           "type": "string",
           "maxLength": 128
         },
+        "isPrivate": {
+          "type": "boolean",
+          "description": "True when the expense is personal and visible only to createdBy."
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "UID of the household member who created the transaction."
+        },
         "notes": {
           "type": "string",
           "maxLength": 500
@@ -405,7 +415,7 @@
           "format": "date-time"
         }
       },
-      "required": ["monthKey", "concept", "category", "amount", "date", "paidBy", "recurringId", "splitPctA", "isSettlement", "settlementTo", "notes", "createdAt", "updatedAt"]
+      "required": ["monthKey", "concept", "category", "amount", "date", "paidBy", "recurringId", "splitPctA", "isSettlement", "settlementTo", "isPrivate", "createdBy", "notes", "createdAt", "updatedAt"]
     },
     "MonthlyBudget": {
       "title": "MonthlyBudget",

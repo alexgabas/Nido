@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUpDown,
   CalendarClock,
@@ -9,6 +9,7 @@ import {
   Download,
   FileSpreadsheet,
   Lock,
+  Minus,
   Pencil,
   Plus,
   RefreshCw,
@@ -16,6 +17,8 @@ import {
   Search,
   SlidersHorizontal,
   Trash2,
+  TrendingDown,
+  TrendingUp,
   Unlock,
   X,
 } from 'lucide-react';
@@ -27,15 +30,20 @@ import {
   calculateCoupleBalance,
   clampSplitPct,
   computeBudgetProgress,
+  computeCategoryComparison,
   daysInMonth,
+  filterGlobalTransactions,
   findMissingRecurringForMonth,
   formatCoupleBalanceSecondPerson,
   formatDateES,
   formatEUR,
   formatMonthLabelES,
+  formatPctES,
   getTodayLocalISO,
   monthlyEquivalent,
+  roundCents,
   shiftMonthKey,
+  type ComparisonDirection,
 } from '../domain/finance';
 import {
   EXPENSE_CATEGORY_LABELS,
@@ -71,6 +79,7 @@ export const MensualView: React.FC = () => {
     uiMode,
     recurring,
     monthTransactions,
+    allTransactions,
     budget,
     monthClosures,
     initialCosts,
@@ -91,6 +100,13 @@ export const MensualView: React.FC = () => {
   const [payerFilter, setPayerFilter] = useState<string>('todos');
   const [sortField, setSortField] = useState<TxSortField>('date');
   const [sortAsc, setSortAsc] = useState(false);
+
+  // Avanzado: Global search across all history
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [globalText, setGlobalText] = useState('');
+  const [globalAmount, setGlobalAmount] = useState('');
+  const [globalCategory, setGlobalCategory] = useState<TransactionCategory | 'todas'>('todas');
+  const [globalLimit, setGlobalLimit] = useState(40);
 
   const [selectedTxIds, setSelectedTxIds] = useState<Set<string>>(new Set());
   const [confirmBulkDeleteTx, setConfirmBulkDeleteTx] = useState(false);
@@ -128,6 +144,15 @@ export const MensualView: React.FC = () => {
   const closure = monthClosures.find((c) => c.monthKey === selectedMonthKey) ?? null;
   const isClosed = Boolean(closure);
 
+  const closedMonthKeys = useMemo(
+    () => new Set(monthClosures.map((c) => c.monthKey)),
+    [monthClosures]
+  );
+  const closedMonthKeysRef = useRef<Set<string>>(closedMonthKeys);
+  useEffect(() => {
+    closedMonthKeysRef.current = closedMonthKeys;
+  }, [closedMonthKeys]);
+
   // Reset selections and inline edit if month changes or becomes closed
   useEffect(() => {
     setSelectedTxIds(new Set());
@@ -137,6 +162,16 @@ export const MensualView: React.FC = () => {
   const balance = useMemo(
     () => calculateCoupleBalance(monthTransactions, memberA, memberB),
     [monthTransactions, memberA, memberB]
+  );
+
+  const personalMonthTotal = useMemo(
+    () =>
+      roundCents(
+        monthTransactions
+          .filter((t) => t.isPrivate && !t.isSettlement)
+          .reduce((sum, t) => sum + (Number(t.amount) || 0), 0)
+      ),
+    [monthTransactions]
   );
 
   const secondPersonBalanceText = useMemo(
@@ -153,6 +188,33 @@ export const MensualView: React.FC = () => {
     () => findMissingRecurringForMonth(recurring, monthTransactions, selectedMonthKey),
     [recurring, monthTransactions, selectedMonthKey]
   );
+
+  const hasGlobalCriteria =
+    globalText.trim() !== '' || globalAmount.trim() !== '' || globalCategory !== 'todas';
+
+  const globalResults = useMemo(() => {
+    if (uiMode !== 'avanzado' || !globalSearchOpen) return [];
+    return filterGlobalTransactions(allTransactions, {
+      text: globalText,
+      amountQuery: globalAmount,
+      category: globalCategory,
+    });
+  }, [uiMode, globalSearchOpen, allTransactions, globalText, globalAmount, globalCategory]);
+
+  const globalTotalAmount = useMemo(
+    () =>
+      roundCents(
+        globalResults
+          .filter((t) => !t.isSettlement)
+          .reduce((sum, t) => sum + (Number(t.amount) || 0), 0)
+      ),
+    [globalResults]
+  );
+
+  const categoryComparison = useMemo(() => {
+    if (uiMode !== 'avanzado') return { activePriorMonths: 0, rows: [] };
+    return computeCategoryComparison(allTransactions, selectedMonthKey);
+  }, [uiMode, allTransactions, selectedMonthKey]);
 
   const filteredAndSortedTransactions = useMemo(() => {
     if (uiMode === 'sencillo') return monthTransactions;
@@ -217,7 +279,8 @@ export const MensualView: React.FC = () => {
       showToast('Introduce un concepto e importe válido mayor que 0.');
       return;
     }
-    const splitVal = clampSplitPct(inlineSplitPct, effectiveSplitPctA);
+    const splitVal = tx.isPrivate ? tx.splitPctA : clampSplitPct(inlineSplitPct, effectiveSplitPctA);
+    const safePaidBy = tx.isPrivate ? tx.paidBy : inlinePaidBy;
     try {
       await repo.upsertTransaction(
         householdId,
@@ -225,7 +288,7 @@ export const MensualView: React.FC = () => {
           ...tx,
           concept: inlineConcept.trim(),
           category: inlineCategory,
-          paidBy: inlinePaidBy,
+          paidBy: safePaidBy,
           splitPctA: splitVal,
           amount: Math.round(numericAmt * 100) / 100,
         },
@@ -245,10 +308,9 @@ export const MensualView: React.FC = () => {
       showToast('No puedes eliminar movimientos de un mes cerrado.');
       return;
     }
-    const closedMonthKeys = new Set(monthClosures.map((c) => c.monthKey));
     const deletable = monthTransactions
       .filter((tx) => selectedTxIds.has(tx.id) && !closedMonthKeys.has(tx.monthKey))
-      .map((tx) => ({ id: tx.id, concept: tx.concept }));
+      .map((tx) => ({ id: tx.id, concept: tx.concept, isPrivate: tx.isPrivate }));
     if (deletable.length === 0) return;
 
     try {
@@ -300,6 +362,8 @@ export const MensualView: React.FC = () => {
         splitPctA: effectiveSplitPctA,
         isSettlement: true,
         settlementTo: receiverUid,
+        isPrivate: false,
+        createdBy: currentUserProfile.uid,
         notes: 'Liquidación de saldo entre pareja',
       },
       currentUserProfile
@@ -396,10 +460,20 @@ export const MensualView: React.FC = () => {
     setDeleteTarget(null);
     if (target.kind === 'tx') {
       const backup = { ...target.item };
-      await repo.deleteTransaction(householdId, backup.id, backup.concept, currentUserProfile);
-      scheduleUndo(`Eliminado "${backup.concept}"`, () =>
-        repo.restoreTransaction(householdId, backup, currentUserProfile)
-      );
+      if (closedMonthKeysRef.current.has(backup.monthKey)) {
+        showToast('No puedes eliminar un gasto de un mes cerrado.');
+        return;
+      }
+      await repo.deleteTransaction(householdId, backup.id, backup.concept, currentUserProfile, {
+        isPrivate: backup.isPrivate,
+      });
+      scheduleUndo(`Eliminado "${backup.concept}"`, async () => {
+        if (closedMonthKeysRef.current.has(backup.monthKey)) {
+          showToast('No se puede deshacer: el mes está cerrado.');
+          return;
+        }
+        await repo.restoreTransaction(householdId, backup, currentUserProfile);
+      });
     } else {
       await repo.deleteRecurring(householdId, target.item.id, target.item.concept, currentUserProfile);
       showToast('Plantilla eliminada');
@@ -414,8 +488,8 @@ export const MensualView: React.FC = () => {
         t.concept,
         TRANSACTION_CATEGORY_LABELS[t.category],
         memberLabel(t.paidBy),
-        t.splitPctA,
-        t.isSettlement ? 'Liquidación' : 'Gasto',
+        t.isPrivate ? 'Personal' : t.splitPctA,
+        t.isPrivate ? 'Personal' : t.isSettlement ? 'Liquidación' : 'Gasto',
         t.amount,
       ])
     );
@@ -506,6 +580,11 @@ export const MensualView: React.FC = () => {
           >
             {secondPersonBalanceText}
           </p>
+          {personalMonthTotal > 0 && (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Además llevas {formatEUR(personalMonthTotal)} en gastos personales (solo visibles para ti).
+            </p>
+          )}
         </section>
 
         <section className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
@@ -525,25 +604,46 @@ export const MensualView: React.FC = () => {
               {simpleList.map((tx) => (
                 <li key={tx.id} className="py-3.5 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-bold truncate">{tx.concept}</p>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <p className="text-sm font-bold truncate">{tx.concept}</p>
+                      {tx.isPrivate && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-600 dark:text-slate-300 shrink-0">
+                          <Lock className="w-3 h-3" />
+                          <span>Personal</span>
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {EXPENSE_CATEGORY_LABELS[tx.category === 'liquidacion' ? 'otros' : tx.category]} · Pagó{' '}
-                      {memberLabel(tx.paidBy)}
+                      {EXPENSE_CATEGORY_LABELS[tx.category === 'liquidacion' ? 'otros' : tx.category]}
+                      {tx.isPrivate ? ' · Solo tú' : ` · Pagó ${memberLabel(tx.paidBy)}`}
                     </p>
                   </div>
-                  <div className="flex items-center gap-1 shrink-0">
+                  <div className="flex items-center gap-0.5 shrink-0">
                     <span className="font-mono-num text-base font-bold mr-1">
                       {formatEUR(tx.amount)}
                     </span>
                     {!isClosed && (
-                      <button
-                        type="button"
-                        aria-label={`Eliminar ${tx.concept}`}
-                        onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
-                        className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          aria-label={`Editar ${tx.concept}`}
+                          onClick={() => {
+                            setEditingTx(tx);
+                            setTxModalOpen(true);
+                          }}
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Eliminar ${tx.concept}`}
+                          onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </>
                     )}
                   </div>
                 </li>
@@ -551,6 +651,15 @@ export const MensualView: React.FC = () => {
             </ul>
           )}
         </section>
+
+        <QuickExpenseModal
+          open={txModalOpen}
+          onClose={() => {
+            setTxModalOpen(false);
+            setEditingTx(null);
+          }}
+          editingTx={editingTx}
+        />
 
         <ConfirmDialog
           open={Boolean(deleteTarget)}
@@ -605,6 +714,18 @@ export const MensualView: React.FC = () => {
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            onClick={() => setGlobalSearchOpen((prev) => !prev)}
+            className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+              globalSearchOpen
+                ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
+                : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] hover:bg-slate-50 dark:hover:bg-slate-800'
+            }`}
+          >
+            <Search className="w-4 h-4" />
+            <span>Búsqueda global</span>
+          </button>
+          <button
+            type="button"
             onClick={handleExportCSV}
             className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5"
           >
@@ -645,6 +766,201 @@ export const MensualView: React.FC = () => {
         </div>
       </div>
 
+      {/* Global Search across all history (Modo Avanzado) */}
+      {globalSearchOpen && (
+        <section
+          aria-label="Búsqueda global de gastos"
+          className="rounded-2xl bg-white dark:bg-[#132025] border border-[#0E5A64]/35 dark:border-[#5EEAD4]/30 p-5 space-y-4"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="font-display text-base font-bold">
+                Búsqueda global en todo el historial
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Busca entre {allTransactions.length} movimientos por texto, importe exacto o parcial, y categoría.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {hasGlobalCriteria && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGlobalText('');
+                    setGlobalAmount('');
+                    setGlobalCategory('todas');
+                  }}
+                  className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                >
+                  Limpiar
+                </button>
+              )}
+              <button
+                type="button"
+                aria-label="Cerrar búsqueda global"
+                onClick={() => setGlobalSearchOpen(false)}
+                className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+            <div className="sm:col-span-5">
+              <label htmlFor="global-search-text" className="block text-[11px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                Texto (concepto, nota o categoría)
+              </label>
+              <input
+                id="global-search-text"
+                type="search"
+                value={globalText}
+                onChange={(e) => {
+                  setGlobalText(e.target.value);
+                  setGlobalLimit(40);
+                }}
+                placeholder="Ej. Bonpreu, fianza, cena..."
+                className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F6F8F8] dark:bg-slate-900 text-xs sm:text-sm"
+              />
+            </div>
+            <div className="sm:col-span-3">
+              <label htmlFor="global-search-amount" className="block text-[11px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                Importe (€)
+              </label>
+              <input
+                id="global-search-amount"
+                type="text"
+                inputMode="decimal"
+                value={globalAmount}
+                onChange={(e) => {
+                  setGlobalAmount(e.target.value);
+                  setGlobalLimit(40);
+                }}
+                placeholder="Ej. 142,60"
+                className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F6F8F8] dark:bg-slate-900 font-mono-num text-xs sm:text-sm"
+              />
+            </div>
+            <div className="sm:col-span-4">
+              <label htmlFor="global-search-cat" className="block text-[11px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                Categoría
+              </label>
+              <select
+                id="global-search-cat"
+                value={globalCategory}
+                onChange={(e) => {
+                  setGlobalCategory(e.target.value as TransactionCategory | 'todas');
+                  setGlobalLimit(40);
+                }}
+                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+              >
+                <option value="todas">Todas las categorías</option>
+                {(Object.keys(TRANSACTION_CATEGORY_LABELS) as TransactionCategory[]).map((cat) => (
+                  <option key={cat} value={cat}>
+                    {TRANSACTION_CATEGORY_LABELS[cat]}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {!hasGlobalCriteria ? (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Escribe un texto, un importe o elige una categoría para buscar en todos tus meses.
+            </p>
+          ) : globalResults.length === 0 ? (
+            <p className="text-sm font-medium text-slate-600 dark:text-slate-300 py-3">
+              No se encontraron gastos que coincidan con esos criterios.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs font-semibold text-slate-600 dark:text-slate-300 tabular-nums">
+                {globalResults.length} resultado{globalResults.length === 1 ? '' : 's'} · Suma de gastos:{' '}
+                <strong className="text-[#0E5A64] dark:text-[#5EEAD4]">{formatEUR(globalTotalAmount)}</strong>
+              </p>
+              <ul className="divide-y divide-slate-100 dark:divide-slate-800 max-h-[360px] overflow-y-auto">
+                {globalResults.slice(0, globalLimit).map((tx) => {
+                  const rowClosed = closedMonthKeys.has(tx.monthKey);
+                  return (
+                    <li
+                      key={tx.id}
+                      className="py-3 first:pt-0 last:pb-0 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+                    >
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-semibold text-sm">{tx.concept}</span>
+                          {tx.isPrivate && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                              <Lock className="w-3 h-3" />
+                              <span>Personal</span>
+                            </span>
+                          )}
+                          {rowClosed && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] text-slate-500 dark:text-slate-400">
+                              <Lock className="w-3 h-3" />
+                              <span>Mes cerrado</span>
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          {formatDateES(tx.date)} ({formatMonthLabelES(tx.monthKey)}) ·{' '}
+                          {TRANSACTION_CATEGORY_LABELS[tx.category]} ·{' '}
+                          {tx.isPrivate ? 'Solo tú' : memberLabel(tx.paidBy)}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center justify-between sm:justify-end gap-1.5 shrink-0">
+                        <span className="font-mono-num text-sm font-bold mr-1">
+                          {formatEUR(tx.amount)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedMonthKey(tx.monthKey)}
+                          className="min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800"
+                        >
+                          Ir al mes
+                        </button>
+                        {!rowClosed && !tx.isSettlement && (
+                          <button
+                            type="button"
+                            aria-label={`Editar ${tx.concept}`}
+                            onClick={() => {
+                              setEditingTx(tx);
+                              setTxModalOpen(true);
+                            }}
+                            className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </button>
+                        )}
+                        {!rowClosed && (
+                          <button
+                            type="button"
+                            aria-label={`Eliminar ${tx.concept}`}
+                            onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
+                            className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+              {globalResults.length > globalLimit && (
+                <button
+                  type="button"
+                  onClick={() => setGlobalLimit((n) => n + 40)}
+                  className="min-h-[40px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                >
+                  Mostrar más ({globalResults.length - globalLimit} restantes)
+                </button>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {isClosed && closure && (
         <div className="rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex items-center gap-2.5 text-sm">
           <Lock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
@@ -678,6 +994,11 @@ export const MensualView: React.FC = () => {
               (corresponde {formatEUR(balance.shareB)})
               {balance.paidComun > 0 ? ` · Cuenta común: ${formatEUR(balance.paidComun)}` : ''}
             </p>
+            {personalMonthTotal > 0 && (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Incluye {formatEUR(personalMonthTotal)} en gastos personales tuyos (excluidos del saldo y totales del hogar).
+              </p>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -911,10 +1232,18 @@ export const MensualView: React.FC = () => {
                           />
                         ) : (
                           <div>
-                            <p className="font-semibold">
-                              {tx.concept}
-                              {tx.isSettlement ? ' · Liquidación' : ''}
-                            </p>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <p className="font-semibold">
+                                {tx.concept}
+                                {tx.isSettlement ? ' · Liquidación' : ''}
+                              </p>
+                              {tx.isPrivate && (
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[10px] font-semibold text-slate-600 dark:text-slate-300">
+                                  <Lock className="w-2.5 h-2.5" />
+                                  <span>Personal</span>
+                                </span>
+                              )}
+                            </div>
                             {tx.notes && (
                               <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate max-w-[220px]">
                                 {tx.notes}
@@ -946,7 +1275,7 @@ export const MensualView: React.FC = () => {
                       </td>
 
                       <td className="py-2.5 pr-3 whitespace-nowrap">
-                        {isInline ? (
+                        {isInline && !tx.isPrivate ? (
                           <select
                             aria-label="Editar pagador en línea"
                             value={inlinePaidBy}
@@ -958,12 +1287,12 @@ export const MensualView: React.FC = () => {
                             <option value={COMMON_ACCOUNT_ID}>Cuenta común</option>
                           </select>
                         ) : (
-                          <span>{memberLabel(tx.paidBy)}</span>
+                          <span>{tx.isPrivate ? 'Solo tú' : memberLabel(tx.paidBy)}</span>
                         )}
                       </td>
 
                       <td className="py-2.5 pr-3 text-right whitespace-nowrap tabular-nums">
-                        {isInline ? (
+                        {isInline && !tx.isPrivate ? (
                           <input
                             type="number"
                             aria-label="Editar reparto en línea (%)"
@@ -974,7 +1303,7 @@ export const MensualView: React.FC = () => {
                             onChange={(e) => setInlineSplitPct(e.target.value)}
                             className="w-16 min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-right"
                           />
-                        ) : tx.paidBy === COMMON_ACCOUNT_ID || tx.paidBy === 'comun' ? (
+                        ) : tx.isPrivate || tx.paidBy === COMMON_ACCOUNT_ID || tx.paidBy === 'comun' ? (
                           <span className="text-slate-400">—</span>
                         ) : (
                           <span className="text-slate-500 dark:text-slate-400">
@@ -1028,20 +1357,30 @@ export const MensualView: React.FC = () => {
                           ) : (
                             <div className="inline-flex items-center gap-1">
                               {!tx.isSettlement && (
-                                <button
-                                  type="button"
-                                  aria-label={`Edición rápida de ${tx.concept}`}
-                                  title="Editar en línea (doble clic o lápiz para detalle)"
-                                  onClick={() => startInlineEdit(tx)}
-                                  onDoubleClick={() => {
-                                    setInlineEditId(null);
-                                    setEditingTx(tx);
-                                    setTxModalOpen(true);
-                                  }}
-                                  className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                                >
-                                  <Pencil className="w-4 h-4" />
-                                </button>
+                                <>
+                                  <button
+                                    type="button"
+                                    aria-label={`Editar ${tx.concept}`}
+                                    title="Editar gasto"
+                                    onClick={() => {
+                                      setInlineEditId(null);
+                                      setEditingTx(tx);
+                                      setTxModalOpen(true);
+                                    }}
+                                    className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                  >
+                                    <Pencil className="w-4 h-4" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    aria-label={`Edición rápida en línea de ${tx.concept}`}
+                                    title="Edición rápida en línea"
+                                    onClick={() => startInlineEdit(tx)}
+                                    className="min-h-[36px] px-2 rounded-lg inline-flex items-center justify-center text-[11px] font-semibold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                  >
+                                    Rápido
+                                  </button>
+                                </>
                               )}
                               <button
                                 type="button"
@@ -1183,6 +1522,180 @@ export const MensualView: React.FC = () => {
           )}
         </section>
       </div>
+
+      {/* Category Comparison: Current vs Previous & 6-Month Average (Modo Avanzado) */}
+      <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div>
+            <h2 className="font-display text-base font-bold">Comparativa por categoría</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {formatMonthLabelES(selectedMonthKey)} frente a{' '}
+              {formatMonthLabelES(shiftMonthKey(selectedMonthKey, -1))} y media de{' '}
+              {categoryComparison.activePriorMonths > 0
+                ? `${categoryComparison.activePriorMonths} ${
+                    categoryComparison.activePriorMonths === 1 ? 'mes previo' : 'meses previos'
+                  } (máx. 6)`
+                : '6 meses'}
+              . Excluye gastos personales y liquidaciones.
+            </p>
+          </div>
+        </div>
+
+        {categoryComparison.rows.length === 0 ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            No hay gastos compartidos en este periodo para comparar categorías.
+          </p>
+        ) : (
+          <>
+            {/* Mobile cards */}
+            <div className="grid grid-cols-1 gap-3 md:hidden">
+              {categoryComparison.rows.map((row) => {
+                const renderDeltaChip = (
+                  pct: number | null,
+                  dir: ComparisonDirection,
+                  hasBaseline: boolean
+                ) => {
+                  if (!hasBaseline) {
+                    return <span className="text-[11px] text-slate-400">Sin datos</span>;
+                  }
+                  const color =
+                    dir === 'up'
+                      ? 'text-[#DC4C3E]'
+                      : dir === 'down'
+                        ? 'text-[#15803D] dark:text-[#4ADE80]'
+                        : 'text-slate-500 dark:text-slate-400';
+                  return (
+                    <span className={`inline-flex items-center gap-0.5 text-xs font-bold tabular-nums ${color}`}>
+                      {dir === 'up' ? (
+                        <TrendingUp className="w-3.5 h-3.5" />
+                      ) : dir === 'down' ? (
+                        <TrendingDown className="w-3.5 h-3.5" />
+                      ) : (
+                        <Minus className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {dir === 'up' ? '↑' : dir === 'down' ? '↓' : '='}{' '}
+                        {pct === null
+                          ? 'Nuevo'
+                          : `${pct > 0 ? '+' : ''}${formatPctES(pct)}`}
+                      </span>
+                    </span>
+                  );
+                };
+
+                return (
+                  <div
+                    key={row.category}
+                    className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-bold">{EXPENSE_CATEGORY_LABELS[row.category]}</span>
+                      <span className="font-mono-num text-sm font-bold">{formatEUR(row.current)}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-100 dark:border-slate-800">
+                      <div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Ant. ({formatEUR(row.prev)})
+                        </p>
+                        {renderDeltaChip(row.vsPrevPct, row.vsPrevDir, true)}
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Media 6m ({formatEUR(row.avg6)})
+                        </p>
+                        {renderDeltaChip(
+                          row.vsAvg6Pct,
+                          row.vsAvg6Dir,
+                          categoryComparison.activePriorMonths > 0
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Desktop table */}
+            <div className="hidden md:block overflow-x-auto">
+              <table className="w-full text-left text-xs sm:text-sm border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 text-xs text-slate-500 dark:text-slate-400">
+                    <th className="py-2 pr-3 font-semibold">Categoría</th>
+                    <th className="py-2 pr-3 font-semibold text-right">Este mes</th>
+                    <th className="py-2 pr-3 font-semibold text-right">Mes anterior</th>
+                    <th className="py-2 pr-3 font-semibold text-right">Vs anterior</th>
+                    <th className="py-2 pr-3 font-semibold text-right">Media 6 m.</th>
+                    <th className="py-2 font-semibold text-right">Vs media 6 m.</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {categoryComparison.rows.map((row) => {
+                    const renderDeltaCell = (
+                      pct: number | null,
+                      dir: ComparisonDirection,
+                      hasBaseline: boolean
+                    ) => {
+                      if (!hasBaseline) {
+                        return <span className="text-xs text-slate-400">Sin datos</span>;
+                      }
+                      const color =
+                        dir === 'up'
+                          ? 'text-[#DC4C3E]'
+                          : dir === 'down'
+                            ? 'text-[#15803D] dark:text-[#4ADE80]'
+                            : 'text-slate-500 dark:text-slate-400';
+                      return (
+                        <span className={`inline-flex items-center justify-end gap-1 font-bold tabular-nums ${color}`}>
+                          {dir === 'up' ? (
+                            <TrendingUp className="w-3.5 h-3.5" />
+                          ) : dir === 'down' ? (
+                            <TrendingDown className="w-3.5 h-3.5" />
+                          ) : (
+                            <Minus className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            {dir === 'up' ? '↑' : dir === 'down' ? '↓' : '='}{' '}
+                            {pct === null
+                              ? 'Nuevo'
+                              : `${pct > 0 ? '+' : ''}${formatPctES(pct)}`}
+                          </span>
+                        </span>
+                      );
+                    };
+
+                    return (
+                      <tr key={row.category}>
+                        <td className="py-2.5 pr-3 font-semibold">
+                          {EXPENSE_CATEGORY_LABELS[row.category]}
+                        </td>
+                        <td className="py-2.5 pr-3 text-right font-mono-num font-bold">
+                          {formatEUR(row.current)}
+                        </td>
+                        <td className="py-2.5 pr-3 text-right font-mono-num text-slate-500 dark:text-slate-400">
+                          {formatEUR(row.prev)}
+                        </td>
+                        <td className="py-2.5 pr-3 text-right whitespace-nowrap">
+                          {renderDeltaCell(row.vsPrevPct, row.vsPrevDir, true)}
+                        </td>
+                        <td className="py-2.5 pr-3 text-right font-mono-num text-slate-500 dark:text-slate-400">
+                          {categoryComparison.activePriorMonths > 0 ? formatEUR(row.avg6) : '—'}
+                        </td>
+                        <td className="py-2.5 text-right whitespace-nowrap">
+                          {renderDeltaCell(
+                            row.vsAvg6Pct,
+                            row.vsAvg6Dir,
+                            categoryComparison.activePriorMonths > 0
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </section>
 
       {/* Modals */}
       <QuickExpenseModal

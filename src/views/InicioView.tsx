@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
 import {
+  AlertTriangle,
   ArrowRight,
+  Bell,
   CalendarClock,
   CalendarDays,
   CheckCircle2,
@@ -21,9 +23,12 @@ import {
   formatEUR,
   formatMonthLabelES,
   formatMonthShortES,
+  getBudgetThresholdAlerts,
   getCurrentMonthKeyLocal,
   getTodayLocalISO,
   getUpcomingCharges,
+  getUpcomingChargesWithinDays,
+  localDaysBetween,
   roundCents,
   shiftMonthKey,
 } from '../domain/finance';
@@ -56,7 +61,7 @@ export const InicioView: React.FC = () => {
     setActiveTab,
     selectedMonthKey,
     setSelectedMonthKey,
-    budget,
+    currentMonthBudget,
     recurring,
     recentTransactions,
     checklist,
@@ -102,13 +107,16 @@ export const InicioView: React.FC = () => {
   const savingsBarPct =
     totalSavingsTarget > 0 ? Math.min(100, Math.round((totalSavings / totalSavingsTarget) * 100)) : 0;
 
-  // Monthly planned budget total (for current month when budget subscription matches)
+  // Monthly planned budget total (always uses current month's budget)
   const currentMonthBudgetTotal = useMemo(() => {
-    if (!budget || budget.monthKey !== currentMonthKey) return 0;
+    if (!currentMonthBudget || currentMonthBudget.monthKey !== currentMonthKey) return 0;
     return roundCents(
-      Object.values(budget.limits ?? {}).reduce((sum, v) => sum + Math.max(0, Number(v) || 0), 0)
+      Object.values(currentMonthBudget.limits ?? {}).reduce(
+        (sum, v) => sum + Math.max(0, Number(v) || 0),
+        0
+      )
     );
-  }, [budget, currentMonthKey]);
+  }, [currentMonthBudget, currentMonthKey]);
 
   const spendBarPct =
     currentMonthBudgetTotal > 0
@@ -120,6 +128,24 @@ export const InicioView: React.FC = () => {
     [recurring, todayISO]
   );
 
+  const budgetAlerts = useMemo(
+    () => getBudgetThresholdAlerts(currentMonthTx, currentMonthBudget, 80),
+    [currentMonthTx, currentMonthBudget]
+  );
+
+  const upcoming3Days = useMemo(
+    () => getUpcomingChargesWithinDays(recurring, todayISO, 3, recentTransactions),
+    [recurring, todayISO, recentTransactions]
+  );
+
+  const hasAlerts = budgetAlerts.length > 0 || upcoming3Days.length > 0;
+
+  const formatDaysUntilLabel = (days: number) => {
+    if (days === 0) return 'Hoy';
+    if (days === 1) return 'Mañana';
+    return `En ${days} días`;
+  };
+
   const last12MonthsBars = useMemo(() => {
     const keys: string[] = [];
     for (let i = 11; i >= 0; i--) {
@@ -127,7 +153,7 @@ export const InicioView: React.FC = () => {
     }
     const sums = new Map<string, number>();
     for (const tx of recentTransactions) {
-      if (tx.isSettlement || tx.category === 'liquidacion') continue;
+      if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
       sums.set(tx.monthKey, (sums.get(tx.monthKey) ?? 0) + tx.amount);
     }
     return keys.map((mk) => ({
@@ -140,7 +166,7 @@ export const InicioView: React.FC = () => {
   const categoryDonutSlices = useMemo(() => {
     const map = new Map<ExpenseCategory, number>();
     for (const tx of currentMonthTx) {
-      if (tx.isSettlement || tx.category === 'liquidacion') continue;
+      if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
       const cat = tx.category as ExpenseCategory;
       map.set(cat, (map.get(cat) ?? 0) + tx.amount);
     }
@@ -167,7 +193,7 @@ export const InicioView: React.FC = () => {
     [checklist]
   );
   const currentMonthExpenseCount = useMemo(
-    () => currentMonthTx.filter((t) => !t.isSettlement).length,
+    () => currentMonthTx.filter((t) => !t.isPrivate && !t.isSettlement).length,
     [currentMonthTx]
   );
 
@@ -284,6 +310,64 @@ export const InicioView: React.FC = () => {
             </div>
           )}
         </button>
+
+        {/* Avisos en Inicio (Modo Sencillo) */}
+        {hasAlerts && (
+          <section
+            aria-label="Avisos importantes"
+            className="rounded-3xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 p-5 space-y-3"
+          >
+            <div className="flex items-center gap-2 text-amber-900 dark:text-amber-200">
+              <Bell className="w-5 h-5 shrink-0" />
+              <h2 className="font-display text-base font-bold">Avisos</h2>
+            </div>
+
+            <ul className="space-y-2.5 text-sm text-amber-950 dark:text-amber-100">
+              {budgetAlerts.map((alert) => (
+                <li key={alert.category} className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-300 shrink-0 mt-0.5" />
+                  <span>
+                    {alert.exceeded ? (
+                      <>
+                        Habéis superado el presupuesto de{' '}
+                        <strong>{EXPENSE_CATEGORY_LABELS[alert.category]}</strong> (
+                        {formatEUR(alert.spent)} de {formatEUR(alert.limit)}).
+                      </>
+                    ) : (
+                      <>
+                        Lleváis el <strong>{alert.pct} %</strong> del presupuesto de{' '}
+                        <strong>{EXPENSE_CATEGORY_LABELS[alert.category]}</strong> (
+                        {formatEUR(alert.spent)} de {formatEUR(alert.limit)}).
+                      </>
+                    )}
+                  </span>
+                </li>
+              ))}
+              {upcoming3Days.map((charge) => (
+                <li key={charge.recurringId} className="flex items-start gap-2">
+                  <CalendarClock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0 mt-0.5" />
+                  <span>
+                    <strong>{formatDaysUntilLabel(charge.daysUntil)}</strong> toca pagar{' '}
+                    <strong>{charge.concept}</strong> ({formatEUR(charge.amount)}).
+                    {charge.alreadyGenerated ? ' Ya está apuntado.' : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
+                setActiveTab('mensual');
+              }}
+              className="min-h-[44px] px-4 rounded-xl bg-white dark:bg-[#132025] border border-amber-300 dark:border-amber-700 text-xs font-bold text-amber-900 dark:text-amber-200 inline-flex items-center gap-1.5"
+            >
+              <span>Revisar en Mensual</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </section>
+        )}
 
         {/* Large Navigation Cards for Mudanza and Mensual */}
         <section aria-label="Accesos rápidos" className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
@@ -424,6 +508,77 @@ export const InicioView: React.FC = () => {
         </button>
       </section>
 
+      {/* Avisos en Inicio (Modo Avanzado) */}
+      {hasAlerts && (
+        <section
+          aria-label="Avisos del mes"
+          className="rounded-2xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 p-5 space-y-3"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-amber-900 dark:text-amber-200">
+              <Bell className="w-5 h-5 shrink-0" />
+              <h2 className="font-display text-base font-bold">Avisos</h2>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
+                setActiveTab('mensual');
+              }}
+              className="text-xs font-semibold text-amber-900 dark:text-amber-200 hover:underline inline-flex items-center gap-1"
+            >
+              <span>Ir a Mensual</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {budgetAlerts.map((alert) => (
+              <div
+                key={alert.category}
+                className="rounded-xl bg-white dark:bg-[#132025] border border-amber-200/80 dark:border-amber-800/60 px-3.5 py-2.5 flex items-center justify-between gap-3"
+              >
+                <div className="min-w-0">
+                  <p className="text-xs font-bold truncate">
+                    Presupuesto · {EXPENSE_CATEGORY_LABELS[alert.category]}
+                  </p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                    {formatEUR(alert.spent)} de {formatEUR(alert.limit)}
+                  </p>
+                </div>
+                <span
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold tabular-nums shrink-0 ${
+                    alert.exceeded
+                      ? 'bg-[#DC4C3E]/12 text-[#DC4C3E]'
+                      : 'bg-amber-500/15 text-amber-800 dark:text-amber-300'
+                  }`}
+                >
+                  {alert.pct} %
+                </span>
+              </div>
+            ))}
+
+            {upcoming3Days.map((charge) => (
+              <div
+                key={charge.recurringId}
+                className="rounded-xl bg-white dark:bg-[#132025] border border-amber-200/80 dark:border-amber-800/60 px-3.5 py-2.5 flex items-center justify-between gap-3"
+              >
+                <div className="min-w-0">
+                  <p className="text-xs font-bold truncate">{charge.concept}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {formatDaysUntilLabel(charge.daysUntil)} ({formatDateES(charge.dueDate)}) ·{' '}
+                    {charge.alreadyGenerated ? 'Ya generado' : 'Pendiente de generar'}
+                  </p>
+                </div>
+                <span className="font-mono-num text-xs font-bold shrink-0">
+                  {formatEUR(charge.amount)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Upcoming Charges */}
       <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
         <div className="flex items-center justify-between">
@@ -446,22 +601,33 @@ export const InicioView: React.FC = () => {
           </p>
         ) : (
           <div className="divide-y divide-slate-100 dark:divide-slate-800">
-            {upcomingCharges.map((charge) => (
-              <div
-                key={charge.recurringId}
-                className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-4"
-              >
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold truncate">{charge.concept}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    {formatDateES(charge.dueDate)} · {EXPENSE_CATEGORY_LABELS[charge.category]}
-                  </p>
+            {upcomingCharges.map((charge) => {
+              const daysUntil = localDaysBetween(todayISO, charge.dueDate);
+              const isSoon = Number.isFinite(daysUntil) && daysUntil >= 0 && daysUntil <= 3;
+              return (
+                <div
+                  key={charge.recurringId}
+                  className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-4"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold truncate">{charge.concept}</p>
+                      {isSoon && (
+                        <span className="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-800 dark:text-amber-300 text-[11px] font-semibold shrink-0">
+                          {formatDaysUntilLabel(daysUntil)}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {formatDateES(charge.dueDate)} · {EXPENSE_CATEGORY_LABELS[charge.category]}
+                    </p>
+                  </div>
+                  <span className="font-mono-num text-sm font-bold shrink-0">
+                    {formatEUR(charge.amount)}
+                  </span>
                 </div>
-                <span className="font-mono-num text-sm font-bold shrink-0">
-                  {formatEUR(charge.amount)}
-                </span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>

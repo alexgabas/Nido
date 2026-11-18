@@ -122,10 +122,14 @@ export function exportNidoPDF(input: PdfExportInput): void {
       body: filteredTx.length
         ? filteredTx.map((t) => [
             formatDateES(t.date),
-            t.concept,
+            t.isPrivate ? `${t.concept} (Personal)` : t.concept,
             TRANSACTION_CATEGORY_LABELS[t.category] || t.category,
             memberLabel(t.paidBy, members),
-            `${t.splitPctA}% / ${Math.round((100 - t.splitPctA) * 10) / 10}%`,
+            t.isPrivate
+              ? 'Solo tú'
+              : t.paidBy === 'cuenta_comun' || t.paidBy === 'comun'
+                ? 'Cuenta común'
+                : `${t.splitPctA}% / ${Math.round((100 - t.splitPctA) * 10) / 10}%`,
             formatEUR(t.amount),
           ])
         : [['—', 'Sin movimientos en el periodo seleccionado', '—', '—', '—', '0,00 €']],

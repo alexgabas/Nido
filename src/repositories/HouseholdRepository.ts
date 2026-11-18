@@ -97,13 +97,21 @@ export interface HouseholdRepository {
   ): Unsubscribe;
   subscribeTransactionsByMonth(
     householdId: string,
+    viewerUid: string,
     monthKey: string,
     onData: (items: Transaction[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
   subscribeTransactionsRecentMonths(
     householdId: string,
+    viewerUid: string,
     minMonthKey: string,
+    onData: (items: Transaction[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  subscribeAllTransactions(
+    householdId: string,
+    viewerUid: string,
     onData: (items: Transaction[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
@@ -248,11 +256,12 @@ export interface HouseholdRepository {
     householdId: string,
     id: string,
     concept: string,
-    actor: UserProfileInput
+    actor: UserProfileInput,
+    options?: { isPrivate?: boolean }
   ): Promise<void>;
   deleteTransactionsBulk(
     householdId: string,
-    items: Array<{ id: string; concept: string }>,
+    items: Array<{ id: string; concept: string; isPrivate?: boolean }>,
     actor: UserProfileInput
   ): Promise<void>;
 
@@ -300,6 +309,6 @@ export interface HouseholdRepository {
   ): Promise<void>;
 
   // Export & Backup Restore
-  exportBackup(householdId: string): Promise<NidoBackupV1>;
+  exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1>;
   importBackup(householdId: string, backup: NidoBackupV1, actor: UserProfileInput): Promise<void>;
 }

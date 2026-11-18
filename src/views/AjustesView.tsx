@@ -168,8 +168,8 @@ export const AjustesView: React.FC = () => {
   };
 
   const handleExportJSON = async () => {
-    if (!householdId) return;
-    const backup = await repo.exportBackup(householdId);
+    if (!householdId || !currentUserProfile) return;
+    const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
     downloadTextFile(
       `nido-backup-${todayISO}.json`,
       JSON.stringify(backup, null, 2),
@@ -212,7 +212,7 @@ export const AjustesView: React.FC = () => {
   const handleFullReportCSV = () => {
     const filtered = recentTransactions.filter((t) => t.date >= reportFrom && t.date <= reportTo);
     const csv = generateSpanishCSV(
-      ['Fecha', 'Mes', 'Concepto', 'Categoría', 'Pagó', 'Reparto A (%)', 'Importe (€)'],
+      ['Fecha', 'Mes', 'Concepto', 'Categoría', 'Pagó', 'Reparto A (%)', 'Tipo', 'Importe (€)'],
       filtered.map((t) => [
         formatDateES(t.date),
         t.monthKey,
@@ -221,7 +221,8 @@ export const AjustesView: React.FC = () => {
         t.paidBy === 'cuenta_comun'
           ? 'Cuenta común'
           : members.find((m) => m.uid === t.paidBy)?.displayName?.split(' ')[0] || t.paidBy,
-        t.splitPctA,
+        t.isPrivate ? 'Personal' : t.splitPctA,
+        t.isPrivate ? 'Personal' : t.isSettlement ? 'Liquidación' : 'Compartido',
         t.amount,
       ])
     );

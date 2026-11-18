@@ -273,6 +273,8 @@ test('4. Usuario no miembro no puede leer ni escribir nada del hogar', async () 
       splitPctA: 50,
       isSettlement: false,
       settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
       notes: '',
       createdAt: ts,
       updatedAt: ts,
@@ -295,6 +297,8 @@ test('4. Usuario no miembro no puede leer ni escribir nada del hogar', async () 
       splitPctA: 50,
       isSettlement: false,
       settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_intruder',
       notes: '',
       createdAt: ts,
       updatedAt: ts,
@@ -337,6 +341,8 @@ test('6. Transacción con splitPctA = 0 se guarda como 0 y valida reglas endurec
       splitPctA: 0,
       isSettlement: false,
       settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
       notes: '',
       createdAt: ts,
       updatedAt: ts,
@@ -400,3 +406,180 @@ test('6. Transacción con splitPctA = 0 se guarda como 0 y valida reglas endurec
     })
   );
 });
+
+test('7. Gastos personales (isPrivate + createdBy): aislamiento entre pareja, filtros list e inmutabilidad de createdBy', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+
+  // Unir a Marta al hogar
+  const joinBatch = dbMarta.batch();
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: firebase.firestore.FieldValue.arrayUnion('uid_marta'),
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('invites/SNT26A'), { memberCount: 2 });
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.set(dbMarta.doc('users/uid_marta'), { householdId: 'h1', updatedAt: ts });
+  await assertSucceeds(joinBatch.commit());
+
+  // 1) Gasto compartido creado por Alex
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_shared').set({
+      monthKey: '2026-11',
+      concept: 'Compra común',
+      category: 'supermercado',
+      amount: 60,
+      date: '2026-11-10',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // 2) Gasto privado válido de Alex
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_priv_alex').set({
+      monthKey: '2026-11',
+      concept: 'Regalo sorpresa',
+      category: 'ocio',
+      amount: 95,
+      date: '2026-11-12',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 100,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+      notes: 'Solo Alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // 3) Creación inválida de gasto privado: paidBy cuenta_comun, createdBy falso o liquidación -> denegado
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_priv_bad_payer').set({
+      monthKey: '2026-11',
+      concept: 'Privado cuenta común',
+      category: 'ocio',
+      amount: 20,
+      date: '2026-11-12',
+      paidBy: 'cuenta_comun',
+      recurringId: null,
+      splitPctA: 100,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_priv_spoof').set({
+      monthKey: '2026-11',
+      concept: 'Suplantado',
+      category: 'ocio',
+      amount: 20,
+      date: '2026-11-12',
+      paidBy: 'uid_marta',
+      recurringId: null,
+      splitPctA: 0,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_marta',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_priv_settle').set({
+      monthKey: '2026-11',
+      concept: 'Liquidación privada',
+      category: 'liquidacion',
+      amount: 20,
+      date: '2026-11-12',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: true,
+      settlementTo: 'uid_marta',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // 4) Lectura / consultas: Marta NO puede hacer get ni list sin filtro; SÍ las 2 queries filtradas
+  await assertFails(dbMarta.doc('households/h1/transactions/tx_priv_alex').get());
+  await assertFails(dbMarta.collection('households/h1/transactions').get());
+
+  const sharedSnap = await assertSucceeds(
+    dbMarta.collection('households/h1/transactions').where('isPrivate', '==', false).get()
+  );
+  assert.deepEqual(
+    sharedSnap.docs.map((d) => d.id),
+    ['tx_shared']
+  );
+
+  const martaOwnSnap = await assertSucceeds(
+    dbMarta.collection('households/h1/transactions').where('createdBy', '==', 'uid_marta').get()
+  );
+  assert.equal(martaOwnSnap.docs.length, 0);
+
+  // 5) Marta NO puede apropiarse de un gasto compartido de Alex poniéndolo privado, ni editar/borrar el privado de Alex
+  await assertFails(
+    dbMarta.doc('households/h1/transactions/tx_shared').update({
+      isPrivate: true,
+      paidBy: 'uid_marta',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h1/transactions/tx_priv_alex').update({
+      concept: 'Espiado',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbMarta.doc('households/h1/transactions/tx_priv_alex').delete());
+
+  // 6) Inmutabilidad de createdBy
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_shared').update({
+      createdBy: 'uid_marta',
+      updatedAt: ts,
+    })
+  );
+
+  // 7) Autor puede editar y borrar su propio gasto privado
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_priv_alex').update({
+      amount: 105,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(dbAlex.doc('households/h1/transactions/tx_priv_alex').delete());
+});
+
