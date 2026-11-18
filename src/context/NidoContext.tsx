@@ -422,8 +422,11 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!householdId || !currentUserProfile) return;
     const next: UiMode = uiMode === 'sencillo' ? 'avanzado' : 'sencillo';
     await repo.updateMemberUiMode(householdId, currentUserProfile.uid, next);
+    if (next === 'sencillo' && activeTab === 'ajustes') {
+      setActiveTab('inicio');
+    }
     showToast(next === 'avanzado' ? 'Modo Avanzado activado' : 'Modo Sencillo activado');
-  }, [householdId, currentUserProfile, uiMode, repo, showToast]);
+  }, [householdId, currentUserProfile, uiMode, activeTab, repo, showToast]);
 
   const value: NidoContextValue = {
     authReady,

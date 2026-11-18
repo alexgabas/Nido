@@ -2,8 +2,10 @@ import React, { useMemo } from 'react';
 import {
   ArrowRight,
   CalendarClock,
+  CalendarDays,
   CheckCircle2,
   History,
+  Package,
   PackageCheck,
   PiggyBank,
   Scale,
@@ -14,6 +16,7 @@ import { useNido } from '../context/NidoContext';
 import {
   calculateCoupleBalance,
   computeFurnitureSummary,
+  formatCoupleBalanceSecondPerson,
   formatDateES,
   formatEUR,
   formatMonthLabelES,
@@ -48,11 +51,15 @@ export const InicioView: React.FC = () => {
     household,
     memberA,
     memberB,
+    currentMember,
     uiMode,
-    toggleUiMode,
     setActiveTab,
+    selectedMonthKey,
+    setSelectedMonthKey,
+    budget,
     recurring,
     recentTransactions,
+    checklist,
     furnitureItems,
     goals,
     goalMovements,
@@ -72,13 +79,41 @@ export const InicioView: React.FC = () => {
     [currentMonthTx, memberA, memberB]
   );
 
+  const secondPersonBalanceText = useMemo(
+    () => formatCoupleBalanceSecondPerson(balance, currentMember, memberA, memberB),
+    [balance, currentMember, memberA, memberB]
+  );
+
+  const activeGoals = useMemo(() => goals.filter((g) => !g.archived), [goals]);
+
   const totalSavings = useMemo(() => {
-    const activeGoalIds = new Set(goals.filter((g) => !g.archived).map((g) => g.id));
+    const activeGoalIds = new Set(activeGoals.map((g) => g.id));
     const total = goalMovements
       .filter((m) => activeGoalIds.has(m.goalId))
       .reduce((sum, m) => sum + (Number(m.amount) || 0), 0);
     return roundCents(Math.max(0, total));
-  }, [goals, goalMovements]);
+  }, [activeGoals, goalMovements]);
+
+  const totalSavingsTarget = useMemo(
+    () => roundCents(activeGoals.reduce((sum, g) => sum + Math.max(0, Number(g.targetAmount) || 0), 0)),
+    [activeGoals]
+  );
+
+  const savingsBarPct =
+    totalSavingsTarget > 0 ? Math.min(100, Math.round((totalSavings / totalSavingsTarget) * 100)) : 0;
+
+  // Monthly planned budget total (for current month when budget subscription matches)
+  const currentMonthBudgetTotal = useMemo(() => {
+    if (!budget || budget.monthKey !== currentMonthKey) return 0;
+    return roundCents(
+      Object.values(budget.limits ?? {}).reduce((sum, v) => sum + Math.max(0, Number(v) || 0), 0)
+    );
+  }, [budget, currentMonthKey]);
+
+  const spendBarPct =
+    currentMonthBudgetTotal > 0
+      ? Math.min(100, Math.round((balance.totalSpent / currentMonthBudgetTotal) * 100))
+      : 0;
 
   const upcomingCharges = useMemo(
     () => getUpcomingCharges(recurring, todayISO, 3),
@@ -123,27 +158,194 @@ export const InicioView: React.FC = () => {
     [furnitureItems]
   );
 
+  const pendingFurnitureCount = useMemo(
+    () => furnitureItems.filter((f) => f.status === 'pendiente' || f.status === 'en_carrito').length,
+    [furnitureItems]
+  );
+  const pendingChecklistCount = useMemo(
+    () => checklist.filter((c) => !c.done).length,
+    [checklist]
+  );
+  const currentMonthExpenseCount = useMemo(
+    () => currentMonthTx.filter((t) => !t.isSettlement).length,
+    [currentMonthTx]
+  );
+
+  // ─── MODO SENCILLO ──────────────────────────────────────────────────────────
+  if (uiMode === 'sencillo') {
+    const viewerName = currentMember?.displayName?.trim() || memberA?.displayName?.trim() || '';
+    const spendExceeded = currentMonthBudgetTotal > 0 && balance.totalSpent > currentMonthBudgetTotal;
+
+    return (
+      <div className="space-y-5 max-w-2xl mx-auto">
+        <header className="space-y-1">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#0E5A64] dark:text-[#5EEAD4]">
+            {household?.name || 'Nuestro hogar'} · {formatMonthLabelES(currentMonthKey)}
+          </p>
+          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">
+            {viewerName ? `Hola, ${viewerName}` : 'Resumen del hogar'}
+          </h1>
+        </header>
+
+        {/* Hero 1: Natural-language monthly spend */}
+        <section
+          aria-label="Gasto del mes"
+          className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-3"
+        >
+          <p className="font-display text-2xl sm:text-3xl font-bold leading-snug text-[#0F1F24] dark:text-[#F0F5F6]">
+            Este mes lleváis{' '}
+            <span className="tabular-nums text-[#0E5A64] dark:text-[#5EEAD4]">
+              {formatEUR(balance.totalSpent)}
+            </span>{' '}
+            gastados
+          </p>
+          {currentMonthBudgetTotal > 0 && (
+            <div className="space-y-2">
+              <p className="text-base text-slate-600 dark:text-slate-300 tabular-nums">
+                de {formatEUR(currentMonthBudgetTotal)} previstos
+              </p>
+              <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    spendExceeded ? 'bg-[#DC4C3E]' : 'bg-[#0E5A64] dark:bg-[#2AA1AE]'
+                  }`}
+                  style={{ width: `${spendBarPct}%` }}
+                />
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* Hero 2: Natural-language balance between partners */}
+        <section
+          aria-label="Saldo entre vosotros"
+          className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 flex items-center justify-between gap-4"
+        >
+          <div className="space-y-1">
+            <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+              Cuentas entre vosotros
+            </p>
+            <p
+              className={`font-display text-2xl sm:text-3xl font-bold leading-tight ${
+                balance.owesDirection === 'peace'
+                  ? 'text-[#15803D] dark:text-[#4ADE80]'
+                  : 'text-[#0F1F24] dark:text-[#F0F5F6]'
+              }`}
+            >
+              {secondPersonBalanceText}
+            </p>
+          </div>
+          <span
+            className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 ${
+              balance.owesDirection === 'peace'
+                ? 'bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80]'
+                : 'bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+            }`}
+          >
+            {balance.owesDirection === 'peace' ? (
+              <CheckCircle2 className="w-6 h-6" />
+            ) : (
+              <Scale className="w-6 h-6" />
+            )}
+          </span>
+        </section>
+
+        {/* Hero 3: Total savings bar */}
+        <button
+          type="button"
+          onClick={() => setActiveTab('ahorros')}
+          className="w-full text-left rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-3 hover:border-[#0E5A64]/40 transition-colors"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+                Vuestro ahorro total
+              </p>
+              <p className="font-display text-2xl sm:text-3xl font-bold tabular-nums text-[#15803D] dark:text-[#4ADE80]">
+                {formatEUR(totalSavings)}
+              </p>
+            </div>
+            <span className="w-11 h-11 rounded-2xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] flex items-center justify-center shrink-0">
+              <PiggyBank className="w-6 h-6" />
+            </span>
+          </div>
+
+          {totalSavingsTarget > 0 && (
+            <div className="space-y-1.5">
+              <div className="h-3.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#15803D] dark:bg-[#4ADE80] transition-all duration-500"
+                  style={{ width: `${savingsBarPct}%` }}
+                />
+              </div>
+              <p className="text-sm text-slate-600 dark:text-slate-300 tabular-nums">
+                de {formatEUR(totalSavingsTarget)} en vuestras metas
+              </p>
+            </div>
+          )}
+        </button>
+
+        {/* Large Navigation Cards for Mudanza and Mensual */}
+        <section aria-label="Accesos rápidos" className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
+          <button
+            type="button"
+            onClick={() => setActiveTab('mudanza')}
+            className="min-h-[96px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
+          >
+            <div className="flex items-center gap-4 min-w-0">
+              <span className="w-12 h-12 rounded-2xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+                <Package className="w-6 h-6" />
+              </span>
+              <div className="min-w-0">
+                <h2 className="font-display text-lg font-bold">Mudanza</h2>
+                <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400">
+                  {pendingFurnitureCount} muebles por comprar · {pendingChecklistCount} tareas
+                </p>
+              </div>
+            </div>
+            <ArrowRight className="w-5 h-5 text-slate-400 shrink-0" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
+              setActiveTab('mensual');
+            }}
+            className="min-h-[96px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
+          >
+            <div className="flex items-center gap-4 min-w-0">
+              <span className="w-12 h-12 rounded-2xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+                <CalendarDays className="w-6 h-6" />
+              </span>
+              <div className="min-w-0">
+                <h2 className="font-display text-lg font-bold">Mensual</h2>
+                <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400">
+                  {currentMonthExpenseCount} gastos apuntados este mes
+                </p>
+              </div>
+            </div>
+            <ArrowRight className="w-5 h-5 text-slate-400 shrink-0" />
+          </button>
+        </section>
+      </div>
+    );
+  }
+
+  // ─── MODO AVANZADO ──────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
-      {/* Header row with Sencillo/Avanzado toggle */}
+      {/* Header row */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
           <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">
             Resumen de {formatMonthLabelES(currentMonthKey)}
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            {household?.name} · {memberA?.displayName?.split(' ')[0] || 'Tú'}
-            {memberB ? ` y ${memberB.displayName.split(' ')[0]}` : ' (esperando pareja)'}
+            {household?.name} · {memberA?.displayName || 'Tú'}
+            {memberB ? ` y ${memberB.displayName}` : ' (esperando pareja)'}
           </p>
         </div>
-
-        <button
-          type="button"
-          onClick={() => void toggleUiMode()}
-          className="self-start sm:self-auto min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-        >
-          Vista: {uiMode === 'sencillo' ? 'Modo Sencillo' : 'Modo Avanzado'} · Cambiar
-        </button>
       </div>
 
       {/* 3 Big KPI Cards */}
@@ -161,7 +363,11 @@ export const InicioView: React.FC = () => {
             {formatEUR(balance.totalSpent)}
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1">
-            <span>Ver desglose mensual</span>
+            <span>
+              {currentMonthBudgetTotal > 0
+                ? `Presupuesto: ${formatEUR(currentMonthBudgetTotal)}`
+                : 'Ver desglose mensual'}
+            </span>
             <ArrowRight className="w-3.5 h-3.5" />
           </p>
         </button>
@@ -212,13 +418,13 @@ export const InicioView: React.FC = () => {
             {formatEUR(totalSavings)}
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1">
-            <span>{goals.filter((g) => !g.archived).length} metas activas</span>
+            <span>{activeGoals.length} metas activas</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </p>
         </button>
       </section>
 
-      {/* Next 3 Upcoming Charges (Always visible in Sencillo & Avanzado) */}
+      {/* Upcoming Charges */}
       <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -260,97 +466,95 @@ export const InicioView: React.FC = () => {
         )}
       </section>
 
-      {/* Advanced Mode Analytics & History */}
-      {uiMode === 'avanzado' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
-            <h2 className="font-display text-base font-bold">Evolución últimos 12 meses</h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Gasto mensual total excluyendo liquidaciones entre vosotros.
-            </p>
-            <MonthlyBarChart data={last12MonthsBars} />
-          </section>
+      {/* Advanced Analytics & History */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+          <h2 className="font-display text-base font-bold">Evolución últimos 12 meses</h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Gasto mensual total excluyendo liquidaciones entre vosotros.
+          </p>
+          <MonthlyBarChart data={last12MonthsBars} />
+        </section>
 
-          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-            <h2 className="font-display text-base font-bold">Gasto por categoría este mes</h2>
-            <DonutChart
-              slices={categoryDonutSlices}
-              centerLabel="Total mes"
-              centerValue={formatEUR(balance.totalSpent)}
-            />
-          </section>
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <h2 className="font-display text-base font-bold">Gasto por categoría este mes</h2>
+          <DonutChart
+            slices={categoryDonutSlices}
+            centerLabel="Total mes"
+            centerValue={formatEUR(balance.totalSpent)}
+          />
+        </section>
 
-          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <PackageCheck className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
-                <h2 className="font-display text-base font-bold">Progreso de mudanza</h2>
-              </div>
-              <button
-                type="button"
-                onClick={() => setActiveTab('mudanza')}
-                className="text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:underline"
-              >
-                Abrir mudanza
-              </button>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-slate-600 dark:text-slate-300">
-                  Mobiliario completado ({furnitureSummary.boughtCount} de {furnitureSummary.totalCount})
-                </span>
-                <span className="font-bold tabular-nums">{furnitureSummary.boughtPct}%</span>
-              </div>
-              <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
-                <div
-                  className="h-full bg-[#0E5A64] dark:bg-[#2AA1AE] rounded-full transition-all duration-500"
-                  style={{ width: `${furnitureSummary.boughtPct}%` }}
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-3 pt-2 text-xs">
-                <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
-                  <p className="text-slate-500 dark:text-slate-400">Pendiente mobiliario</p>
-                  <p className="text-base font-bold tabular-nums mt-0.5">
-                    {formatEUR(furnitureSummary.totalPending)}
-                  </p>
-                </div>
-                <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
-                  <p className="text-slate-500 dark:text-slate-400">En carrito IKEA</p>
-                  <p className="text-base font-bold tabular-nums mt-0.5">
-                    {formatEUR(furnitureSummary.totalCart)}
-                  </p>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <History className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
-              <h2 className="font-display text-base font-bold">Últimos 10 cambios</h2>
+              <PackageCheck className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
+              <h2 className="font-display text-base font-bold">Progreso de mudanza</h2>
             </div>
-            {activity.length === 0 ? (
-              <p className="text-sm text-slate-500 dark:text-slate-400">Sin actividad registrada todavía.</p>
-            ) : (
-              <ul className="divide-y divide-slate-100 dark:divide-slate-800 max-h-72 overflow-y-auto">
-                {activity.slice(0, 10).map((entry) => (
-                  <li key={entry.id} className="py-2.5 first:pt-0 last:pb-0 flex items-start gap-2.5 text-xs">
-                    <CheckCircle2 className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0 mt-0.5" />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-[#0F1F24] dark:text-[#F0F5F6]">
-                        <span className="font-semibold">{entry.actorName}</span> · {entry.summary}
-                      </p>
-                      <p className="text-slate-500 dark:text-slate-400">
-                        {formatDateES(entry.timestamp.slice(0, 10))}
-                      </p>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        </div>
-      )}
+            <button
+              type="button"
+              onClick={() => setActiveTab('mudanza')}
+              className="text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:underline"
+            >
+              Abrir mudanza
+            </button>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-slate-600 dark:text-slate-300">
+                Mobiliario completado ({furnitureSummary.boughtCount} de {furnitureSummary.totalCount})
+              </span>
+              <span className="font-bold tabular-nums">{furnitureSummary.boughtPct}%</span>
+            </div>
+            <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+              <div
+                className="h-full bg-[#0E5A64] dark:bg-[#2AA1AE] rounded-full transition-all duration-500"
+                style={{ width: `${furnitureSummary.boughtPct}%` }}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3 pt-2 text-xs">
+              <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
+                <p className="text-slate-500 dark:text-slate-400">Pendiente mobiliario</p>
+                <p className="text-base font-bold tabular-nums mt-0.5">
+                  {formatEUR(furnitureSummary.totalPending)}
+                </p>
+              </div>
+              <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
+                <p className="text-slate-500 dark:text-slate-400">En carrito IKEA</p>
+                <p className="text-base font-bold tabular-nums mt-0.5">
+                  {formatEUR(furnitureSummary.totalCart)}
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <History className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
+            <h2 className="font-display text-base font-bold">Últimos 10 cambios</h2>
+          </div>
+          {activity.length === 0 ? (
+            <p className="text-sm text-slate-500 dark:text-slate-400">Sin actividad registrada todavía.</p>
+          ) : (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800 max-h-72 overflow-y-auto">
+              {activity.slice(0, 10).map((entry) => (
+                <li key={entry.id} className="py-2.5 first:pt-0 last:pb-0 flex items-start gap-2.5 text-xs">
+                  <CheckCircle2 className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[#0F1F24] dark:text-[#F0F5F6]">
+                      <span className="font-semibold">{entry.actorName}</span> · {entry.summary}
+                    </p>
+                    <p className="text-slate-500 dark:text-slate-400">
+                      {formatDateES(entry.timestamp.slice(0, 10))}
+                    </p>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </div>
     </div>
   );
 };

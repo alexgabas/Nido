@@ -238,6 +238,33 @@ export function calculateCoupleBalance(
   };
 }
 
+export function formatCoupleBalanceSecondPerson(
+  balance: CoupleBalanceResult,
+  currentMember: HouseholdMember | undefined,
+  memberA: HouseholdMember | undefined,
+  memberB: HouseholdMember | undefined
+): string {
+  if (!memberB) {
+    return 'Aún no se ha unido nadie más al hogar';
+  }
+  if (balance.owesDirection === 'peace') {
+    return 'Estáis en paz';
+  }
+  const firstNameA = memberA?.displayName?.trim() || 'Tu pareja';
+  const firstNameB = memberB?.displayName?.trim() || 'Tu pareja';
+  const amountText = formatEUR(balance.owesAmount);
+  const viewerIsA = !currentMember || currentMember.uid === memberA?.uid;
+
+  if (viewerIsA) {
+    return balance.owesDirection === 'b_owes_a'
+      ? `${firstNameB} te debe ${amountText}`
+      : `Le debes ${amountText} a ${firstNameB}`;
+  }
+  return balance.owesDirection === 'a_owes_b'
+    ? `${firstNameA} te debe ${amountText}`
+    : `Le debes ${amountText} a ${firstNameA}`;
+}
+
 // ─── Recurring Expenses & Budget Helpers ─────────────────────────────────────
 
 export function monthlyEquivalent(amount: number, frequency: RecurrenceFrequency): number {

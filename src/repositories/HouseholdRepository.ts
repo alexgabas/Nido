@@ -209,6 +209,11 @@ export interface HouseholdRepository {
     name: string,
     actor: UserProfileInput
   ): Promise<void>;
+  deleteFurnitureItemsBulk(
+    householdId: string,
+    items: Array<{ id: string; name: string }>,
+    actor: UserProfileInput
+  ): Promise<void>;
 
   // Recurring & Monthly Transactions
   upsertRecurring(
@@ -243,6 +248,11 @@ export interface HouseholdRepository {
     householdId: string,
     id: string,
     concept: string,
+    actor: UserProfileInput
+  ): Promise<void>;
+  deleteTransactionsBulk(
+    householdId: string,
+    items: Array<{ id: string; concept: string }>,
     actor: UserProfileInput
   ): Promise<void>;
 

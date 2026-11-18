@@ -625,6 +625,24 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async deleteFurnitureItemsBulk(
+    _hid: string,
+    items: Array<{ id: string; name: string }>,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (items.length === 0) return;
+    const ids = new Set(items.map((it) => it.id));
+    this.state.items = this.state.items.filter((it) => !ids.has(it.id));
+    this.logActivity(
+      actor,
+      'delete',
+      'mobiliario',
+      items[0].id,
+      `Eliminó ${items.length} artículos de mobiliario`
+    );
+    this.emit();
+  }
+
   async upsertRecurring(
     _hid: string,
     rec: Omit<RecurringExpense, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
@@ -732,6 +750,24 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   async deleteTransaction(_hid: string, id: string, concept: string, actor: UserProfileInput): Promise<void> {
     this.state.transactions = this.state.transactions.filter((t) => t.id !== id);
     this.logActivity(actor, 'delete', 'gasto', id, `Eliminó "${concept}"`);
+    this.emit();
+  }
+
+  async deleteTransactionsBulk(
+    _hid: string,
+    items: Array<{ id: string; concept: string }>,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (items.length === 0) return;
+    const ids = new Set(items.map((tx) => tx.id));
+    this.state.transactions = this.state.transactions.filter((t) => !ids.has(t.id));
+    this.logActivity(
+      actor,
+      'delete',
+      'gasto',
+      items[0].id,
+      `Eliminó ${items.length} movimientos`
+    );
     this.emit();
   }
 

@@ -1333,6 +1333,39 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async deleteFurnitureItemsBulk(
+    householdId: string,
+    items: Array<{ id: string; name: string }>,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (items.length === 0) return;
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = items.map(
+      (item) => ({
+        path: `households/${householdId}/items/${item.id}`,
+        apply: (batch) => batch.delete(doc(db, 'households', householdId, 'items', item.id)),
+      })
+    );
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (batch) =>
+        this.addActivityToBatch(
+          batch,
+          householdId,
+          actor,
+          'delete',
+          'mobiliario',
+          items[0].id,
+          `Eliminó ${items.length} artículos de mobiliario`
+        ),
+    });
+    await this.commitBatchOps(
+      ops,
+      OperationType.DELETE,
+      `households/${householdId}/items`,
+      'No se pudieron eliminar los artículos seleccionados.'
+    );
+  }
+
   async upsertRecurring(
     householdId: string,
     rec: Omit<RecurringExpense, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
@@ -1538,6 +1571,39 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     } catch (error) {
       handleFirestoreError(error, OperationType.DELETE, path);
     }
+  }
+
+  async deleteTransactionsBulk(
+    householdId: string,
+    items: Array<{ id: string; concept: string }>,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (items.length === 0) return;
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = items.map(
+      (tx) => ({
+        path: `households/${householdId}/transactions/${tx.id}`,
+        apply: (batch) => batch.delete(doc(db, 'households', householdId, 'transactions', tx.id)),
+      })
+    );
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (batch) =>
+        this.addActivityToBatch(
+          batch,
+          householdId,
+          actor,
+          'delete',
+          'gasto',
+          items[0].id,
+          `Eliminó ${items.length} movimientos`
+        ),
+    });
+    await this.commitBatchOps(
+      ops,
+      OperationType.DELETE,
+      `households/${householdId}/transactions`,
+      'No se pudieron eliminar los movimientos seleccionados.'
+    );
   }
 
   async saveBudget(

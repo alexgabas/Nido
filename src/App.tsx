@@ -10,7 +10,7 @@ import { MensualView } from './views/MensualView';
 import { MudanzaView } from './views/MudanzaView';
 
 const NidoRouter: React.FC = () => {
-  const { authReady, authUser, isDemoMode, householdId, household, activeTab } = useNido();
+  const { authReady, authUser, isDemoMode, householdId, household, activeTab, uiMode } = useNido();
 
   if (!authReady) {
     return <LoginOnboarding />;
@@ -30,13 +30,15 @@ const NidoRouter: React.FC = () => {
     );
   }
 
+  const effectiveTab = uiMode === 'sencillo' && activeTab === 'ajustes' ? 'inicio' : activeTab;
+
   return (
     <AppShell>
-      {activeTab === 'inicio' && <InicioView />}
-      {activeTab === 'mudanza' && <MudanzaView />}
-      {activeTab === 'mensual' && <MensualView />}
-      {activeTab === 'ahorros' && <AhorrosView />}
-      {activeTab === 'ajustes' && <AjustesView />}
+      {effectiveTab === 'inicio' && <InicioView />}
+      {effectiveTab === 'mudanza' && <MudanzaView />}
+      {effectiveTab === 'mensual' && <MensualView />}
+      {effectiveTab === 'ahorros' && <AhorrosView />}
+      {effectiveTab === 'ajustes' && <AjustesView />}
     </AppShell>
   );
 };

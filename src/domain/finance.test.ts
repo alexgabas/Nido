@@ -9,12 +9,14 @@ import {
   computeFurnitureSummary,
   computeGoalProgress,
   findMissingRecurringForMonth,
+  formatCoupleBalanceSecondPerson,
   formatDateES,
   formatEUR,
   formatLocalDateISO,
   monthlyEquivalent,
 } from './finance';
 import { generateSpanishCSV, validateAndMigrateBackup } from './backup';
+import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import type {
   FurnitureItem,
   GoalMovement,
@@ -420,4 +422,205 @@ test('backup JSON round-trip y rechazo de entradas corruptas + CSV español', ()
   const csv = generateSpanishCSV(['Concepto', 'Importe'], [['Café; té', 12.5]]);
   assert.ok(csv.startsWith('\uFEFF'));
   assert.ok(csv.includes('"Café; té";12,50'));
+});
+
+test('formatCoupleBalanceSecondPerson usa displayName real para cada miembro y estado en paz', () => {
+  const alexViewingB_owes_A = formatCoupleBalanceSecondPerson(
+    {
+      totalSpent: 100,
+      personalTotalSpent: 100,
+      paidA: 82,
+      paidB: 18,
+      paidComun: 0,
+      shareA: 50,
+      shareB: 50,
+      balanceA: 32,
+      owesDirection: 'b_owes_a',
+      owesAmount: 32,
+      summaryText: 'Marta debe 32,00 € a Alex',
+    },
+    memberA,
+    memberA,
+    memberB
+  );
+  assert.match(alexViewingB_owes_A, /^Marta te debe 32,00\s*€$/);
+
+  const martaViewingB_owes_A = formatCoupleBalanceSecondPerson(
+    {
+      totalSpent: 100,
+      personalTotalSpent: 100,
+      paidA: 82,
+      paidB: 18,
+      paidComun: 0,
+      shareA: 50,
+      shareB: 50,
+      balanceA: 32,
+      owesDirection: 'b_owes_a',
+      owesAmount: 32,
+      summaryText: 'Marta debe 32,00 € a Alex',
+    },
+    memberB,
+    memberA,
+    memberB
+  );
+  assert.match(martaViewingB_owes_A, /^Le debes 32,00\s*€ a Alex$/);
+
+  const alexViewingPeace = formatCoupleBalanceSecondPerson(
+    {
+      totalSpent: 100,
+      personalTotalSpent: 100,
+      paidA: 50,
+      paidB: 50,
+      paidComun: 0,
+      shareA: 50,
+      shareB: 50,
+      balanceA: 0,
+      owesDirection: 'peace',
+      owesAmount: 0,
+      summaryText: 'Estáis en paz',
+    },
+    memberA,
+    memberA,
+    memberB
+  );
+  assert.equal(alexViewingPeace, 'Estáis en paz');
+
+  const soloMember = formatCoupleBalanceSecondPerson(
+    {
+      totalSpent: 0,
+      personalTotalSpent: 0,
+      paidA: 0,
+      paidB: 0,
+      paidComun: 0,
+      shareA: 0,
+      shareB: 0,
+      balanceA: 0,
+      owesDirection: 'peace',
+      owesAmount: 0,
+      summaryText: 'Estáis en paz',
+    },
+    memberA,
+    memberA,
+    undefined
+  );
+  assert.equal(soloMember, 'Aún no se ha unido nadie más al hogar');
+});
+
+test('DemoHouseholdRepository borrado masivo y conservación de splitPctA=0', async () => {
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  let latestTxIds: string[] = [];
+  let latestFurnitureIds: string[] = [];
+  let latestZeroTxSplit: number | undefined;
+
+  const unsubTx = repo.subscribeTransactionsByMonth(
+    'demo_hogar_santsadurni',
+    '2026-11',
+    (txs) => {
+      latestTxIds = txs.map((t) => t.id);
+      const found = txs.find((t) => t.concept === 'Prueba cero porciento');
+      latestZeroTxSplit = found?.splitPctA;
+    }
+  );
+  const unsubFur = repo.subscribeFurniture(
+    'demo_hogar_santsadurni',
+    (items) => {
+      latestFurnitureIds = items.map((i) => i.id);
+    }
+  );
+
+  const txId1 = await repo.upsertTransaction(
+    'demo_hogar_santsadurni',
+    {
+      monthKey: '2026-11',
+      concept: 'Prueba cero porciento',
+      category: 'ocio',
+      amount: 25,
+      date: '2026-11-18',
+      paidBy: 'demo_alex',
+      recurringId: null,
+      splitPctA: 0,
+      isSettlement: false,
+      settlementTo: '',
+      notes: '',
+    },
+    actor
+  );
+  assert.equal(latestZeroTxSplit, 0);
+
+  const txId2 = await repo.upsertTransaction(
+    'demo_hogar_santsadurni',
+    {
+      monthKey: '2026-11',
+      concept: 'Otro gasto bulk',
+      category: 'otros',
+      amount: 10,
+      date: '2026-11-18',
+      paidBy: 'cuenta_comun',
+      recurringId: null,
+      splitPctA: 55,
+      isSettlement: false,
+      settlementTo: '',
+      notes: '',
+    },
+    actor
+  );
+  assert.ok(latestTxIds.includes(txId1) && latestTxIds.includes(txId2));
+
+  await repo.deleteTransactionsBulk(
+    'demo_hogar_santsadurni',
+    [
+      { id: txId1, concept: 'Prueba cero porciento' },
+      { id: txId2, concept: 'Otro gasto bulk' },
+    ],
+    actor
+  );
+  assert.ok(!latestTxIds.includes(txId1) && !latestTxIds.includes(txId2));
+
+  const fId1 = await repo.upsertFurnitureItem(
+    'demo_hogar_santsadurni',
+    {
+      name: 'Taburete bulk 1',
+      room: 'cocina',
+      priority: 'algun_dia',
+      status: 'pendiente',
+      store: 'IKEA',
+      productUrl: '',
+      articleNumber: '',
+      unitPrice: 15,
+      qty: 1,
+      notes: '',
+    },
+    actor
+  );
+  const fId2 = await repo.upsertFurnitureItem(
+    'demo_hogar_santsadurni',
+    {
+      name: 'Taburete bulk 2',
+      room: 'cocina',
+      priority: 'algun_dia',
+      status: 'pendiente',
+      store: 'IKEA',
+      productUrl: '',
+      articleNumber: '',
+      unitPrice: 15,
+      qty: 1,
+      notes: '',
+    },
+    actor
+  );
+  assert.ok(latestFurnitureIds.includes(fId1) && latestFurnitureIds.includes(fId2));
+
+  await repo.deleteFurnitureItemsBulk(
+    'demo_hogar_santsadurni',
+    [
+      { id: fId1, name: 'Taburete bulk 1' },
+      { id: fId2, name: 'Taburete bulk 2' },
+    ],
+    actor
+  );
+  assert.ok(!latestFurnitureIds.includes(fId1) && !latestFurnitureIds.includes(fId2));
+
+  unsubTx();
+  unsubFur();
 });

@@ -1,6 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ArrowUpDown,
   CalendarClock,
+  Check,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -11,9 +13,11 @@ import {
   Plus,
   RefreshCw,
   Scale,
+  Search,
   SlidersHorizontal,
   Trash2,
   Unlock,
+  X,
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { QuickExpenseModal } from '../components/QuickExpenseModal';
@@ -21,9 +25,11 @@ import { useNido } from '../context/NidoContext';
 import { downloadTextFile, generateSpanishCSV } from '../domain/backup';
 import {
   calculateCoupleBalance,
+  clampSplitPct,
   computeBudgetProgress,
   daysInMonth,
   findMissingRecurringForMonth,
+  formatCoupleBalanceSecondPerson,
   formatDateES,
   formatEUR,
   formatMonthLabelES,
@@ -37,13 +43,18 @@ import {
   TRANSACTION_CATEGORY_LABELS,
 } from '../domain/presets';
 import { exportNidoPDF } from '../services/pdfExport';
-import type {
-  ExpenseCategory,
-  MonthlyBudget,
-  RecurrenceFrequency,
-  RecurringExpense,
-  Transaction,
+import { toUserFriendlyErrorMessage } from '../services/firebase';
+import {
+  COMMON_ACCOUNT_ID,
+  type ExpenseCategory,
+  type MonthlyBudget,
+  type RecurrenceFrequency,
+  type RecurringExpense,
+  type Transaction,
+  type TransactionCategory,
 } from '../types/nido';
+
+type TxSortField = 'date' | 'concept' | 'category' | 'amount';
 
 export const MensualView: React.FC = () => {
   const {
@@ -52,6 +63,7 @@ export const MensualView: React.FC = () => {
     members,
     memberA,
     memberB,
+    currentMember,
     currentUserProfile,
     effectiveSplitPctA,
     selectedMonthKey,
@@ -73,6 +85,23 @@ export const MensualView: React.FC = () => {
   const [editingTx, setEditingTx] = useState<Transaction | null>(null);
   const [txModalOpen, setTxModalOpen] = useState(false);
 
+  // Avanzado: Search, filters, sorting, inline edit, multi-select bulk delete
+  const [txSearch, setTxSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<TransactionCategory | 'todas'>('todas');
+  const [payerFilter, setPayerFilter] = useState<string>('todos');
+  const [sortField, setSortField] = useState<TxSortField>('date');
+  const [sortAsc, setSortAsc] = useState(false);
+
+  const [selectedTxIds, setSelectedTxIds] = useState<Set<string>>(new Set());
+  const [confirmBulkDeleteTx, setConfirmBulkDeleteTx] = useState(false);
+
+  const [inlineEditId, setInlineEditId] = useState<string | null>(null);
+  const [inlineConcept, setInlineConcept] = useState('');
+  const [inlineCategory, setInlineCategory] = useState<ExpenseCategory>('supermercado');
+  const [inlinePaidBy, setInlinePaidBy] = useState<string>(COMMON_ACCOUNT_ID);
+  const [inlineSplitPct, setInlineSplitPct] = useState('50');
+  const [inlineAmount, setInlineAmount] = useState('');
+
   // Recurring modal
   const [recModalOpen, setRecModalOpen] = useState(false);
   const [editingRec, setEditingRec] = useState<RecurringExpense | null>(null);
@@ -81,7 +110,7 @@ export const MensualView: React.FC = () => {
   const [recAmount, setRecAmount] = useState('');
   const [recFrequency, setRecFrequency] = useState<RecurrenceFrequency>('mensual');
   const [recDay, setRecDay] = useState('1');
-  const [recPaidBy, setRecPaidBy] = useState('cuenta_comun');
+  const [recPaidBy, setRecPaidBy] = useState<string>(COMMON_ACCOUNT_ID);
   const [recActive, setRecActive] = useState(true);
 
   // Budget modal
@@ -99,9 +128,20 @@ export const MensualView: React.FC = () => {
   const closure = monthClosures.find((c) => c.monthKey === selectedMonthKey) ?? null;
   const isClosed = Boolean(closure);
 
+  // Reset selections and inline edit if month changes or becomes closed
+  useEffect(() => {
+    setSelectedTxIds(new Set());
+    setInlineEditId(null);
+  }, [selectedMonthKey, isClosed]);
+
   const balance = useMemo(
     () => calculateCoupleBalance(monthTransactions, memberA, memberB),
     [monthTransactions, memberA, memberB]
+  );
+
+  const secondPersonBalanceText = useMemo(
+    () => formatCoupleBalanceSecondPerson(balance, currentMember, memberA, memberB),
+    [balance, currentMember, memberA, memberB]
   );
 
   const budgetProgress = useMemo(
@@ -114,12 +154,110 @@ export const MensualView: React.FC = () => {
     [recurring, monthTransactions, selectedMonthKey]
   );
 
-  const nameA = memberA?.displayName?.split(' ')[0] || 'Persona A';
-  const nameB = memberB?.displayName?.split(' ')[0] || 'Pareja';
+  const filteredAndSortedTransactions = useMemo(() => {
+    if (uiMode === 'sencillo') return monthTransactions;
+    const q = txSearch.trim().toLowerCase();
+    const filtered = monthTransactions.filter((tx) => {
+      if (categoryFilter !== 'todas' && tx.category !== categoryFilter) return false;
+      if (payerFilter !== 'todos' && tx.paidBy !== payerFilter) return false;
+      if (q) {
+        const hay = `${tx.concept} ${tx.notes} ${TRANSACTION_CATEGORY_LABELS[tx.category]}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    return [...filtered].sort((a, b) => {
+      let cmp = 0;
+      if (sortField === 'date') cmp = a.date.localeCompare(b.date);
+      else if (sortField === 'concept') cmp = a.concept.localeCompare(b.concept, 'es');
+      else if (sortField === 'category') {
+        cmp = TRANSACTION_CATEGORY_LABELS[a.category].localeCompare(
+          TRANSACTION_CATEGORY_LABELS[b.category],
+          'es'
+        );
+      } else {
+        cmp = a.amount - b.amount;
+      }
+      return sortAsc ? cmp : -cmp;
+    });
+  }, [uiMode, monthTransactions, txSearch, categoryFilter, payerFilter, sortField, sortAsc]);
+
+  const fullNameA = memberA?.displayName?.trim() || 'Persona A';
+  const fullNameB = memberB?.displayName?.trim() || 'Pareja';
+  const shortNameA = fullNameA.split(' ')[0];
+  const shortNameB = fullNameB.split(' ')[0];
 
   const memberLabel = (uid: string) => {
-    if (uid === 'cuenta_comun' || uid === 'comun') return 'Cuenta común';
-    return members.find((m) => m.uid === uid)?.displayName?.split(' ')[0] || 'Pareja';
+    if (uid === COMMON_ACCOUNT_ID || uid === 'comun') return 'Cuenta común';
+    return members.find((m) => m.uid === uid)?.displayName?.trim() || 'Pareja';
+  };
+
+  const handleSortClick = (field: TxSortField) => {
+    if (sortField === field) setSortAsc((prev) => !prev);
+    else {
+      setSortField(field);
+      setSortAsc(field === 'concept' || field === 'category');
+    }
+  };
+
+  const startInlineEdit = (tx: Transaction) => {
+    if (isClosed || tx.isSettlement) return;
+    setInlineEditId(tx.id);
+    setInlineConcept(tx.concept);
+    setInlineCategory(tx.category === 'liquidacion' ? 'otros' : tx.category);
+    setInlinePaidBy(tx.paidBy === 'comun' ? COMMON_ACCOUNT_ID : tx.paidBy);
+    setInlineSplitPct(String(clampSplitPct(tx.splitPctA, effectiveSplitPctA)));
+    setInlineAmount(String(tx.amount));
+  };
+
+  const handleSaveInlineEdit = async (tx: Transaction) => {
+    if (!householdId || !currentUserProfile || isClosed) return;
+    const numericAmt = Number(inlineAmount.replace(',', '.'));
+    if (!Number.isFinite(numericAmt) || numericAmt <= 0 || !inlineConcept.trim()) {
+      showToast('Introduce un concepto e importe válido mayor que 0.');
+      return;
+    }
+    const splitVal = clampSplitPct(inlineSplitPct, effectiveSplitPctA);
+    try {
+      await repo.upsertTransaction(
+        householdId,
+        {
+          ...tx,
+          concept: inlineConcept.trim(),
+          category: inlineCategory,
+          paidBy: inlinePaidBy,
+          splitPctA: splitVal,
+          amount: Math.round(numericAmt * 100) / 100,
+        },
+        currentUserProfile
+      );
+      setInlineEditId(null);
+      showToast('Gasto actualizado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el gasto.'));
+    }
+  };
+
+  const handleConfirmBulkDeleteTx = async () => {
+    if (!householdId || !currentUserProfile) return;
+    setConfirmBulkDeleteTx(false);
+    if (isClosed) {
+      showToast('No puedes eliminar movimientos de un mes cerrado.');
+      return;
+    }
+    const closedMonthKeys = new Set(monthClosures.map((c) => c.monthKey));
+    const deletable = monthTransactions
+      .filter((tx) => selectedTxIds.has(tx.id) && !closedMonthKeys.has(tx.monthKey))
+      .map((tx) => ({ id: tx.id, concept: tx.concept }));
+    if (deletable.length === 0) return;
+
+    try {
+      await repo.deleteTransactionsBulk(householdId, deletable, currentUserProfile);
+      setSelectedTxIds(new Set());
+      showToast(`Eliminados ${deletable.length} movimientos`);
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudieron eliminar los movimientos.'));
+    }
   };
 
   const handleGenerateFromTemplates = async () => {
@@ -198,7 +336,7 @@ export const MensualView: React.FC = () => {
     setRecAmount(rec ? String(rec.amount) : '');
     setRecFrequency(rec?.frequency ?? 'mensual');
     setRecDay(rec ? String(rec.dayOfMonth) : '1');
-    setRecPaidBy(rec?.paidByDefault ?? 'cuenta_comun');
+    setRecPaidBy(rec?.paidByDefault ?? COMMON_ACCOUNT_ID);
     setRecActive(rec?.active ?? true);
     setRecModalOpen(true);
   };
@@ -317,6 +455,121 @@ export const MensualView: React.FC = () => {
     }
   };
 
+  // ─── MODO SENCILLO: LISTA LIMPIA SIN CIERRE, PLANTILLAS, PRESUPUESTOS NI % ──
+  if (uiMode === 'sencillo') {
+    const simpleList = monthTransactions.filter((t) => !t.isSettlement);
+
+    return (
+      <div className="space-y-5 max-w-2xl mx-auto">
+        <div className="flex items-center justify-between gap-2">
+          <button
+            type="button"
+            aria-label="Mes anterior"
+            onClick={() => setSelectedMonthKey(shiftMonthKey(selectedMonthKey, -1))}
+            className="min-h-[46px] min-w-[46px] rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] flex items-center justify-center"
+          >
+            <ChevronLeft className="w-5 h-5" />
+          </button>
+          <h1 className="font-display text-xl sm:text-2xl font-bold tracking-tight text-center">
+            {formatMonthLabelES(selectedMonthKey)}
+          </h1>
+          <button
+            type="button"
+            aria-label="Mes siguiente"
+            onClick={() => setSelectedMonthKey(shiftMonthKey(selectedMonthKey, 1))}
+            className="min-h-[46px] min-w-[46px] rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] flex items-center justify-center"
+          >
+            <ChevronRight className="w-5 h-5" />
+          </button>
+        </div>
+
+        {isClosed && (
+          <div className="rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex items-center gap-2.5 text-sm">
+            <Lock className="w-4 h-4 text-slate-500 shrink-0" />
+            <span>Este mes ya está cerrado y no se puede cambiar.</span>
+          </div>
+        )}
+
+        <section className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-2">
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            Total gastado:{' '}
+            <strong className="font-display text-lg text-[#0F1F24] dark:text-[#F0F5F6] tabular-nums">
+              {formatEUR(balance.totalSpent)}
+            </strong>
+          </p>
+          <p
+            className={`font-display text-xl font-bold ${
+              balance.owesDirection === 'peace'
+                ? 'text-[#15803D] dark:text-[#4ADE80]'
+                : 'text-[#0E5A64] dark:text-[#5EEAD4]'
+            }`}
+          >
+            {secondPersonBalanceText}
+          </p>
+        </section>
+
+        <section className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+          <h2 className="font-display text-base font-bold">
+            Gastos ({simpleList.length})
+          </h2>
+
+          {simpleList.length === 0 ? (
+            <div className="py-8 text-center space-y-1.5">
+              <p className="text-base font-bold">No hay gastos en este mes</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">
+                Pulsa el botón + de abajo para apuntar el primero.
+              </p>
+            </div>
+          ) : (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+              {simpleList.map((tx) => (
+                <li key={tx.id} className="py-3.5 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-bold truncate">{tx.concept}</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {EXPENSE_CATEGORY_LABELS[tx.category === 'liquidacion' ? 'otros' : tx.category]} · Pagó{' '}
+                      {memberLabel(tx.paidBy)}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <span className="font-mono-num text-base font-bold mr-1">
+                      {formatEUR(tx.amount)}
+                    </span>
+                    {!isClosed && (
+                      <button
+                        type="button"
+                        aria-label={`Eliminar ${tx.concept}`}
+                        onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
+                        className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <ConfirmDialog
+          open={Boolean(deleteTarget)}
+          title="Eliminar gasto"
+          description={`Vas a eliminar "${deleteTarget?.kind === 'tx' ? deleteTarget.item.concept : ''}". Podrás deshacerlo durante 5 segundos.`}
+          confirmLabel="Eliminar"
+          onConfirm={() => void handleConfirmDelete()}
+          onCancel={() => setDeleteTarget(null)}
+        />
+      </div>
+    );
+  }
+
+  // ─── MODO AVANZADO: TABLA CON ORDENACIÓN, FILTROS, BÚSQUEDA, EDICIÓN EN LÍNEA Y BORRADO MASIVO ─
+  const allVisibleSelected =
+    !isClosed &&
+    filteredAndSortedTransactions.length > 0 &&
+    filteredAndSortedTransactions.every((t) => selectedTxIds.has(t.id));
+
   return (
     <div className="space-y-6">
       {/* Header & Month selector */}
@@ -335,7 +588,8 @@ export const MensualView: React.FC = () => {
               {formatMonthLabelES(selectedMonthKey)}
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Reparto vigente: {nameA} {effectiveSplitPctA}% · {nameB} {Math.round((100 - effectiveSplitPctA) * 10) / 10}%
+              Reparto vigente: {shortNameA} {effectiveSplitPctA}% · {shortNameB}{' '}
+              {Math.round((100 - effectiveSplitPctA) * 10) / 10}%
             </p>
           </div>
           <button
@@ -375,37 +629,29 @@ export const MensualView: React.FC = () => {
               <span>Cerrar mes</span>
             </button>
           ) : (
-            uiMode === 'avanzado' && (
-              <button
-                type="button"
-                onClick={() =>
-                  householdId &&
-                  currentUserProfile &&
-                  void repo.reopenMonth(householdId, selectedMonthKey, currentUserProfile)
-                }
-                className="min-h-[44px] px-3.5 rounded-xl bg-amber-500/15 text-amber-800 dark:text-amber-300 text-xs font-semibold flex items-center gap-1.5"
-              >
-                <Unlock className="w-4 h-4" />
-                <span>Desbloquear mes</span>
-              </button>
-            )
+            <button
+              type="button"
+              onClick={() =>
+                householdId &&
+                currentUserProfile &&
+                void repo.reopenMonth(householdId, selectedMonthKey, currentUserProfile)
+              }
+              className="min-h-[44px] px-3.5 rounded-xl bg-amber-500/15 text-amber-800 dark:text-amber-300 text-xs font-semibold flex items-center gap-1.5"
+            >
+              <Unlock className="w-4 h-4" />
+              <span>Desbloquear mes</span>
+            </button>
           )}
         </div>
       </div>
 
       {isClosed && closure && (
-        <div className="rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <div className="flex items-center gap-2.5 text-sm">
-            <Lock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
-            <span>
-              <strong>Mes cerrado.</strong> Foto guardada: {closure.settlementText} (Total {formatEUR(closure.totalSpent)}).
-            </span>
-          </div>
-          {uiMode === 'sencillo' && (
-            <span className="text-xs text-slate-500 dark:text-slate-400">
-              Activa Modo Avanzado en Ajustes para desbloquear.
-            </span>
-          )}
+        <div className="rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex items-center gap-2.5 text-sm">
+          <Lock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
+          <span>
+            <strong>Mes cerrado.</strong> Foto guardada: {closure.settlementText} (Total{' '}
+            {formatEUR(closure.totalSpent)}). Edición y borrado masivo bloqueados hasta desbloquear.
+          </span>
         </div>
       )}
 
@@ -427,7 +673,9 @@ export const MensualView: React.FC = () => {
               {balance.summaryText}
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              Total mes: {formatEUR(balance.totalSpent)} · {nameA} pagó {formatEUR(balance.paidA)} (corresponde {formatEUR(balance.shareA)}) · {nameB} pagó {formatEUR(balance.paidB)} (corresponde {formatEUR(balance.shareB)})
+              Total mes: {formatEUR(balance.totalSpent)} · {shortNameA} pagó {formatEUR(balance.paidA)}{' '}
+              (corresponde {formatEUR(balance.shareA)}) · {shortNameB} pagó {formatEUR(balance.paidB)}{' '}
+              (corresponde {formatEUR(balance.shareB)})
               {balance.paidComun > 0 ? ` · Cuenta común: ${formatEUR(balance.paidComun)}` : ''}
             </p>
           </div>
@@ -478,202 +726,462 @@ export const MensualView: React.FC = () => {
         )}
       </section>
 
-      {/* Budget vs Real + Transactions Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Transactions list */}
-        <section className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+      {/* Transactions Table (Full width for dense inspection) */}
+      <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4 min-w-0">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <h2 className="font-display text-base font-bold">
+            Tabla de movimientos ({filteredAndSortedTransactions.length} de {monthTransactions.length})
+          </h2>
+
+          {!isClosed && selectedTxIds.size > 0 && (
+            <button
+              type="button"
+              onClick={() => setConfirmBulkDeleteTx(true)}
+              className="min-h-[40px] px-3.5 rounded-xl bg-[#DC4C3E] text-white text-xs font-semibold flex items-center gap-1.5 self-start md:self-auto"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>Eliminar seleccionados ({selectedTxIds.size})</span>
+            </button>
+          )}
+        </div>
+
+        {/* Search & Filters */}
+        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+          <div className="sm:col-span-6 relative">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="search"
+              aria-label="Buscar movimientos"
+              value={txSearch}
+              onChange={(e) => setTxSearch(e.target.value)}
+              placeholder="Buscar por concepto, categoría o nota..."
+              className="w-full min-h-[42px] pl-10 pr-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F6F8F8] dark:bg-slate-900 text-xs sm:text-sm"
+            />
+          </div>
+          <div className="sm:col-span-3">
+            <select
+              aria-label="Filtrar por categoría"
+              value={categoryFilter}
+              onChange={(e) => setCategoryFilter(e.target.value as TransactionCategory | 'todas')}
+              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+            >
+              <option value="todas">Todas las categorías</option>
+              {(Object.keys(TRANSACTION_CATEGORY_LABELS) as TransactionCategory[]).map((cat) => (
+                <option key={cat} value={cat}>
+                  {TRANSACTION_CATEGORY_LABELS[cat]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="sm:col-span-3">
+            <select
+              aria-label="Filtrar por pagador"
+              value={payerFilter}
+              onChange={(e) => setPayerFilter(e.target.value)}
+              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+            >
+              <option value="todos">Todos los pagadores</option>
+              {memberA && <option value={memberA.uid}>{fullNameA}</option>}
+              {memberB && <option value={memberB.uid}>{fullNameB}</option>}
+              <option value={COMMON_ACCOUNT_ID}>Cuenta común</option>
+            </select>
+          </div>
+        </div>
+
+        {filteredAndSortedTransactions.length === 0 ? (
+          <div className="py-10 text-center space-y-2">
+            <p className="text-sm font-semibold">
+              {monthTransactions.length === 0
+                ? `No hay gastos en ${formatMonthLabelES(selectedMonthKey)}`
+                : 'Ningún movimiento coincide con los filtros'}
+            </p>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {monthTransactions.length === 0
+                ? 'Pulsa «Añadir gasto» o genera los gastos fijos desde vuestras plantillas.'
+                : 'Prueba a limpiar la búsqueda o cambiar los filtros.'}
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs sm:text-sm border-collapse">
+              <thead>
+                <tr className="border-b border-slate-200 dark:border-slate-800 text-xs text-slate-500 dark:text-slate-400">
+                  {!isClosed && (
+                    <th className="py-2.5 pr-2 w-8">
+                      <input
+                        type="checkbox"
+                        aria-label="Seleccionar todos los movimientos visibles"
+                        checked={allVisibleSelected}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedTxIds(new Set(filteredAndSortedTransactions.map((t) => t.id)));
+                          } else {
+                            setSelectedTxIds(new Set());
+                          }
+                        }}
+                        className="w-4 h-4 accent-[#0E5A64]"
+                      />
+                    </th>
+                  )}
+                  <th className="py-2.5 pr-3">
+                    <button
+                      type="button"
+                      onClick={() => handleSortClick('date')}
+                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                    >
+                      <span>Fecha</span>
+                      <ArrowUpDown className="w-3 h-3" />
+                    </button>
+                  </th>
+                  <th className="py-2.5 pr-3">
+                    <button
+                      type="button"
+                      onClick={() => handleSortClick('concept')}
+                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                    >
+                      <span>Concepto</span>
+                      <ArrowUpDown className="w-3 h-3" />
+                    </button>
+                  </th>
+                  <th className="py-2.5 pr-3">
+                    <button
+                      type="button"
+                      onClick={() => handleSortClick('category')}
+                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                    >
+                      <span>Categoría</span>
+                      <ArrowUpDown className="w-3 h-3" />
+                    </button>
+                  </th>
+                  <th className="py-2.5 pr-3 font-semibold">Pagó</th>
+                  <th className="py-2.5 pr-3 font-semibold text-right">Reparto</th>
+                  <th className="py-2.5 pr-3 text-right">
+                    <button
+                      type="button"
+                      onClick={() => handleSortClick('amount')}
+                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                    >
+                      <span>Importe</span>
+                      <ArrowUpDown className="w-3 h-3" />
+                    </button>
+                  </th>
+                  {!isClosed && <th className="py-2.5 text-right font-semibold">Acciones</th>}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                {filteredAndSortedTransactions.map((tx) => {
+                  const isInline = inlineEditId === tx.id;
+                  const isSelected = selectedTxIds.has(tx.id);
+                  return (
+                    <tr
+                      key={tx.id}
+                      className={isSelected ? 'bg-[#0E5A64]/5 dark:bg-[#0E5A64]/15' : undefined}
+                    >
+                      {!isClosed && (
+                        <td className="py-2.5 pr-2 align-middle">
+                          <input
+                            type="checkbox"
+                            aria-label={`Seleccionar ${tx.concept}`}
+                            checked={isSelected}
+                            onChange={(e) => {
+                              setSelectedTxIds((prev) => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(tx.id);
+                                else next.delete(tx.id);
+                                return next;
+                              });
+                            }}
+                            className="w-4 h-4 accent-[#0E5A64]"
+                          />
+                        </td>
+                      )}
+
+                      <td className="py-2.5 pr-3 whitespace-nowrap text-slate-500 dark:text-slate-400">
+                        {formatDateES(tx.date)}
+                      </td>
+
+                      <td className="py-2.5 pr-3 min-w-[150px]">
+                        {isInline ? (
+                          <input
+                            type="text"
+                            aria-label="Editar concepto en línea"
+                            value={inlineConcept}
+                            onChange={(e) => setInlineConcept(e.target.value)}
+                            className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                          />
+                        ) : (
+                          <div>
+                            <p className="font-semibold">
+                              {tx.concept}
+                              {tx.isSettlement ? ' · Liquidación' : ''}
+                            </p>
+                            {tx.notes && (
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate max-w-[220px]">
+                                {tx.notes}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </td>
+
+                      <td className="py-2.5 pr-3 whitespace-nowrap">
+                        {isInline ? (
+                          <select
+                            aria-label="Editar categoría en línea"
+                            value={inlineCategory}
+                            onChange={(e) => setInlineCategory(e.target.value as ExpenseCategory)}
+                            className="min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                          >
+                            {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
+                              <option key={cat} value={cat}>
+                                {EXPENSE_CATEGORY_LABELS[cat]}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="text-slate-600 dark:text-slate-300">
+                            {TRANSACTION_CATEGORY_LABELS[tx.category]}
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="py-2.5 pr-3 whitespace-nowrap">
+                        {isInline ? (
+                          <select
+                            aria-label="Editar pagador en línea"
+                            value={inlinePaidBy}
+                            onChange={(e) => setInlinePaidBy(e.target.value)}
+                            className="min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                          >
+                            {memberA && <option value={memberA.uid}>{shortNameA}</option>}
+                            {memberB && <option value={memberB.uid}>{shortNameB}</option>}
+                            <option value={COMMON_ACCOUNT_ID}>Cuenta común</option>
+                          </select>
+                        ) : (
+                          <span>{memberLabel(tx.paidBy)}</span>
+                        )}
+                      </td>
+
+                      <td className="py-2.5 pr-3 text-right whitespace-nowrap tabular-nums">
+                        {isInline ? (
+                          <input
+                            type="number"
+                            aria-label="Editar reparto en línea (%)"
+                            min={0}
+                            max={100}
+                            step={0.5}
+                            value={inlineSplitPct}
+                            onChange={(e) => setInlineSplitPct(e.target.value)}
+                            className="w-16 min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-right"
+                          />
+                        ) : tx.paidBy === COMMON_ACCOUNT_ID || tx.paidBy === 'comun' ? (
+                          <span className="text-slate-400">—</span>
+                        ) : (
+                          <span className="text-slate-500 dark:text-slate-400">
+                            {tx.splitPctA}/{Math.round((100 - tx.splitPctA) * 10) / 10}%
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="py-2.5 pr-3 text-right whitespace-nowrap">
+                        {isInline ? (
+                          <input
+                            type="text"
+                            aria-label="Editar importe en línea"
+                            inputMode="decimal"
+                            value={inlineAmount}
+                            onChange={(e) => setInlineAmount(e.target.value)}
+                            className="w-24 min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-xs text-right font-bold"
+                          />
+                        ) : (
+                          <span
+                            className={`font-mono-num font-bold ${
+                              tx.isSettlement ? 'text-[#15803D] dark:text-[#4ADE80]' : ''
+                            }`}
+                          >
+                            {formatEUR(tx.amount)}
+                          </span>
+                        )}
+                      </td>
+
+                      {!isClosed && (
+                        <td className="py-2.5 text-right whitespace-nowrap">
+                          {isInline ? (
+                            <div className="inline-flex items-center gap-1">
+                              <button
+                                type="button"
+                                aria-label="Guardar edición en línea"
+                                onClick={() => void handleSaveInlineEdit(tx)}
+                                className="min-h-[36px] min-w-[36px] rounded-lg bg-[#0E5A64] text-white inline-flex items-center justify-center"
+                              >
+                                <Check className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label="Cancelar edición en línea"
+                                onClick={() => setInlineEditId(null)}
+                                className="min-h-[36px] min-w-[36px] rounded-lg border border-slate-300 dark:border-slate-700 inline-flex items-center justify-center"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="inline-flex items-center gap-1">
+                              {!tx.isSettlement && (
+                                <button
+                                  type="button"
+                                  aria-label={`Edición rápida de ${tx.concept}`}
+                                  title="Editar en línea (doble clic o lápiz para detalle)"
+                                  onClick={() => startInlineEdit(tx)}
+                                  onDoubleClick={() => {
+                                    setInlineEditId(null);
+                                    setEditingTx(tx);
+                                    setTxModalOpen(true);
+                                  }}
+                                  className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                >
+                                  <Pencil className="w-4 h-4" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                aria-label={`Eliminar ${tx.concept}`}
+                                onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
+                                className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* Budget vs Real + Recurring Templates */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="font-display text-base font-bold">
-              Movimientos ({monthTransactions.length})
-            </h2>
+            <h2 className="font-display text-base font-bold">Presupuesto vs real</h2>
+            {!isClosed && (
+              <button
+                type="button"
+                onClick={openBudgetEditor}
+                className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                <span>Editar límites</span>
+              </button>
+            )}
           </div>
 
-          {monthTransactions.length === 0 ? (
-            <div className="py-10 text-center space-y-2">
-              <p className="text-sm font-semibold">No hay gastos en {formatMonthLabelES(selectedMonthKey)}</p>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Pulsa «Añadir gasto» o genera los gastos fijos desde vuestras plantillas.
-              </p>
-            </div>
+          {budgetProgress.length === 0 ? (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Define límites mensuales por categoría para activar el semáforo de control.
+            </p>
           ) : (
-            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {monthTransactions.map((tx) => (
-                <li key={tx.id} className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold truncate">
-                      {tx.concept}
-                      {tx.isSettlement ? ' · Liquidación' : ''}
-                    </p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {formatDateES(tx.date)} · {TRANSACTION_CATEGORY_LABELS[tx.category]} · Pagó: {memberLabel(tx.paidBy)}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <span
-                      className={`font-mono-num text-sm font-bold mr-1 ${
-                        tx.isSettlement ? 'text-[#15803D] dark:text-[#4ADE80]' : ''
-                      }`}
-                    >
-                      {formatEUR(tx.amount)}
-                    </span>
-                    {!isClosed && (
+            <div className="space-y-3.5">
+              {budgetProgress.map((bp) => {
+                const badge = statusBadge(bp.status);
+                const barWidth = bp.limit > 0 ? Math.min(100, bp.pct) : 0;
+                return (
+                  <div key={bp.category} className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-semibold">
+                        {EXPENSE_CATEGORY_LABELS[bp.category]}
+                      </span>
+                      <span className="tabular-nums">
+                        <strong>{formatEUR(bp.spent)}</strong>
+                        {bp.limit > 0 ? ` / ${formatEUR(bp.limit)}` : ''}
+                      </span>
+                    </div>
+                    {bp.limit > 0 && (
                       <>
-                        {!tx.isSettlement && (
-                          <button
-                            type="button"
-                            aria-label={`Editar ${tx.concept}`}
-                            onClick={() => {
-                              setEditingTx(tx);
-                              setTxModalOpen(true);
-                            }}
-                            className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                          >
-                            <Pencil className="w-4 h-4" />
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          aria-label={`Eliminar ${tx.concept}`}
-                          onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
-                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        <div className="h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-500 ${badge.bar}`}
+                            style={{ width: `${barWidth}%` }}
+                          />
+                        </div>
+                        <div className="flex justify-between text-[11px]">
+                          <span className={`font-medium ${badge.text}`}>{badge.label}</span>
+                          <span className="tabular-nums text-slate-500 dark:text-slate-400">{bp.pct}%</span>
+                        </div>
                       </>
                     )}
                   </div>
-                </li>
-              ))}
-            </ul>
+                );
+              })}
+            </div>
           )}
         </section>
 
-        {/* Budget vs Real + Recurring */}
-        <div className="lg:col-span-5 space-y-6">
-          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="font-display text-base font-bold">Presupuesto vs real</h2>
-              {!isClosed && (
-                <button
-                  type="button"
-                  onClick={openBudgetEditor}
-                  className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5"
-                >
-                  <SlidersHorizontal className="w-3.5 h-3.5" />
-                  <span>Editar límites</span>
-                </button>
-              )}
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <CalendarClock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+              <h2 className="font-display text-base font-bold">Plantillas y calendario</h2>
             </div>
+            <button
+              type="button"
+              onClick={() => openRecModal(null)}
+              className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Plantilla</span>
+            </button>
+          </div>
 
-            {budgetProgress.length === 0 ? (
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Define límites mensuales por categoría para activar el semáforo de control.
-              </p>
-            ) : (
-              <div className="space-y-3.5">
-                {budgetProgress.map((bp) => {
-                  const badge = statusBadge(bp.status);
-                  const barWidth = bp.limit > 0 ? Math.min(100, bp.pct) : 0;
-                  return (
-                    <div key={bp.category} className="space-y-1.5">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-semibold">
-                          {EXPENSE_CATEGORY_LABELS[bp.category]}
-                        </span>
-                        <span className="tabular-nums">
-                          <strong>{formatEUR(bp.spent)}</strong>
-                          {bp.limit > 0 ? ` / ${formatEUR(bp.limit)}` : ''}
-                        </span>
-                      </div>
-                      {bp.limit > 0 && (
-                        <>
-                          <div className="h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
-                            <div
-                              className={`h-full rounded-full transition-all duration-500 ${badge.bar}`}
-                              style={{ width: `${barWidth}%` }}
-                            />
-                          </div>
-                          <div className="flex justify-between text-[11px]">
-                            <span className={`font-medium ${badge.text}`}>{badge.label}</span>
-                            <span className="tabular-nums text-slate-500 dark:text-slate-400">{bp.pct}%</span>
-                          </div>
-                        </>
-                      )}
+          {recurring.length === 0 ? (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Añade alquiler, luz, agua o seguros para generar el mes en un toque.
+            </p>
+          ) : (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+              {recurring.map((rec) => {
+                const equiv = monthlyEquivalent(rec.amount, rec.frequency);
+                return (
+                  <li key={rec.id} className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className={`text-sm font-semibold truncate ${!rec.active ? 'opacity-50' : ''}`}>
+                        Día {rec.dayOfMonth} · {rec.concept}
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        {FREQUENCY_LABELS[rec.frequency]} · {memberLabel(rec.paidByDefault)}
+                        {rec.frequency !== 'mensual' ? ` · Equiv. mensual: ${formatEUR(equiv)}` : ''}
+                      </p>
                     </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-
-          {/* Recurring Templates & Simple Day-of-Month Calendar */}
-          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <CalendarClock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
-                <h2 className="font-display text-base font-bold">Plantillas y calendario</h2>
-              </div>
-              <button
-                type="button"
-                onClick={() => openRecModal(null)}
-                className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Plantilla</span>
-              </button>
-            </div>
-
-            {recurring.length === 0 ? (
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Añade alquiler, luz, agua o seguros para generar el mes en un toque.
-              </p>
-            ) : (
-              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-                {recurring.map((rec) => {
-                  const equiv = monthlyEquivalent(rec.amount, rec.frequency);
-                  return (
-                    <li key={rec.id} className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className={`text-sm font-semibold truncate ${!rec.active ? 'opacity-50' : ''}`}>
-                          Día {rec.dayOfMonth} · {rec.concept}
-                        </p>
-                        <p className="text-xs text-slate-500 dark:text-slate-400">
-                          {FREQUENCY_LABELS[rec.frequency]} · {memberLabel(rec.paidByDefault)}
-                          {rec.frequency !== 'mensual'
-                            ? ` · Equiv. mensual: ${formatEUR(equiv)}`
-                            : ''}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <span className="font-mono-num text-xs font-bold">{formatEUR(rec.amount)}</span>
-                        {uiMode === 'avanzado' && (
-                          <>
-                            <button
-                              type="button"
-                              aria-label={`Editar plantilla ${rec.concept}`}
-                              onClick={() => openRecModal(rec)}
-                              className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                            >
-                              <Pencil className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={`Eliminar plantilla ${rec.concept}`}
-                              onClick={() => setDeleteTarget({ kind: 'rec', item: rec })}
-                              className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </section>
-        </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <span className="font-mono-num text-xs font-bold">{formatEUR(rec.amount)}</span>
+                      <button
+                        type="button"
+                        aria-label={`Editar plantilla ${rec.concept}`}
+                        onClick={() => openRecModal(rec)}
+                        className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Eliminar plantilla ${rec.concept}`}
+                        onClick={() => setDeleteTarget({ kind: 'rec', item: rec })}
+                        className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
       </div>
 
       {/* Modals */}
@@ -770,9 +1278,9 @@ export const MensualView: React.FC = () => {
                   onChange={(e) => setRecPaidBy(e.target.value)}
                   className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                 >
-                  <option value="cuenta_comun">Cuenta común</option>
-                  {memberA && <option value={memberA.uid}>{nameA}</option>}
-                  {memberB && <option value={memberB.uid}>{nameB}</option>}
+                  <option value={COMMON_ACCOUNT_ID}>Cuenta común</option>
+                  {memberA && <option value={memberA.uid}>{shortNameA}</option>}
+                  {memberB && <option value={memberB.uid}>{shortNameB}</option>}
                 </select>
               </div>
               <label className="flex items-center gap-2 text-sm pt-1">
@@ -865,6 +1373,15 @@ export const MensualView: React.FC = () => {
         confirmLabel="Eliminar"
         onConfirm={() => void handleConfirmDelete()}
         onCancel={() => setDeleteTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={confirmBulkDeleteTx}
+        title="Eliminar movimientos seleccionados"
+        description={`Se eliminarán ${selectedTxIds.size} movimientos de ${formatMonthLabelES(selectedMonthKey)}.`}
+        confirmLabel={`Eliminar ${selectedTxIds.size}`}
+        onConfirm={() => void handleConfirmBulkDeleteTx()}
+        onCancel={() => setConfirmBulkDeleteTx(false)}
       />
 
       <ConfirmDialog

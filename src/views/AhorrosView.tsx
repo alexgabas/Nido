@@ -5,6 +5,7 @@ import {
   Download,
   FileSpreadsheet,
   Pencil,
+  PiggyBank,
   Plus,
   ShieldCheck,
   Sparkles,
@@ -50,14 +51,14 @@ export const AhorrosView: React.FC = () => {
 
   const todayISO = getTodayLocalISO();
 
-  // 2-tap Movement modal
+  // Movement modal
   const [moveGoal, setMoveGoal] = useState<SavingsGoal | null>(null);
   const [moveDirection, setMoveDirection] = useState<'add' | 'withdraw'>('add');
   const [moveAmount, setMoveAmount] = useState('');
   const [moveBy, setMoveBy] = useState(currentUserProfile?.uid || memberA?.uid || '');
   const [moveNote, setMoveNote] = useState('');
 
-  // Goal create/edit modal
+  // Goal create/edit modal (Avanzado)
   const [goalModalOpen, setGoalModalOpen] = useState(false);
   const [editingGoal, setEditingGoal] = useState<SavingsGoal | null>(null);
   const [goalName, setGoalName] = useState('');
@@ -66,7 +67,6 @@ export const AhorrosView: React.FC = () => {
   const [goalType, setGoalType] = useState<GoalType>('custom');
   const [goalColor, setGoalColor] = useState('#0E5A64');
 
-  // Celebration banner
   const [celebratedGoalName, setCelebratedGoalName] = useState<string | null>(null);
   const [deleteGoalTarget, setDeleteGoalTarget] = useState<SavingsGoal | null>(null);
 
@@ -80,6 +80,11 @@ export const AhorrosView: React.FC = () => {
   const totalSaved = useMemo(
     () => roundCents(goalsProgress.reduce((s, p) => s + p.savedAmount, 0)),
     [goalsProgress]
+  );
+
+  const totalTarget = useMemo(
+    () => roundCents(activeGoals.reduce((s, g) => s + Math.max(0, Number(g.targetAmount) || 0), 0)),
+    [activeGoals]
   );
 
   const emergency3x = useMemo(() => computeEmergencyTarget(recurring, 3), [recurring]);
@@ -114,7 +119,10 @@ export const AhorrosView: React.FC = () => {
     if (!moveGoal || !householdId || !currentUserProfile) return;
     const rawAmt = Number(moveAmount.replace(',', '.'));
     if (!Number.isFinite(rawAmt) || rawAmt <= 0) return;
-    const signed = moveDirection === 'add' ? Math.round(rawAmt * 100) / 100 : -Math.round(rawAmt * 100) / 100;
+    const signed =
+      moveDirection === 'add'
+        ? Math.round(rawAmt * 100) / 100
+        : -Math.round(rawAmt * 100) / 100;
 
     const currentProg = computeGoalProgress(moveGoal, goalMovements, todayISO);
     const willComplete =
@@ -141,7 +149,7 @@ export const AhorrosView: React.FC = () => {
       setCelebratedGoalName(completedName);
       window.setTimeout(() => setCelebratedGoalName(null), 5000);
     } else {
-      showToast(signed > 0 ? 'Aportación registrada' : 'Retirada registrada');
+      showToast(signed > 0 ? 'Aportación guardada' : 'Retirada guardada');
     }
   };
 
@@ -222,6 +230,238 @@ export const AhorrosView: React.FC = () => {
     showToast('PDF de ahorros descargado');
   };
 
+  const movementModal = moveGoal && (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="move-modal-title"
+    >
+      <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4">
+        <h2 id="move-modal-title" className="font-display text-lg font-bold">
+          {moveDirection === 'add' ? 'Aportar a' : 'Retirar de'} {moveGoal.name}
+        </h2>
+        <form onSubmit={handleSaveMovement} className="space-y-4">
+          <div>
+            <label htmlFor="move-amount" className="block text-xs font-medium mb-1">
+              Importe (€)
+            </label>
+            <input
+              id="move-amount"
+              type="text"
+              inputMode="decimal"
+              required
+              autoFocus
+              value={moveAmount}
+              onChange={(e) => setMoveAmount(e.target.value)}
+              placeholder="100,00"
+              className="w-full min-h-[50px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-2xl font-bold"
+            />
+          </div>
+
+          <div>
+            <span className="block text-xs font-medium mb-1.5">Quién</span>
+            <div className="grid grid-cols-2 gap-2">
+              {memberA && (
+                <button
+                  type="button"
+                  onClick={() => setMoveBy(memberA.uid)}
+                  className={`min-h-[48px] px-3 rounded-xl text-sm font-semibold border transition-colors truncate ${
+                    moveBy === memberA.uid
+                      ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                      : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  {memberA.displayName}
+                </button>
+              )}
+              {memberB && (
+                <button
+                  type="button"
+                  onClick={() => setMoveBy(memberB.uid)}
+                  className={`min-h-[48px] px-3 rounded-xl text-sm font-semibold border transition-colors truncate ${
+                    moveBy === memberB.uid
+                      ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                      : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  {memberB.displayName}
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="move-note" className="block text-xs font-medium mb-1">
+              Nota (opcional)
+            </label>
+            <input
+              id="move-note"
+              type="text"
+              maxLength={240}
+              value={moveNote}
+              onChange={(e) => setMoveNote(e.target.value)}
+              placeholder="Ej. Ahorro de este mes"
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+            />
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setMoveGoal(null)}
+              className="min-h-[46px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              className="min-h-[46px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold"
+            >
+              Confirmar
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+
+  // ─── MODO SENCILLO: SOLO TOTAL + TARJETAS DE METAS CON APORTAR / RETIRAR ────
+  if (uiMode === 'sencillo') {
+    const overallBarPct =
+      totalTarget > 0 ? Math.min(100, Math.round((totalSaved / totalTarget) * 100)) : 0;
+
+    return (
+      <div className="space-y-5 max-w-2xl mx-auto">
+        <header className="space-y-1">
+          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">Ahorros</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            Vuestras metas para aportar o retirar cuando lo necesitéis.
+          </p>
+        </header>
+
+        {celebratedGoalName && (
+          <div
+            role="status"
+            className="rounded-2xl bg-[#15803D] text-white p-4 flex items-center gap-3 shadow-md"
+          >
+            <Sparkles className="w-6 h-6 shrink-0" />
+            <div>
+              <p className="font-display font-bold text-base">
+                ¡Meta «{celebratedGoalName}» completada!
+              </p>
+              <p className="text-xs text-white/90">Habéis llegado al objetivo.</p>
+            </div>
+          </div>
+        )}
+
+        {/* Total savings summary card (no donut, no %) */}
+        <section className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+                Total ahorrado juntos
+              </p>
+              <p className="font-display text-3xl font-bold tabular-nums text-[#15803D] dark:text-[#4ADE80] mt-0.5">
+                {formatEUR(totalSaved)}
+              </p>
+            </div>
+            <span className="w-12 h-12 rounded-2xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] flex items-center justify-center shrink-0">
+              <PiggyBank className="w-6 h-6" />
+            </span>
+          </div>
+          {totalTarget > 0 && (
+            <div className="space-y-1.5">
+              <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#15803D] dark:bg-[#4ADE80] transition-all duration-500"
+                  style={{ width: `${overallBarPct}%` }}
+                />
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                Objetivo total: {formatEUR(totalTarget)}
+              </p>
+            </div>
+          )}
+        </section>
+
+        {/* Goal Cards */}
+        {goalsProgress.length === 0 ? (
+          <div className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
+            <p className="text-base font-bold">No tenéis metas de ahorro todavía</p>
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Cuando creéis una meta aparecerá aquí para ir sumando.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {goalsProgress.map(({ goal, savedAmount, pct, remaining, isCompleted }) => (
+              <article
+                key={goal.id}
+                className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <h2 className="font-display text-lg font-bold">{goal.name}</h2>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {isCompleted
+                        ? 'Objetivo conseguido'
+                        : remaining > 0
+                          ? `Faltan ${formatEUR(remaining)}`
+                          : GOAL_TYPE_LABELS[goal.type]}
+                    </p>
+                  </div>
+                  <p className="font-display text-xl font-bold tabular-nums text-[#0F1F24] dark:text-[#F0F5F6]">
+                    {formatEUR(savedAmount)}
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="h-3.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-700 ease-out"
+                      style={{
+                        width: `${pct}%`,
+                        backgroundColor: isCompleted ? '#15803D' : goal.color || '#0E5A64',
+                      }}
+                    />
+                  </div>
+                  {goal.targetAmount > 0 && (
+                    <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                      Objetivo: {formatEUR(goal.targetAmount)}
+                    </p>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => openMovementModal(goal, 'add')}
+                    className="min-h-[48px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold flex items-center justify-center gap-2 transition-colors"
+                  >
+                    <ArrowUpCircle className="w-5 h-5" />
+                    <span>Aportar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openMovementModal(goal, 'withdraw')}
+                    className="min-h-[48px] px-4 rounded-2xl border border-slate-200 dark:border-slate-700 text-sm font-bold flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    <ArrowDownCircle className="w-5 h-5" />
+                    <span>Retirar</span>
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+
+        {movementModal}
+      </div>
+    );
+  }
+
+  // ─── MODO AVANZADO ──────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -230,7 +470,7 @@ export const AhorrosView: React.FC = () => {
             Ahorros y metas
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Colchón de emergencia, viajes y objetivos compartidos.
+            Colchón de emergencia, viajes y objetivos compartidos con reparto por miembro.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -264,7 +504,7 @@ export const AhorrosView: React.FC = () => {
       {celebratedGoalName && (
         <div
           role="status"
-          className="rounded-2xl bg-[#15803D] text-white p-4 flex items-center gap-3 shadow-md transition-transform"
+          className="rounded-2xl bg-[#15803D] text-white p-4 flex items-center gap-3 shadow-md"
         >
           <Sparkles className="w-6 h-6 shrink-0" />
           <div>
@@ -298,7 +538,7 @@ export const AhorrosView: React.FC = () => {
             {memberShares.map((ms) => (
               <div key={ms.uid} className="space-y-1">
                 <div className="flex items-center justify-between text-sm">
-                  <span className="font-semibold">{ms.displayName.split(' ')[0]}</span>
+                  <span className="font-semibold">{ms.displayName}</span>
                   <span className="font-mono-num font-bold">{formatEUR(ms.totalContributed)}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
@@ -374,26 +614,24 @@ export const AhorrosView: React.FC = () => {
                     {goal.targetDate ? ` · Objetivo ${formatDateES(goal.targetDate)}` : ''}
                   </p>
                 </div>
-                {uiMode === 'avanzado' && (
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      aria-label={`Editar meta ${goal.name}`}
-                      onClick={() => openGoalEditor(goal)}
-                      className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                    >
-                      <Pencil className="w-4 h-4" />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Eliminar meta ${goal.name}`}
-                      onClick={() => setDeleteGoalTarget(goal)}
-                      className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                )}
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    aria-label={`Editar meta ${goal.name}`}
+                    onClick={() => openGoalEditor(goal)}
+                    className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Eliminar meta ${goal.name}`}
+                    onClick={() => setDeleteGoalTarget(goal)}
+                    className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
 
               <div className="space-y-2">
@@ -449,72 +687,79 @@ export const AhorrosView: React.FC = () => {
         </div>
       )}
 
-      {/* 2-tap Movement Modal */}
-      {moveGoal && (
-        <div
-          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="move-modal-title"
-        >
-          <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4">
-            <h2 id="move-modal-title" className="font-display text-lg font-bold">
-              {moveDirection === 'add' ? 'Aportar a' : 'Retirar de'} {moveGoal.name}
-            </h2>
-            <form onSubmit={handleSaveMovement} className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium mb-1">Importe (€)</label>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  required
-                  autoFocus
-                  value={moveAmount}
-                  onChange={(e) => setMoveAmount(e.target.value)}
-                  placeholder="100,00"
-                  className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-xl font-bold"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Persona</label>
-                <select
-                  value={moveBy}
-                  onChange={(e) => setMoveBy(e.target.value)}
-                  className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
-                >
-                  {memberA && <option value={memberA.uid}>{memberA.displayName}</option>}
-                  {memberB && <option value={memberB.uid}>{memberB.displayName}</option>}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Nota (opcional)</label>
-                <input
-                  type="text"
-                  maxLength={240}
-                  value={moveNote}
-                  onChange={(e) => setMoveNote(e.target.value)}
-                  className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
-                />
-              </div>
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setMoveGoal(null)}
-                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium"
-                >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold"
-                >
-                  Confirmar
-                </button>
-              </div>
-            </form>
+      {/* Advanced: Recent Goal Movements Table */}
+      <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+        <h2 className="font-display text-base font-bold">
+          Historial de movimientos ({goalMovements.length})
+        </h2>
+        {goalMovements.length === 0 ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Todavía no hay aportaciones o retiradas registradas.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs sm:text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 dark:border-slate-800 text-xs text-slate-500 dark:text-slate-400">
+                  <th className="py-2 pr-3 font-semibold">Fecha</th>
+                  <th className="py-2 pr-3 font-semibold">Meta</th>
+                  <th className="py-2 pr-3 font-semibold">Persona</th>
+                  <th className="py-2 pr-3 font-semibold">Nota</th>
+                  <th className="py-2 pr-3 font-semibold text-right">Importe</th>
+                  <th className="py-2 font-semibold text-right">Acción</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                {goalMovements.slice(0, 20).map((m) => {
+                  const goalNameForMov = goals.find((g) => g.id === m.goalId)?.name || 'Meta';
+                  const personName =
+                    members.find((mb) => mb.uid === m.by)?.displayName?.split(' ')[0] || m.by;
+                  return (
+                    <tr key={m.id}>
+                      <td className="py-2.5 pr-3 whitespace-nowrap text-slate-500 dark:text-slate-400">
+                        {formatDateES(m.date)}
+                      </td>
+                      <td className="py-2.5 pr-3 font-semibold">{goalNameForMov}</td>
+                      <td className="py-2.5 pr-3">{personName}</td>
+                      <td className="py-2.5 pr-3 text-slate-500 dark:text-slate-400 max-w-[180px] truncate">
+                        {m.note || '—'}
+                      </td>
+                      <td
+                        className={`py-2.5 pr-3 text-right font-mono-num font-bold whitespace-nowrap ${
+                          m.amount >= 0 ? 'text-[#15803D] dark:text-[#4ADE80]' : 'text-[#DC4C3E]'
+                        }`}
+                      >
+                        {m.amount >= 0 ? `+${formatEUR(m.amount)}` : formatEUR(m.amount)}
+                      </td>
+                      <td className="py-2.5 text-right">
+                        <button
+                          type="button"
+                          aria-label={`Eliminar movimiento de ${goalNameForMov}`}
+                          onClick={() =>
+                            householdId &&
+                            currentUserProfile &&
+                            void repo.deleteGoalMovement(
+                              householdId,
+                              m.id,
+                              goalNameForMov,
+                              currentUserProfile
+                            )
+                          }
+                          className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
-        </div>
-      )}
+        )}
+      </section>
+
+      {movementModal}
 
       {/* Create/Edit Goal Modal */}
       {goalModalOpen && (

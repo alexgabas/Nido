@@ -1,12 +1,16 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   CalendarDays,
+  ChevronDown,
   Home,
+  LogOut,
+  Moon,
   Package,
   PiggyBank,
   Plus,
   RotateCcw,
   Settings,
+  Sun,
   WifiOff,
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
@@ -14,7 +18,11 @@ import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import type { NavTab } from '../types/nido';
 import { QuickExpenseModal } from './QuickExpenseModal';
 
-const NAV_ITEMS: Array<{ id: NavTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+const AVANZADO_NAV_ITEMS: Array<{
+  id: NavTab;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}> = [
   { id: 'inicio', label: 'Inicio', icon: Home },
   { id: 'mudanza', label: 'Mudanza', icon: Package },
   { id: 'mensual', label: 'Mensual', icon: CalendarDays },
@@ -22,11 +30,35 @@ const NAV_ITEMS: Array<{ id: NavTab; label: string; icon: React.ComponentType<{ 
   { id: 'ajustes', label: 'Ajustes', icon: Settings },
 ];
 
+const SENCILLO_DESKTOP_NAV_ITEMS: Array<{
+  id: NavTab;
+  label: string;
+}> = [
+  { id: 'inicio', label: 'Inicio' },
+  { id: 'ahorros', label: 'Ahorros' },
+];
+
+function getInitials(name: string | undefined): string {
+  const clean = (name || 'U').trim();
+  if (!clean) return 'U';
+  const parts = clean.split(/\s+/);
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  }
+  return clean.slice(0, 2).toUpperCase();
+}
+
 export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const {
     household,
+    currentUserProfile,
+    currentMember,
     activeTab,
     setActiveTab,
+    uiMode,
+    toggleUiMode,
+    theme,
+    toggleTheme,
     quickExpenseOpen,
     setQuickExpenseOpen,
     toastMessage,
@@ -34,37 +66,75 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
     dismissUndo,
     isDemoMode,
     exitDemoMode,
+    logout,
     seedPending,
     seedingDefaults,
     retryDefaultSeed,
   } = useNido();
   const isOnline = useOnlineStatus();
 
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [switchingMode, setSwitchingMode] = useState(false);
+  const menuContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (menuContainerRef.current && !menuContainerRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [menuOpen]);
+
+  const handleToggleMode = async () => {
+    if (switchingMode) return;
+    setSwitchingMode(true);
+    try {
+      await toggleUiMode();
+    } finally {
+      setSwitchingMode(false);
+    }
+  };
+
+  const displayName = currentMember?.displayName || currentUserProfile?.displayName || 'Usuario';
+  const photoURL = currentMember?.photoURL || currentUserProfile?.photoURL || '';
+  const desktopNavItems = uiMode === 'sencillo' ? SENCILLO_DESKTOP_NAV_ITEMS : AVANZADO_NAV_ITEMS;
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F6F8F8] dark:bg-[#0B1316] text-[#0F1F24] dark:text-[#F0F5F6]">
-      {/* Top Bar: 3 zones on desktop, compact 52px on mobile */}
-      <header className="sticky top-0 z-30 h-[54px] md:h-16 bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
-        <div className="max-w-6xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-4 md:gap-8">
+      {/* Top Bar */}
+      <header className="sticky top-0 z-30 h-[56px] md:h-16 bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
+        <div className="max-w-6xl mx-auto h-full px-3 sm:px-6 flex items-center justify-between gap-3 md:gap-8">
           {/* Zone 1: Brand wordmark */}
           <button
             type="button"
             onClick={() => setActiveTab('inicio')}
-            className="font-display font-bold text-lg tracking-tight text-[#0E5A64] dark:text-[#5EEAD4] whitespace-nowrap shrink-0 flex items-center gap-2 min-h-[44px]"
+            className="font-display font-bold text-lg tracking-tight text-[#0E5A64] dark:text-[#5EEAD4] whitespace-nowrap shrink-0 flex items-center gap-2 min-h-[44px] min-w-0"
           >
             <span>Nido</span>
             {household?.name && (
-              <span className="hidden sm:inline font-sans font-normal text-sm text-slate-500 dark:text-slate-400">
+              <span
+                className={`font-sans font-normal text-xs sm:text-sm text-slate-500 dark:text-slate-400 truncate max-w-[135px] sm:max-w-[220px] ${
+                  uiMode === 'avanzado' ? 'hidden sm:inline' : ''
+                }`}
+              >
                 · {household.name}
               </span>
             )}
           </button>
 
-          {/* Zone 2: 5 single-line nav links on desktop */}
-          <nav
-            aria-label="Navegación principal"
-            className="hidden md:flex items-center gap-6"
-          >
-            {NAV_ITEMS.map((item) => {
+          {/* Zone 2: Desktop Navigation */}
+          <nav aria-label="Navegación principal" className="hidden md:flex items-center gap-6">
+            {desktopNavItems.map((item) => {
               const active = activeTab === item.id;
               return (
                 <button
@@ -83,22 +153,191 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
             })}
           </nav>
 
-          {/* Zone 3: 1 primary CTA */}
-          <div className="flex items-center gap-2 shrink-0">
+          {/* Zone 3: Quick Add (desktop or Avanzado mobile) + Top-Right Avatar & Mode Menu */}
+          <div className="flex items-center gap-2 shrink-0" ref={menuContainerRef}>
             <button
               type="button"
+              aria-label="Añadir gasto"
               onClick={() => setQuickExpenseOpen(true)}
-              className="min-h-[40px] sm:min-h-[44px] px-3.5 sm:px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              className={`${
+                uiMode === 'sencillo' ? 'hidden md:flex' : 'flex'
+              } min-h-[40px] sm:min-h-[44px] px-3 sm:px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold items-center gap-1.5 transition-colors whitespace-nowrap shrink-0`}
             >
               <Plus className="w-4 h-4 shrink-0" />
-              <span>Añadir gasto</span>
+              <span className="sm:hidden">Gasto</span>
+              <span className="hidden sm:inline">Añadir gasto</span>
             </button>
+
+            <div className="relative">
+              <button
+                type="button"
+                aria-label={`Menú de ${displayName} (${uiMode === 'sencillo' ? 'Modo Sencillo' : 'Modo Avanzado'})`}
+                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                onClick={() => setMenuOpen((prev) => !prev)}
+                className="min-h-[44px] pl-1.5 pr-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center gap-2 transition-colors"
+              >
+                {photoURL ? (
+                  <img
+                    src={photoURL}
+                    alt={displayName}
+                    className="w-8 h-8 rounded-full object-cover border border-slate-200 dark:border-slate-700 shrink-0"
+                  />
+                ) : (
+                  <span className="w-8 h-8 rounded-full bg-[#0E5A64] text-white text-xs font-bold flex items-center justify-center shrink-0">
+                    {getInitials(displayName)}
+                  </span>
+                )}
+                <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 whitespace-nowrap">
+                  {uiMode === 'sencillo' ? 'Sencillo' : 'Avanzado'}
+                </span>
+                <ChevronDown
+                  className={`w-3.5 h-3.5 text-slate-400 transition-transform ${
+                    menuOpen ? 'rotate-180' : ''
+                  }`}
+                />
+              </button>
+
+              {menuOpen && (
+                <div
+                  role="dialog"
+                  aria-label="Opciones de cuenta y modo"
+                  className="absolute right-0 mt-2 w-72 rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 shadow-xl p-4 space-y-3 z-50"
+                >
+                  <div className="flex items-center gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
+                    {photoURL ? (
+                      <img
+                        src={photoURL}
+                        alt={displayName}
+                        className="w-10 h-10 rounded-full object-cover shrink-0"
+                      />
+                    ) : (
+                      <span className="w-10 h-10 rounded-full bg-[#0E5A64] text-white text-sm font-bold flex items-center justify-center shrink-0">
+                        {getInitials(displayName)}
+                      </span>
+                    )}
+                    <div className="min-w-0">
+                      <p className="text-sm font-bold truncate">{displayName}</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                        {household?.name || 'Hogar'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Clear Mode Toggle Switch */}
+                  <div className="rounded-xl bg-[#F6F8F8] dark:bg-slate-900/90 border border-slate-200/80 dark:border-slate-800 p-3 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-xs font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+                          Modo de la app
+                        </p>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {uiMode === 'sencillo'
+                            ? 'Simple, directo y sin menús técnicos'
+                            : 'Tablas, filtros, gráficos y control total'}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={uiMode === 'avanzado'}
+                        aria-label="Cambiar entre Modo Sencillo y Modo Avanzado"
+                        disabled={switchingMode}
+                        onClick={() => void handleToggleMode()}
+                        className={`relative inline-flex h-8 w-14 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus:outline-2 focus:outline-[#0E5A64] ${
+                          uiMode === 'avanzado'
+                            ? 'bg-[#0E5A64]'
+                            : 'bg-slate-300 dark:bg-slate-700'
+                        }`}
+                      >
+                        <span
+                          className={`pointer-events-none inline-block h-6 w-6 rounded-full bg-white shadow-sm transition-transform ${
+                            uiMode === 'avanzado' ? 'translate-x-6' : 'translate-x-0.5'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 text-[11px] font-semibold text-center rounded-lg bg-white dark:bg-[#132025] p-1 border border-slate-200 dark:border-slate-800">
+                      <button
+                        type="button"
+                        disabled={switchingMode || uiMode === 'sencillo'}
+                        onClick={() => void handleToggleMode()}
+                        className={`min-h-[32px] rounded-md transition-colors ${
+                          uiMode === 'sencillo'
+                            ? 'bg-[#0E5A64] text-white'
+                            : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                        }`}
+                      >
+                        Sencillo
+                      </button>
+                      <button
+                        type="button"
+                        disabled={switchingMode || uiMode === 'avanzado'}
+                        onClick={() => void handleToggleMode()}
+                        className={`min-h-[32px] rounded-md transition-colors ${
+                          uiMode === 'avanzado'
+                            ? 'bg-[#0E5A64] text-white'
+                            : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                        }`}
+                      >
+                        Avanzado
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Quick Secondary Actions */}
+                  <div className="space-y-1">
+                    {uiMode === 'avanzado' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveTab('ajustes');
+                          setMenuOpen(false);
+                        }}
+                        className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      >
+                        <Settings className="w-4 h-4 text-slate-500" />
+                        <span>Ajustes del hogar</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={toggleTheme}
+                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center justify-between hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <span className="flex items-center gap-2.5">
+                        {theme === 'dark' ? (
+                          <Sun className="w-4 h-4 text-slate-500" />
+                        ) : (
+                          <Moon className="w-4 h-4 text-slate-500" />
+                        )}
+                        <span>{theme === 'dark' ? 'Cambiar a tema claro' : 'Cambiar a tema oscuro'}</span>
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        if (isDemoMode) exitDemoMode();
+                        else void logout();
+                      }}
+                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5] flex items-center gap-2.5 hover:bg-[#DC4C3E]/10"
+                    >
+                      <LogOut className="w-4 h-4" />
+                      <span>{isDemoMode ? 'Salir de la vista de prueba' : 'Cerrar sesión'}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
 
       {/* Subtle demo banner when exploring without Google account */}
-      {isDemoMode && (
+      {isDemoMode && uiMode === 'avanzado' && (
         <div className="bg-[#0E5A64]/10 dark:bg-[#2AA1AE]/15 border-b border-[#0E5A64]/20 px-4 py-2 text-xs text-[#0E5A64] dark:text-[#5EEAD4]">
           <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2">
             <span>Vista previa local con datos de ejemplo (Sant Sadurní d’Anoia).</span>
@@ -121,7 +360,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         >
           <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2">
             <span>
-              Tu hogar está listo, pero faltan por cargar las listas iniciales (mudanza, checklist, mobiliario y metas).
+              Tu hogar está listo, pero faltan por cargar las listas iniciales.
             </span>
             <button
               type="button"
@@ -136,35 +375,79 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       )}
 
       {/* Main Content */}
-      <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-5 pb-24 md:pb-10">
+      <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-5 pb-24 md:pb-10 min-w-0 overflow-x-hidden">
         {children}
       </main>
 
-      {/* Mobile Fixed Bottom Navigation (60px height, >=44px hitboxes) */}
-      <nav
-        aria-label="Navegación inferior móvil"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-[62px] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-5 items-center px-1"
-      >
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = activeTab === item.id;
-          return (
+      {/* Mobile Fixed Bottom Navigation */}
+      {uiMode === 'sencillo' ? (
+        <nav
+          aria-label="Navegación inferior móvil"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-[66px] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-3 items-center px-3"
+        >
+          <button
+            type="button"
+            onClick={() => setActiveTab('inicio')}
+            className={`min-h-[50px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
+              activeTab === 'inicio'
+                ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
+                : 'text-slate-500 dark:text-slate-400'
+            }`}
+          >
+            <Home className="w-5 h-5" />
+            <span className="text-[11px] leading-none">Inicio</span>
+          </button>
+
+          <div className="flex items-center justify-center">
             <button
-              key={item.id}
               type="button"
-              onClick={() => setActiveTab(item.id)}
-              className={`min-h-[48px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
-                active
-                  ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
-                  : 'text-slate-500 dark:text-slate-400'
-              }`}
+              aria-label="Añadir gasto"
+              onClick={() => setQuickExpenseOpen(true)}
+              className="w-16 h-12 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] active:scale-[0.97] text-white shadow-md flex items-center justify-center transition-all"
             >
-              <Icon className="w-5 h-5" />
-              <span className="text-[11px] leading-none">{item.label}</span>
+              <Plus className="w-7 h-7" strokeWidth={2.5} />
             </button>
-          );
-        })}
-      </nav>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('ahorros')}
+            className={`min-h-[50px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
+              activeTab === 'ahorros'
+                ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
+                : 'text-slate-500 dark:text-slate-400'
+            }`}
+          >
+            <PiggyBank className="w-5 h-5" />
+            <span className="text-[11px] leading-none">Ahorros</span>
+          </button>
+        </nav>
+      ) : (
+        <nav
+          aria-label="Navegación inferior móvil"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-[62px] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-5 items-center px-1"
+        >
+          {AVANZADO_NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            const active = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveTab(item.id)}
+                className={`min-h-[48px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
+                  active
+                    ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
+                    : 'text-slate-500 dark:text-slate-400'
+                }`}
+              >
+                <Icon className="w-5 h-5" />
+                <span className="text-[11px] leading-none">{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      )}
 
       {/* Offline indicator */}
       {!isOnline && (
@@ -209,10 +492,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         </div>
       )}
 
-      <QuickExpenseModal
-        open={quickExpenseOpen}
-        onClose={() => setQuickExpenseOpen(false)}
-      />
+      <QuickExpenseModal open={quickExpenseOpen} onClose={() => setQuickExpenseOpen(false)} />
     </div>
   );
 };
