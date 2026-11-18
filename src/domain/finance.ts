@@ -1,0 +1,566 @@
+import type {
+  ExpenseCategory,
+  FurnitureItem,
+  GoalMovement,
+  HouseholdMember,
+  HouseholdSettings,
+  InitialCost,
+  MonthlyBudget,
+  RecurrenceFrequency,
+  RecurringExpense,
+  SavingsGoal,
+  Transaction,
+} from '../types/nido';
+
+// ─── Local Calendar Date Helpers (NEVER derive local day from UTC ISO slice) ──
+
+export function formatLocalDateISO(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+export function getTodayLocalISO(now: Date = new Date()): string {
+  return formatLocalDateISO(now);
+}
+
+export function getCurrentMonthKeyLocal(now: Date = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`;
+}
+
+export function shiftMonthKey(monthKey: string, deltaMonths: number): string {
+  const [yStr, mStr] = monthKey.split('-');
+  const y = Number(yStr);
+  const m = Number(mStr) - 1;
+  const dt = new Date(y, m + deltaMonths, 1);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+}
+
+export function formatDateES(isoDate: string): string {
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}/.test(isoDate)) return '—';
+  const [y, m, d] = isoDate.slice(0, 10).split('-');
+  return `${d}/${m}/${y}`;
+}
+
+export function formatMonthLabelES(monthKey: string): string {
+  const [yStr, mStr] = monthKey.split('-');
+  const dt = new Date(Number(yStr), Number(mStr) - 1, 1);
+  const label = new Intl.DateTimeFormat('es-ES', {
+    month: 'long',
+    year: 'numeric',
+  }).format(dt);
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+export function formatMonthShortES(monthKey: string): string {
+  const [yStr, mStr] = monthKey.split('-');
+  const dt = new Date(Number(yStr), Number(mStr) - 1, 1);
+  return new Intl.DateTimeFormat('es-ES', { month: 'short' }).format(dt);
+}
+
+export function daysInMonth(monthKey: string): number {
+  const [yStr, mStr] = monthKey.split('-');
+  return new Date(Number(yStr), Number(mStr), 0).getDate();
+}
+
+export function clampDateForMonth(monthKey: string, dayOfMonth: number): string {
+  const maxDay = daysInMonth(monthKey);
+  const day = Math.max(1, Math.min(maxDay, Math.round(dayOfMonth)));
+  return `${monthKey}-${String(day).padStart(2, '0')}`;
+}
+
+export function monthsUntilLocal(fromISO: string, toISO: string): number {
+  if (!toISO || !/^\d{4}-\d{2}-\d{2}$/.test(toISO)) return 0;
+  const [fy, fm, fd] = fromISO.split('-').map(Number);
+  const [ty, tm, td] = toISO.split('-').map(Number);
+  let diff = (ty - fy) * 12 + (tm - fm);
+  if (td > fd) diff += 0;
+  return Math.max(1, diff);
+}
+
+// ─── Currency Formatting (es-ES) ─────────────────────────────────────────────
+
+const eurFormatter = new Intl.NumberFormat('es-ES', {
+  style: 'currency',
+  currency: 'EUR',
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+  useGrouping: 'always',
+});
+
+const pctFormatter = new Intl.NumberFormat('es-ES', {
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 1,
+});
+
+export function formatEUR(value: number): string {
+  const clean = Math.abs(value) < 0.005 ? 0 : value;
+  return eurFormatter.format(clean);
+}
+
+export function formatPctES(value: number): string {
+  const clean = Number.isFinite(value) ? value : 0;
+  return `${pctFormatter.format(clean)}%`;
+}
+
+export function roundCents(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+// ─── Split Formula ───────────────────────────────────────────────────────────
+
+export function computeEffectiveSplitPctA(settings: HouseholdSettings): number {
+  if (settings.splitMode === 'income') {
+    const a = Math.max(0, Number(settings.incomeA) || 0);
+    const b = Math.max(0, Number(settings.incomeB) || 0);
+    const total = a + b;
+    if (total <= 0) return 50;
+    return Math.round((a / total) * 1000) / 10;
+  }
+  const pct = Number(settings.presetA);
+  if (!Number.isFinite(pct)) return 50;
+  return Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
+}
+
+// ─── Couple Balance & Settlement Calculation ─────────────────────────────────
+
+export interface CoupleBalanceResult {
+  totalSpent: number;
+  personalTotalSpent: number;
+  paidA: number;
+  paidB: number;
+  paidComun: number;
+  shareA: number;
+  shareB: number;
+  balanceA: number; // > 0 => B owes A; < 0 => A owes B
+  owesDirection: 'peace' | 'b_owes_a' | 'a_owes_b';
+  owesAmount: number;
+  summaryText: string;
+}
+
+export function calculateCoupleBalance(
+  transactions: Transaction[],
+  memberA: HouseholdMember | undefined,
+  memberB: HouseholdMember | undefined
+): CoupleBalanceResult {
+  const uidA = memberA?.uid ?? 'member_a';
+  const uidB = memberB?.uid ?? 'member_b';
+  const nameA = memberA?.displayName?.split(' ')[0] || 'Persona A';
+  const nameB = memberB?.displayName?.split(' ')[0] || 'Persona B';
+
+  let totalSpent = 0;
+  let personalTotalSpent = 0;
+  let paidA = 0;
+  let paidB = 0;
+  let paidComun = 0;
+  let shareA = 0;
+  let shareB = 0;
+  let settlementDeltaA = 0;
+
+  for (const tx of transactions) {
+    const amount = Math.max(0, Number(tx.amount) || 0);
+    if (tx.isSettlement) {
+      // If A pays settlement to B, A's balance increases (+amount). If B pays A, A's balance decreases (-amount).
+      if (tx.paidBy === uidA && tx.settlementTo === uidB) {
+        settlementDeltaA += amount;
+      } else if (tx.paidBy === uidB && tx.settlementTo === uidA) {
+        settlementDeltaA -= amount;
+      }
+      continue;
+    }
+
+    totalSpent += amount;
+    if (tx.paidBy === 'cuenta_comun' || tx.paidBy === 'comun') {
+      paidComun += amount;
+      continue;
+    }
+
+    personalTotalSpent += amount;
+    const pctA = Math.max(0, Math.min(100, Number(tx.splitPctA) || 50)) / 100;
+    const txShareA = amount * pctA;
+    const txShareB = amount - txShareA;
+
+    shareA += txShareA;
+    shareB += txShareB;
+
+    if (tx.paidBy === uidA) {
+      paidA += amount;
+    } else if (tx.paidBy === uidB) {
+      paidB += amount;
+    }
+  }
+
+  // Formula: Saldo_A = Pagado_A - (Total_gastos_personales * %_A) + liquidaciones_netas
+  const rawBalanceA = paidA - shareA + settlementDeltaA;
+  const balanceA = roundCents(rawBalanceA);
+
+  let owesDirection: CoupleBalanceResult['owesDirection'] = 'peace';
+  let owesAmount = 0;
+  let summaryText = 'Estáis en paz';
+
+  if (Math.abs(balanceA) >= 0.01) {
+    owesAmount = roundCents(Math.abs(balanceA));
+    if (balanceA > 0) {
+      owesDirection = 'b_owes_a';
+      summaryText = `${nameB} debe ${formatEUR(owesAmount)} a ${nameA}`;
+    } else {
+      owesDirection = 'a_owes_b';
+      summaryText = `${nameA} debe ${formatEUR(owesAmount)} a ${nameB}`;
+    }
+  }
+
+  return {
+    totalSpent: roundCents(totalSpent),
+    personalTotalSpent: roundCents(personalTotalSpent),
+    paidA: roundCents(paidA),
+    paidB: roundCents(paidB),
+    paidComun: roundCents(paidComun),
+    shareA: roundCents(shareA),
+    shareB: roundCents(shareB),
+    balanceA,
+    owesDirection,
+    owesAmount,
+    summaryText,
+  };
+}
+
+// ─── Recurring Expenses & Budget Helpers ─────────────────────────────────────
+
+export function monthlyEquivalent(amount: number, frequency: RecurrenceFrequency): number {
+  const clean = Math.max(0, Number(amount) || 0);
+  switch (frequency) {
+    case 'mensual':
+      return roundCents(clean);
+    case 'bimestral':
+      return roundCents(clean / 2);
+    case 'trimestral':
+      return roundCents(clean / 3);
+    case 'anual':
+      return roundCents(clean / 12);
+  }
+}
+
+export function findMissingRecurringForMonth(
+  recurringList: RecurringExpense[],
+  existingMonthTransactions: Transaction[],
+  monthKey: string
+): RecurringExpense[] {
+  const existingIds = new Set(
+    existingMonthTransactions.map((t) => t.recurringId).filter((id): id is string => Boolean(id))
+  );
+  const monthNum = Number(monthKey.split('-')[1]);
+  return recurringList.filter((rec) => {
+    if (!rec.active) return false;
+    if (existingIds.has(rec.id)) return false;
+    // Generate monthly items every month, and periodic items in matching cadence or always if user explicitly triggers?
+    // Checking cadence: mensual = always, bimestral = odd months (or every 2), trimestral = 1,4,7,10, anual = 1.
+    // Wait: in practice, generating active monthly + due periodic items (and letting user toggle or generate all active)
+    // Wait: user prompt says "Generar gastos del mes desde plantillas (no duplicar si ya existen). Los no mensuales se muestran además prorrateados ('equivalente mensual')."
+    // So active monthly templates generate every month, and non-monthly templates generate when due by cadence (e.g. bimestral every 2 months, trimestral every 3 months, anual month 1 or 12? Actually, let's check if monthNum matches or allow generating monthly + due periodic). Let's include mensual always, bimestral on odd months (1,3,5,7,9,11), trimestral on 1,4,7,10, anual on 1 (or if none generated yet, generate mensual + due ones!). Better yet: let's return all active items not yet in the month when frequency is mensual or due this month, OR let's check: if someone tests in November (month 11) with an annual home insurance template, they might want to see monthly equivalent AND optionally generate it. Let's make `isRecurringDueInMonth` true for mensual, bimestral on odd months (11 is odd!), trimestral on (1,4,7,10), anual on month 1, AND expose a helper to check cadence.
+    if (rec.frequency === 'mensual') return true;
+    if (rec.frequency === 'bimestral') return monthNum % 2 === 1;
+    if (rec.frequency === 'trimestral') return (monthNum - 1) % 3 === 0;
+    if (rec.frequency === 'anual') return monthNum === 1;
+    return true;
+  });
+}
+
+export interface UpcomingCharge {
+  recurringId: string;
+  concept: string;
+  category: ExpenseCategory;
+  amount: number;
+  dayOfMonth: number;
+  dueDate: string;
+  frequency: RecurrenceFrequency;
+}
+
+export function getUpcomingCharges(
+  recurringList: RecurringExpense[],
+  todayISO: string,
+  limit = 6
+): UpcomingCharge[] {
+  const currentMonth = todayISO.slice(0, 7);
+  const nextMonth = shiftMonthKey(currentMonth, 1);
+  const todayDay = Number(todayISO.slice(8, 10));
+
+  const upcoming: UpcomingCharge[] = [];
+  for (const rec of recurringList) {
+    if (!rec.active) continue;
+    const targetMonth = rec.dayOfMonth >= todayDay ? currentMonth : nextMonth;
+    const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
+    upcoming.push({
+      recurringId: rec.id,
+      concept: rec.concept,
+      category: rec.category,
+      amount: rec.amount,
+      dayOfMonth: rec.dayOfMonth,
+      dueDate,
+      frequency: rec.frequency,
+    });
+  }
+
+  return upcoming.sort((a, b) => a.dueDate.localeCompare(b.dueDate)).slice(0, limit);
+}
+
+export type BudgetTrafficLight = 'sin_limite' | 'verde' | 'ambar' | 'rojo';
+
+export interface CategoryBudgetProgress {
+  category: ExpenseCategory;
+  spent: number;
+  limit: number;
+  pct: number;
+  status: BudgetTrafficLight;
+}
+
+export function computeBudgetProgress(
+  transactions: Transaction[],
+  budget: MonthlyBudget | null
+): CategoryBudgetProgress[] {
+  const spentMap = new Map<ExpenseCategory, number>();
+  for (const tx of transactions) {
+    if (tx.isSettlement || tx.category === 'liquidacion') continue;
+    spentMap.set(tx.category, (spentMap.get(tx.category) ?? 0) + tx.amount);
+  }
+
+  const limits = budget?.limits ?? {};
+  const categories = new Set<ExpenseCategory>([
+    ...(Object.keys(limits) as ExpenseCategory[]),
+    ...Array.from(spentMap.keys()),
+  ]);
+
+  const result: CategoryBudgetProgress[] = [];
+  for (const category of categories) {
+    const spent = roundCents(spentMap.get(category) ?? 0);
+    const limit = roundCents(Number(limits[category]) || 0);
+    if (spent === 0 && limit === 0) continue;
+    let status: BudgetTrafficLight = 'sin_limite';
+    let pct = 0;
+    if (limit > 0) {
+      pct = Math.round((spent / limit) * 100);
+      if (pct < 80) status = 'verde';
+      else if (pct <= 100) status = 'ambar';
+      else status = 'rojo';
+    }
+    result.push({ category, spent, limit, pct, status });
+  }
+
+  return result.sort((a, b) => b.spent - a.spent);
+}
+
+// ─── Mudanza Summaries ───────────────────────────────────────────────────────
+
+export interface InitialCostsSummary {
+  totalPlanned: number;
+  totalPaid: number;
+  totalPending: number;
+  shareA: number;
+  shareB: number;
+  paidA: number;
+  paidB: number;
+  paidComun: number;
+}
+
+export function computeInitialCostsSummary(
+  costs: InitialCost[],
+  splitPctA: number,
+  uidA: string,
+  uidB: string
+): InitialCostsSummary {
+  let totalPlanned = 0;
+  let totalPaid = 0;
+  let totalPending = 0;
+  let paidA = 0;
+  let paidB = 0;
+  let paidComun = 0;
+
+  for (const c of costs) {
+    const amt = Math.max(0, Number(c.amount) || 0);
+    totalPlanned += amt;
+    if (c.status === 'pagado') {
+      totalPaid += amt;
+      if (c.paidBy === uidA) paidA += amt;
+      else if (c.paidBy === uidB) paidB += amt;
+      else paidComun += amt;
+    } else {
+      totalPending += amt;
+    }
+  }
+
+  const pctA = Math.max(0, Math.min(100, splitPctA)) / 100;
+  const shareA = roundCents(totalPlanned * pctA);
+  const shareB = roundCents(totalPlanned - shareA);
+
+  return {
+    totalPlanned: roundCents(totalPlanned),
+    totalPaid: roundCents(totalPaid),
+    totalPending: roundCents(totalPending),
+    shareA,
+    shareB,
+    paidA: roundCents(paidA),
+    paidB: roundCents(paidB),
+    paidComun: roundCents(paidComun),
+  };
+}
+
+export interface FurnitureSummary {
+  totalAll: number;
+  totalSpent: number;
+  totalPending: number;
+  totalCart: number;
+  cartCount: number;
+  boughtCount: number;
+  totalCount: number;
+  boughtPct: number;
+}
+
+export function computeFurnitureSummary(items: FurnitureItem[]): FurnitureSummary {
+  let totalAll = 0;
+  let totalSpent = 0;
+  let totalPending = 0;
+  let totalCart = 0;
+  let cartCount = 0;
+  let boughtCount = 0;
+
+  for (const item of items) {
+    const lineTotal = Math.max(0, Number(item.unitPrice) || 0) * Math.max(1, Number(item.qty) || 1);
+    if (item.status === 'ya_lo_tenemos') {
+      boughtCount += 1;
+      continue;
+    }
+    totalAll += lineTotal;
+    if (item.status === 'comprado') {
+      totalSpent += lineTotal;
+      boughtCount += 1;
+    } else if (item.status === 'en_carrito') {
+      totalCart += lineTotal;
+      totalPending += lineTotal;
+      cartCount += 1;
+    } else {
+      totalPending += lineTotal;
+    }
+  }
+
+  const totalCount = items.length;
+  const boughtPct = totalCount > 0 ? Math.round((boughtCount / totalCount) * 100) : 0;
+
+  return {
+    totalAll: roundCents(totalAll),
+    totalSpent: roundCents(totalSpent),
+    totalPending: roundCents(totalPending),
+    totalCart: roundCents(totalCart),
+    cartCount,
+    boughtCount,
+    totalCount,
+    boughtPct,
+  };
+}
+
+export function buildIkeaSearchUrl(name: string): string {
+  return `https://www.ikea.com/es/es/search/?q=${encodeURIComponent(name.trim())}`;
+}
+
+// ─── Savings Goals & Emergency Cushion ───────────────────────────────────────
+
+export interface GoalProgress {
+  goal: SavingsGoal;
+  savedAmount: number;
+  pct: number;
+  remaining: number;
+  monthlyNeeded: number | null;
+  monthsLeft: number | null;
+  isCompleted: boolean;
+}
+
+export function computeGoalProgress(
+  goal: SavingsGoal,
+  movements: GoalMovement[],
+  todayISO: string
+): GoalProgress {
+  const savedRaw = movements
+    .filter((m) => m.goalId === goal.id)
+    .reduce((acc, m) => acc + (Number(m.amount) || 0), 0);
+  const savedAmount = roundCents(Math.max(0, savedRaw));
+  const target = Math.max(0, Number(goal.targetAmount) || 0);
+  const pct = target > 0 ? Math.min(100, Math.round((savedAmount / target) * 1000) / 10) : 0;
+  const remaining = roundCents(Math.max(0, target - savedAmount));
+  const isCompleted = target > 0 && savedAmount >= target;
+
+  let monthlyNeeded: number | null = null;
+  let monthsLeft: number | null = null;
+  if (goal.targetDate && remaining > 0) {
+    monthsLeft = monthsUntilLocal(todayISO, goal.targetDate);
+    monthlyNeeded = roundCents(remaining / monthsLeft);
+  }
+
+  return {
+    goal,
+    savedAmount,
+    pct,
+    remaining,
+    monthlyNeeded,
+    monthsLeft,
+    isCompleted,
+  };
+}
+
+export function computeEmergencyTarget(
+  recurringList: RecurringExpense[],
+  months: 3 | 6
+): number {
+  const fixedMonthly = recurringList
+    .filter((r) => r.active)
+    .reduce((acc, r) => acc + monthlyEquivalent(r.amount, r.frequency), 0);
+  return roundCents(fixedMonthly * months);
+}
+
+export interface SavingsMemberShare {
+  uid: string;
+  displayName: string;
+  totalContributed: number;
+  actualPct: number;
+  agreedPct: number;
+}
+
+export function computeSavingsByMember(
+  movements: GoalMovement[],
+  memberA: HouseholdMember | undefined,
+  memberB: HouseholdMember | undefined,
+  agreedPctA: number
+): SavingsMemberShare[] {
+  const uidA = memberA?.uid ?? 'member_a';
+  const uidB = memberB?.uid ?? 'member_b';
+  let sumA = 0;
+  let sumB = 0;
+  for (const m of movements) {
+    if (m.by === uidA) sumA += m.amount;
+    else if (m.by === uidB) sumB += m.amount;
+  }
+  const cleanA = roundCents(Math.max(0, sumA));
+  const cleanB = roundCents(Math.max(0, sumB));
+  const total = cleanA + cleanB;
+
+  return [
+    {
+      uid: uidA,
+      displayName: memberA?.displayName || 'Persona A',
+      totalContributed: cleanA,
+      actualPct: total > 0 ? Math.round((cleanA / total) * 1000) / 10 : 0,
+      agreedPct: agreedPctA,
+    },
+    ...(memberB
+      ? [
+          {
+            uid: uidB,
+            displayName: memberB.displayName || 'Persona B',
+            totalContributed: cleanB,
+            actualPct: total > 0 ? Math.round((cleanB / total) * 1000) / 10 : 0,
+            agreedPct: Math.round((100 - agreedPctA) * 10) / 10,
+          },
+        ]
+      : []),
+  ];
+}

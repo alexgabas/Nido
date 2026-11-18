@@ -1,0 +1,492 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ─── Global Primitives ───────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidMonthKey(k) {
+      return k is string && k.size() == 7 && k.matches('^\\d{4}-\\d{2}$');
+    }
+
+    function isValidDateStr(d) {
+      return d is string && d.size() == 10 && d.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidInviteCode(code) {
+      return code is string && code.size() == 6 && code.matches('^[A-Z0-9]{6}$');
+    }
+
+    function isNonNegNumber(n) {
+      return (n is int || n is float) && n >= 0;
+    }
+
+    function isFiniteNumber(n) {
+      return n is int || n is float;
+    }
+
+    function isHouseholdMember(hid) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/households/$(hid))
+        && (request.auth.uid in get(/databases/$(database)/documents/households/$(hid)).data.memberUids);
+    }
+
+    function isHouseholdMemberAfter(hid) {
+      return isSignedIn()
+        && existsAfter(/databases/$(database)/documents/households/$(hid))
+        && (request.auth.uid in getAfter(/databases/$(database)/documents/households/$(hid)).data.memberUids);
+    }
+
+    // ─── Validation Blueprints ───────────────────────────────────────────────
+
+    function isValidUserLink(data) {
+      return data.keys().hasAll(['householdId', 'updatedAt'])
+        && data.keys().hasOnly(['householdId', 'updatedAt'])
+        && data.householdId is string
+        && data.householdId.size() <= 128
+        && (data.householdId == '' || isValidId(data.householdId))
+        && data.updatedAt == request.time;
+    }
+
+    function isValidInvite(data) {
+      return data.keys().hasAll(['householdId', 'householdName', 'createdBy', 'createdAt'])
+        && data.keys().hasOnly(['householdId', 'householdName', 'createdBy', 'createdAt'])
+        && isValidId(data.householdId)
+        && data.householdName is string && data.householdName.size() >= 1 && data.householdName.size() <= 80
+        && data.createdBy is string && data.createdBy == request.auth.uid
+        && data.createdAt == request.time;
+    }
+
+    function isValidSettings(s) {
+      return s is map
+        && s.keys().hasAll(['splitMode', 'presetA', 'presetB', 'incomeA', 'incomeB', 'currency'])
+        && s.keys().hasOnly(['splitMode', 'presetA', 'presetB', 'incomeA', 'incomeB', 'currency'])
+        && (s.splitMode in ['income', 'preset', 'custom'])
+        && isFiniteNumber(s.presetA) && s.presetA >= 0 && s.presetA <= 100
+        && isFiniteNumber(s.presetB) && s.presetB >= 0 && s.presetB <= 100
+        && isNonNegNumber(s.incomeA)
+        && isNonNegNumber(s.incomeB)
+        && s.currency == 'EUR';
+    }
+
+    function isValidHousehold(data) {
+      return data.keys().hasAll(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.memberUids is list
+        && data.memberUids.size() >= 1 && data.memberUids.size() <= 2
+        && data.memberUids[0] is string && data.memberUids[0].size() >= 1 && data.memberUids[0].size() <= 128
+        && (data.memberUids.size() == 1 || (data.memberUids[1] is string && data.memberUids[1].size() >= 1 && data.memberUids[1].size() <= 128 && data.memberUids[1] != data.memberUids[0]))
+        && isValidInviteCode(data.inviteCode)
+        && isValidSettings(data.settings)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidMember(data) {
+      return data.keys().hasAll(['displayName', 'photoURL', 'role', 'uiMode', 'joinedAt', 'updatedAt'])
+        && data.keys().hasOnly(['displayName', 'photoURL', 'role', 'uiMode', 'joinedAt', 'updatedAt'])
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.photoURL is string && data.photoURL.size() <= 500
+        && (data.role in ['member_a', 'member_b'])
+        && (data.uiMode in ['sencillo', 'avanzado'])
+        && data.joinedAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidActivity(data) {
+      return data.keys().hasAll(['uid', 'actorName', 'action', 'entity', 'entityId', 'summary', 'timestamp'])
+        && data.keys().hasOnly(['uid', 'actorName', 'action', 'entity', 'entityId', 'summary', 'timestamp'])
+        && data.uid is string && data.uid == request.auth.uid
+        && data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 80
+        && (data.action in ['create', 'update', 'delete', 'close_month', 'reopen_month', 'join', 'import'])
+        && data.entity is string && data.entity.size() >= 1 && data.entity.size() <= 40
+        && data.entityId is string && data.entityId.size() >= 1 && data.entityId.size() <= 128
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 240
+        && data.timestamp == request.time;
+    }
+
+    function isValidInitialCost(data) {
+      return data.keys().hasAll(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'createdAt', 'updatedAt'])
+        && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
+        && (data.category in ['alquiler', 'fianza', 'garantia_adicional', 'suministros', 'cerrajeria', 'mudanza', 'mobiliario', 'otros'])
+        && isNonNegNumber(data.amount)
+        && data.paidBy is string && data.paidBy.size() >= 1 && data.paidBy.size() <= 128
+        && (data.status in ['pendiente', 'pagado'])
+        && (data.dueDate == '' || isValidDateStr(data.dueDate))
+        && data.notes is string && data.notes.size() <= 500
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidChecklistItem(data) {
+      return data.keys().hasAll(['text', 'done', 'doneBy', 'doneAt', 'group', 'order', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['text', 'done', 'doneBy', 'doneAt', 'group', 'order', 'createdAt', 'updatedAt'])
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 240
+        && data.done is bool
+        && data.doneBy is string && data.doneBy.size() <= 128
+        && data.doneAt is string && data.doneAt.size() <= 32
+        && data.group is string && data.group.size() >= 1 && data.group.size() <= 60
+        && isNonNegNumber(data.order)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidFurnitureItem(data) {
+      return data.keys().hasAll(['name', 'room', 'priority', 'status', 'store', 'productUrl', 'articleNumber', 'unitPrice', 'qty', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'room', 'priority', 'status', 'store', 'productUrl', 'articleNumber', 'unitPrice', 'qty', 'notes', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && (data.room in ['salon', 'dormitorio', 'cocina', 'baño', 'entrada', 'terraza', 'otros'])
+        && (data.priority in ['imprescindible', 'pronto', 'algun_dia'])
+        && (data.status in ['ya_lo_tenemos', 'pendiente', 'en_carrito', 'comprado'])
+        && data.store is string && data.store.size() >= 1 && data.store.size() <= 60
+        && data.productUrl is string && data.productUrl.size() <= 500
+        && data.articleNumber is string && data.articleNumber.size() <= 40
+        && isNonNegNumber(data.unitPrice)
+        && isFiniteNumber(data.qty) && data.qty >= 1 && data.qty <= 999
+        && data.notes is string && data.notes.size() <= 500
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidRecurring(data) {
+      return data.keys().hasAll(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
+        && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
+        && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros'])
+        && isNonNegNumber(data.amount)
+        && (data.frequency in ['mensual', 'bimestral', 'trimestral', 'anual'])
+        && isFiniteNumber(data.dayOfMonth) && data.dayOfMonth >= 1 && data.dayOfMonth <= 31
+        && (data.splitOverride == null || (isFiniteNumber(data.splitOverride) && data.splitOverride >= 0 && data.splitOverride <= 100))
+        && data.paidByDefault is string && data.paidByDefault.size() >= 1 && data.paidByDefault.size() <= 128
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasAll(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'notes', 'createdAt', 'updatedAt'])
+        && isValidMonthKey(data.monthKey)
+        && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
+        && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros', 'liquidacion'])
+        && isNonNegNumber(data.amount)
+        && isValidDateStr(data.date)
+        && data.paidBy is string && data.paidBy.size() >= 1 && data.paidBy.size() <= 128
+        && (data.recurringId == null || (data.recurringId is string && data.recurringId.size() <= 128))
+        && isFiniteNumber(data.splitPctA) && data.splitPctA >= 0 && data.splitPctA <= 100
+        && data.isSettlement is bool
+        && data.settlementTo is string && data.settlementTo.size() <= 128
+        && data.notes is string && data.notes.size() <= 500
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidBudget(data, monthKey) {
+      return data.keys().hasAll(['monthKey', 'limits', 'updatedAt'])
+        && data.keys().hasOnly(['monthKey', 'limits', 'updatedAt'])
+        && data.monthKey == monthKey
+        && isValidMonthKey(data.monthKey)
+        && data.limits is map
+        && data.limits.size() <= 20
+        && data.updatedAt == request.time;
+    }
+
+    function isValidMonthClosure(data, monthKey) {
+      return data.keys().hasAll(['monthKey', 'totalSpent', 'paidA', 'paidB', 'paidComun', 'shareA', 'shareB', 'balanceA', 'settlementText', 'closedBy', 'closedAt'])
+        && data.keys().hasOnly(['monthKey', 'totalSpent', 'paidA', 'paidB', 'paidComun', 'shareA', 'shareB', 'balanceA', 'settlementText', 'closedBy', 'closedAt'])
+        && data.monthKey == monthKey
+        && isValidMonthKey(data.monthKey)
+        && isNonNegNumber(data.totalSpent)
+        && isNonNegNumber(data.paidA)
+        && isNonNegNumber(data.paidB)
+        && isNonNegNumber(data.paidComun)
+        && isNonNegNumber(data.shareA)
+        && isNonNegNumber(data.shareB)
+        && isFiniteNumber(data.balanceA)
+        && data.settlementText is string && data.settlementText.size() >= 1 && data.settlementText.size() <= 200
+        && data.closedBy is string && data.closedBy == request.auth.uid
+        && data.closedAt == request.time;
+    }
+
+    function isValidGoal(data) {
+      return data.keys().hasAll(['name', 'icon', 'color', 'targetAmount', 'targetDate', 'type', 'archived', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'icon', 'color', 'targetAmount', 'targetDate', 'type', 'archived', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.icon is string && data.icon.size() >= 1 && data.icon.size() <= 40
+        && data.color is string && data.color.size() >= 1 && data.color.size() <= 30
+        && isNonNegNumber(data.targetAmount)
+        && (data.targetDate == '' || isValidDateStr(data.targetDate))
+        && (data.type in ['navidad', 'viajes', 'cumpleaños', 'ahorro_comun', 'emergencia', 'custom'])
+        && data.archived is bool
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidGoalMovement(data) {
+      return data.keys().hasAll(['goalId', 'amount', 'by', 'date', 'note', 'createdAt'])
+        && data.keys().hasOnly(['goalId', 'amount', 'by', 'date', 'note', 'createdAt'])
+        && isValidId(data.goalId)
+        && isFiniteNumber(data.amount) && data.amount != 0
+        && data.by is string && data.by.size() >= 1 && data.by.size() <= 128
+        && isValidDateStr(data.date)
+        && data.note is string && data.note.size() <= 240
+        && data.createdAt == request.time;
+    }
+
+    // ─── /users/{uid} ────────────────────────────────────────────────────────
+    match /users/{uid} {
+      allow get: if isSignedIn() && isValidId(uid) && request.auth.uid == uid;
+      allow list: if false;
+      allow create: if isSignedIn() && isValidId(uid) && request.auth.uid == uid && isValidUserLink(incoming());
+      allow update: if isSignedIn() && isValidId(uid) && request.auth.uid == uid && isValidUserLink(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['householdId', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // ─── /invites/{inviteCode} ───────────────────────────────────────────────
+    match /invites/{inviteCode} {
+      allow get: if isSignedIn() && isValidInviteCode(inviteCode);
+      allow list: if false;
+      allow create: if isSignedIn() && isValidInviteCode(inviteCode) && isValidInvite(incoming())
+        && isHouseholdMemberAfter(incoming().householdId);
+      allow update: if false;
+      allow delete: if isSignedIn() && isValidInviteCode(inviteCode)
+        && isHouseholdMember(existing().householdId);
+    }
+
+    // ─── /households/{hid} ───────────────────────────────────────────────────
+    match /households/{hid} {
+      allow get: if isSignedIn() && isValidId(hid) && (request.auth.uid in existing().memberUids);
+      allow list: if isSignedIn() && (request.auth.uid in resource.data.memberUids);
+
+      allow create: if isSignedIn()
+        && isValidId(hid)
+        && isValidHousehold(incoming())
+        && incoming().createdAt == request.time
+        && incoming().memberUids.size() == 1
+        && incoming().memberUids[0] == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode));
+
+      allow update: if isSignedIn() && isValidId(hid) && isValidHousehold(incoming())
+        && incoming().createdAt == existing().createdAt
+        && (
+          // Action 1: Update household settings or name by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'settings', 'updatedAt'])
+          )
+          ||
+          // Action 2: Rotate invite code by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['inviteCode', 'updatedAt'])
+            && existsAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode))
+          )
+          ||
+          // Action 3: Join household as second member (max 2)
+          (
+            !(request.auth.uid in existing().memberUids)
+            && existing().memberUids.size() == 1
+            && incoming().memberUids.size() == 2
+            && incoming().memberUids.hasAll(existing().memberUids)
+            && (request.auth.uid in incoming().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'updatedAt'])
+            && exists(/databases/$(database)/documents/invites/$(existing().inviteCode))
+            && get(/databases/$(database)/documents/invites/$(existing().inviteCode)).data.householdId == hid
+          )
+        );
+
+      allow delete: if false;
+
+      // ─── /households/{hid}/members/{uid} ──────────────────────────────────
+      match /members/{uid} {
+        allow get: if isValidId(hid) && isValidId(uid) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(uid)
+          && request.auth.uid == uid
+          && isHouseholdMemberAfter(hid)
+          && isValidMember(incoming())
+          && incoming().joinedAt == request.time;
+        allow update: if isValidId(hid) && isValidId(uid)
+          && isHouseholdMember(hid)
+          && request.auth.uid == uid
+          && isValidMember(incoming())
+          && incoming().joinedAt == existing().joinedAt
+          && incoming().role == existing().role
+          && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'uiMode', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      // ─── /households/{hid}/activity/{actId} ───────────────────────────────
+      match /activity/{actId} {
+        allow get: if isValidId(hid) && isValidId(actId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(actId)
+          && (isHouseholdMember(hid) || isHouseholdMemberAfter(hid))
+          && isValidActivity(incoming());
+        allow update, delete: if false;
+      }
+
+      // ─── /households/{hid}/initialCosts/{costId} ──────────────────────────
+      match /initialCosts/{costId} {
+        allow get: if isValidId(hid) && isValidId(costId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(costId)
+          && isHouseholdMember(hid)
+          && isValidInitialCost(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(costId)
+          && isHouseholdMember(hid)
+          && isValidInitialCost(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(costId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/checklist/{taskId} ─────────────────────────────
+      match /checklist/{taskId} {
+        allow get: if isValidId(hid) && isValidId(taskId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(taskId)
+          && isHouseholdMember(hid)
+          && isValidChecklistItem(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(taskId)
+          && isHouseholdMember(hid)
+          && isValidChecklistItem(incoming())
+          && incoming().createdAt == existing().createdAt
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['done', 'doneBy', 'doneAt', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['text', 'group', 'order', 'updatedAt'])
+          );
+        allow delete: if isValidId(hid) && isValidId(taskId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/items/{itemId} ─────────────────────────────────
+      match /items/{itemId} {
+        allow get: if isValidId(hid) && isValidId(itemId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(itemId)
+          && isHouseholdMember(hid)
+          && isValidFurnitureItem(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(itemId)
+          && isHouseholdMember(hid)
+          && isValidFurnitureItem(incoming())
+          && incoming().createdAt == existing().createdAt
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'room', 'priority', 'status', 'store', 'productUrl', 'articleNumber', 'unitPrice', 'qty', 'notes', 'updatedAt'])
+          );
+        allow delete: if isValidId(hid) && isValidId(itemId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/recurring/{recId} ──────────────────────────────
+      match /recurring/{recId} {
+        allow get: if isValidId(hid) && isValidId(recId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(recId)
+          && isHouseholdMember(hid)
+          && isValidRecurring(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(recId)
+          && isHouseholdMember(hid)
+          && isValidRecurring(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(recId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/transactions/{txId} ────────────────────────────
+      match /transactions/{txId} {
+        allow get: if isValidId(hid) && isValidId(txId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(txId)
+          && isHouseholdMember(hid)
+          && isValidTransaction(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(txId)
+          && isHouseholdMember(hid)
+          && isValidTransaction(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'splitPctA', 'notes', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(txId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/budgets/{monthKey} ─────────────────────────────
+      match /budgets/{monthKey} {
+        allow get: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidMonthKey(monthKey)
+          && isHouseholdMember(hid)
+          && isValidBudget(incoming(), monthKey);
+        allow update: if isValidId(hid) && isValidMonthKey(monthKey)
+          && isHouseholdMember(hid)
+          && isValidBudget(incoming(), monthKey)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['limits', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/monthClosures/{monthKey} ───────────────────────
+      match /monthClosures/{monthKey} {
+        allow get: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidMonthKey(monthKey)
+          && isHouseholdMember(hid)
+          && isValidMonthClosure(incoming(), monthKey);
+        allow update: if false;
+        allow delete: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/goals/{goalId} ─────────────────────────────────
+      match /goals/{goalId} {
+        allow get: if isValidId(hid) && isValidId(goalId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(goalId)
+          && isHouseholdMember(hid)
+          && isValidGoal(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(goalId)
+          && isHouseholdMember(hid)
+          && isValidGoal(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'icon', 'color', 'targetAmount', 'targetDate', 'type', 'archived', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(goalId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/goalMovements/{movId} ──────────────────────────
+      match /goalMovements/{movId} {
+        allow get: if isValidId(hid) && isValidId(movId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(movId)
+          && isHouseholdMember(hid)
+          && isValidGoalMovement(incoming())
+          && exists(/databases/$(database)/documents/households/$(hid)/goals/$(incoming().goalId));
+        allow update: if false;
+        allow delete: if isValidId(hid) && isValidId(movId) && isHouseholdMember(hid);
+      }
+    }
+  }
+}

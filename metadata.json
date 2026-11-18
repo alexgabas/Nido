@@ -1,0 +1,6 @@
+{
+  "name": "Nido",
+  "description": "Gestión de gastos compartidos en pareja, mudanza y ahorros para vuestro hogar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

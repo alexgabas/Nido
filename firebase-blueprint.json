@@ -1,0 +1,592 @@
+{
+  "entities": {
+    "UserHouseholdLink": {
+      "title": "UserHouseholdLink",
+      "description": "Maps a user UID to their active household ID.",
+      "type": "object",
+      "properties": {
+        "householdId": {
+          "type": "string",
+          "description": "Active household document ID or empty string if unlinked.",
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["householdId", "updatedAt"]
+    },
+    "InviteCode": {
+      "title": "InviteCode",
+      "description": "Six-character invite code resolving to a household.",
+      "type": "object",
+      "properties": {
+        "householdId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "householdName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["householdId", "householdName", "createdBy", "createdAt"]
+    },
+    "Household": {
+      "title": "Household",
+      "description": "Shared couple household with up to 2 members and split configuration.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "UIDs of the 1 or 2 household members."
+        },
+        "inviteCode": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[A-Z0-9]{6}$"
+        },
+        "settings": {
+          "type": "object",
+          "description": "Split configuration and currency settings."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "memberUids", "inviteCode", "settings", "createdAt", "updatedAt"]
+    },
+    "Member": {
+      "title": "Member",
+      "description": "Household member profile and UI mode preference.",
+      "type": "object",
+      "properties": {
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "role": {
+          "type": "string",
+          "enum": ["member_a", "member_b"]
+        },
+        "uiMode": {
+          "type": "string",
+          "enum": ["sencillo", "avanzado"]
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["displayName", "photoURL", "role", "uiMode", "joinedAt", "updatedAt"]
+    },
+    "ActivityEntry": {
+      "title": "ActivityEntry",
+      "description": "Immutable audit log entry for household changes.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "actorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "action": {
+          "type": "string",
+          "enum": ["create", "update", "delete", "close_month", "reopen_month", "join", "import"]
+        },
+        "entity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "entityId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "actorName", "action", "entity", "entityId", "summary", "timestamp"]
+    },
+    "InitialCost": {
+      "title": "InitialCost",
+      "description": "One-off moving and rental setup expense.",
+      "type": "object",
+      "properties": {
+        "concept": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "enum": ["alquiler", "fianza", "garantia_adicional", "suministros", "cerrajeria", "mudanza", "mobiliario", "otros"]
+        },
+        "amount": {
+          "type": "number"
+        },
+        "paidBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pendiente", "pagado"]
+        },
+        "dueDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["concept", "category", "amount", "paidBy", "status", "dueDate", "notes", "createdAt", "updatedAt"]
+    },
+    "ChecklistItem": {
+      "title": "ChecklistItem",
+      "description": "Catalunya rental moving checklist task.",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "done": {
+          "type": "boolean"
+        },
+        "doneBy": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "doneAt": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "group": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "order": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["text", "done", "doneBy", "doneAt", "group", "order", "createdAt", "updatedAt"]
+    },
+    "FurnitureItem": {
+      "title": "FurnitureItem",
+      "description": "Furniture or appliance item to equip the home.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "room": {
+          "type": "string",
+          "enum": ["salon", "dormitorio", "cocina", "baño", "entrada", "terraza", "otros"]
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["imprescindible", "pronto", "algun_dia"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ya_lo_tenemos", "pendiente", "en_carrito", "comprado"]
+        },
+        "store": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "productUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "articleNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "unitPrice": {
+          "type": "number"
+        },
+        "qty": {
+          "type": "number"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "room", "priority", "status", "store", "productUrl", "articleNumber", "unitPrice", "qty", "notes", "createdAt", "updatedAt"]
+    },
+    "RecurringExpense": {
+      "title": "RecurringExpense",
+      "description": "Recurring expense template (monthly, bimonthly, quarterly, annual).",
+      "type": "object",
+      "properties": {
+        "concept": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "enum": ["alquiler", "luz", "agua", "gas", "internet", "movil", "suscripciones", "seguros", "comunidad", "supermercado", "transporte", "ocio", "otros"]
+        },
+        "amount": {
+          "type": "number"
+        },
+        "frequency": {
+          "type": "string",
+          "enum": ["mensual", "bimestral", "trimestral", "anual"]
+        },
+        "dayOfMonth": {
+          "type": "number"
+        },
+        "splitOverride": {
+          "type": "number"
+        },
+        "paidByDefault": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["concept", "category", "amount", "frequency", "dayOfMonth", "paidByDefault", "active", "createdAt", "updatedAt"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Monthly expense or couple settlement transaction.",
+      "type": "object",
+      "properties": {
+        "monthKey": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}$",
+          "maxLength": 7
+        },
+        "concept": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "enum": ["alquiler", "luz", "agua", "gas", "internet", "movil", "suscripciones", "seguros", "comunidad", "supermercado", "transporte", "ocio", "otros", "liquidacion"]
+        },
+        "amount": {
+          "type": "number"
+        },
+        "date": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "paidBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "recurringId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "splitPctA": {
+          "type": "number"
+        },
+        "isSettlement": {
+          "type": "boolean"
+        },
+        "settlementTo": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["monthKey", "concept", "category", "amount", "date", "paidBy", "recurringId", "splitPctA", "isSettlement", "settlementTo", "notes", "createdAt", "updatedAt"]
+    },
+    "MonthlyBudget": {
+      "title": "MonthlyBudget",
+      "description": "Category budget limits for a specific month.",
+      "type": "object",
+      "properties": {
+        "monthKey": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}$",
+          "maxLength": 7
+        },
+        "limits": {
+          "type": "object",
+          "description": "Map of category to monthly EUR limit."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["monthKey", "limits", "updatedAt"]
+    },
+    "MonthClosure": {
+      "title": "MonthClosure",
+      "description": "Closed month snapshot locking edits unless unlocked.",
+      "type": "object",
+      "properties": {
+        "monthKey": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}$",
+          "maxLength": 7
+        },
+        "totalSpent": { "type": "number" },
+        "paidA": { "type": "number" },
+        "paidB": { "type": "number" },
+        "paidComun": { "type": "number" },
+        "shareA": { "type": "number" },
+        "shareB": { "type": "number" },
+        "balanceA": { "type": "number" },
+        "settlementText": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "closedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "closedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["monthKey", "totalSpent", "paidA", "paidB", "paidComun", "shareA", "shareB", "balanceA", "settlementText", "closedBy", "closedAt"]
+    },
+    "SavingsGoal": {
+      "title": "SavingsGoal",
+      "description": "Couple savings goal with optional target date.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "icon": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "color": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 30
+        },
+        "targetAmount": { "type": "number" },
+        "targetDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "type": {
+          "type": "string",
+          "enum": ["navidad", "viajes", "cumpleaños", "ahorro_comun", "emergencia", "custom"]
+        },
+        "archived": { "type": "boolean" },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "icon", "color", "targetAmount", "targetDate", "type", "archived", "createdAt", "updatedAt"]
+    },
+    "GoalMovement": {
+      "title": "GoalMovement",
+      "description": "Deposit (+) or withdrawal (-) movement for a savings goal.",
+      "type": "object",
+      "properties": {
+        "goalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "amount": { "type": "number" },
+        "by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "date": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["goalId", "amount", "by", "date", "note", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": { "$ref": "#/entities/UserHouseholdLink" },
+      "description": "Private user link to current household."
+    },
+    "/invites/{inviteCode}": {
+      "schema": { "$ref": "#/entities/InviteCode" },
+      "description": "Lookup index from 6-character invite code to householdId."
+    },
+    "/households/{hid}": {
+      "schema": { "$ref": "#/entities/Household" },
+      "description": "Shared couple household root document."
+    },
+    "/households/{hid}/members/{uid}": {
+      "schema": { "$ref": "#/entities/Member" },
+      "description": "Household members (max 2)."
+    },
+    "/households/{hid}/activity/{id}": {
+      "schema": { "$ref": "#/entities/ActivityEntry" },
+      "description": "Audit log of changes within the household."
+    },
+    "/households/{hid}/initialCosts/{id}": {
+      "schema": { "$ref": "#/entities/InitialCost" },
+      "description": "Initial moving and rental setup costs."
+    },
+    "/households/{hid}/checklist/{id}": {
+      "schema": { "$ref": "#/entities/ChecklistItem" },
+      "description": "Catalunya rental moving checklist."
+    },
+    "/households/{hid}/items/{id}": {
+      "schema": { "$ref": "#/entities/FurnitureItem" },
+      "description": "Furniture and appliances list."
+    },
+    "/households/{hid}/recurring/{id}": {
+      "schema": { "$ref": "#/entities/RecurringExpense" },
+      "description": "Recurring expense templates."
+    },
+    "/households/{hid}/transactions/{id}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Monthly expenses and couple settlements."
+    },
+    "/households/{hid}/budgets/{monthKey}": {
+      "schema": { "$ref": "#/entities/MonthlyBudget" },
+      "description": "Monthly category budgets keyed by YYYY-MM."
+    },
+    "/households/{hid}/monthClosures/{monthKey}": {
+      "schema": { "$ref": "#/entities/MonthClosure" },
+      "description": "Monthly closure snapshots keyed by YYYY-MM."
+    },
+    "/households/{hid}/goals/{id}": {
+      "schema": { "$ref": "#/entities/SavingsGoal" },
+      "description": "Couple savings goals."
+    },
+    "/households/{hid}/goalMovements/{id}": {
+      "schema": { "$ref": "#/entities/GoalMovement" },
+      "description": "Deposits and withdrawals on savings goals."
+    }
+  }
+}

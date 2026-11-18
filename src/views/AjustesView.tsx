@@ -1,0 +1,558 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Check,
+  Copy,
+  Download,
+  FileSpreadsheet,
+  LogOut,
+  Moon,
+  RefreshCw,
+  Sun,
+  Upload,
+} from 'lucide-react';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { PWAInstallButton } from '../components/PWAInstallButton';
+import { useNido } from '../context/NidoContext';
+import {
+  downloadTextFile,
+  generateSpanishCSV,
+  validateAndMigrateBackup,
+} from '../domain/backup';
+import {
+  computeEffectiveSplitPctA,
+  formatDateES,
+  getTodayLocalISO,
+  shiftMonthKey,
+} from '../domain/finance';
+import { SPLIT_PRESETS, TRANSACTION_CATEGORY_LABELS } from '../domain/presets';
+import { exportNidoPDF } from '../services/pdfExport';
+import type { HouseholdSettings, NidoBackupV1, SplitMode } from '../types/nido';
+
+export const AjustesView: React.FC = () => {
+  const {
+    household,
+    householdId,
+    members,
+    memberA,
+    memberB,
+    currentUserProfile,
+    uiMode,
+    toggleUiMode,
+    theme,
+    toggleTheme,
+    recentTransactions,
+    initialCosts,
+    furnitureItems,
+    goals,
+    goalMovements,
+    repo,
+    logout,
+    showToast,
+  } = useNido();
+
+  const [splitMode, setSplitMode] = useState<SplitMode>('preset');
+  const [presetA, setPresetA] = useState(50);
+  const [incomeA, setIncomeA] = useState('2000');
+  const [incomeB, setIncomeB] = useState('2000');
+  const [householdName, setHouseholdName] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  // Full report date range
+  const todayISO = getTodayLocalISO();
+  const [reportFrom, setReportFrom] = useState(() => `${shiftMonthKey(todayISO.slice(0, 7), -2)}-01`);
+  const [reportTo, setReportTo] = useState(todayISO);
+
+  // JSON import state
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [pendingBackup, setPendingBackup] = useState<NidoBackupV1 | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!household) return;
+    setSplitMode(household.settings.splitMode);
+    setPresetA(household.settings.presetA);
+    setIncomeA(String(household.settings.incomeA || ''));
+    setIncomeB(String(household.settings.incomeB || ''));
+    setHouseholdName(household.name);
+  }, [household]);
+
+  const draftSettings: HouseholdSettings = {
+    splitMode,
+    presetA,
+    presetB: Math.round((100 - presetA) * 10) / 10,
+    incomeA: Math.max(0, Number(incomeA.replace(',', '.')) || 0),
+    incomeB: Math.max(0, Number(incomeB.replace(',', '.')) || 0),
+    currency: 'EUR',
+  };
+
+  const previewPctA = computeEffectiveSplitPctA(draftSettings);
+  const previewPctB = Math.round((100 - previewPctA) * 10) / 10;
+
+  const nameA = memberA?.displayName?.split(' ')[0] || 'Tú';
+  const nameB = memberB?.displayName?.split(' ')[0] || 'tu pareja';
+
+  const handleSaveSplit = async () => {
+    if (!householdId || !currentUserProfile) return;
+    const summary = `Actualizó el reparto a ${previewPctA}% / ${previewPctB}% (${splitMode === 'income' ? 'proporcional al salario' : splitMode === 'preset' ? 'predefinido' : 'personalizado'})`;
+    await repo.updateSettings(householdId, draftSettings, currentUserProfile, summary);
+    showToast('Reparto guardado y sincronizado');
+  };
+
+  const handleSaveName = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!householdId || !currentUserProfile || !householdName.trim()) return;
+    await repo.updateHouseholdName(householdId, householdName.trim(), currentUserProfile);
+    showToast('Nombre del hogar actualizado');
+  };
+
+  const handleCopyInvite = async () => {
+    if (!household?.inviteCode) return;
+    try {
+      await navigator.clipboard.writeText(household.inviteCode);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+      showToast('Código copiado');
+    } catch {
+      showToast(`Código: ${household.inviteCode}`);
+    }
+  };
+
+  const handleExportJSON = async () => {
+    if (!householdId) return;
+    const backup = await repo.exportBackup(householdId);
+    downloadTextFile(
+      `nido-backup-${todayISO}.json`,
+      JSON.stringify(backup, null, 2),
+      'application/json'
+    );
+    showToast('Copia de seguridad JSON descargada');
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setImportError(null);
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const validated = validateAndMigrateBackup(parsed);
+      setPendingBackup(validated);
+    } catch (err) {
+      setImportError(
+        err instanceof Error ? err.message : 'El archivo no tiene un formato válido de Nido.'
+      );
+    }
+  };
+
+  const handleConfirmImport = async () => {
+    if (!pendingBackup || !householdId || !currentUserProfile) return;
+    const backup = pendingBackup;
+    setPendingBackup(null);
+    await repo.importBackup(householdId, backup, currentUserProfile);
+    showToast('Copia de seguridad restaurada');
+  };
+
+  const handleFullReportCSV = () => {
+    const filtered = recentTransactions.filter((t) => t.date >= reportFrom && t.date <= reportTo);
+    const csv = generateSpanishCSV(
+      ['Fecha', 'Mes', 'Concepto', 'Categoría', 'Pagó', 'Reparto A (%)', 'Importe (€)'],
+      filtered.map((t) => [
+        formatDateES(t.date),
+        t.monthKey,
+        t.concept,
+        TRANSACTION_CATEGORY_LABELS[t.category],
+        t.paidBy === 'cuenta_comun'
+          ? 'Cuenta común'
+          : members.find((m) => m.uid === t.paidBy)?.displayName?.split(' ')[0] || t.paidBy,
+        t.splitPctA,
+        t.amount,
+      ])
+    );
+    downloadTextFile(`nido-informe-${reportFrom}_${reportTo}.csv`, csv, 'text/csv;charset=utf-8;');
+    showToast('Informe CSV descargado');
+  };
+
+  const handleFullReportPDF = () => {
+    if (!household) return;
+    exportNidoPDF({
+      scope: 'completo',
+      household,
+      members,
+      fromDate: reportFrom,
+      toDate: reportTo,
+      transactions: recentTransactions,
+      initialCosts,
+      items: furnitureItems,
+      goals,
+      goalMovements,
+    });
+    showToast('Informe completo PDF descargado');
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">Ajustes</h1>
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Reparto de gastos, preferencias de vista, hogar compartido y copias de seguridad.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Split configuration */}
+        <section className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-5">
+          <div className="space-y-1">
+            <h2 className="font-display text-lg font-bold">Configuración del reparto</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Define qué porcentaje de los gastos comunes corresponde a cada uno.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-3 gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-xl">
+            {[
+              { id: 'preset' as const, label: 'Predefinido' },
+              { id: 'income' as const, label: 'Por salario' },
+              { id: 'custom' as const, label: 'Personalizado' },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => {
+                  setSplitMode(tab.id);
+                  if (tab.id === 'preset' && !SPLIT_PRESETS.some((p) => p.a === presetA)) {
+                    setPresetA(50);
+                  }
+                }}
+                className={`min-h-[44px] px-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors ${
+                  splitMode === tab.id
+                    ? 'bg-white dark:bg-[#132025] text-[#0F1F24] dark:text-[#F0F5F6] shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {splitMode === 'preset' && (
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              {SPLIT_PRESETS.map((p) => {
+                const active = presetA === p.a;
+                return (
+                  <button
+                    key={p.label}
+                    type="button"
+                    onClick={() => setPresetA(p.a)}
+                    className={`min-h-[44px] rounded-xl text-sm font-bold tabular-nums border transition-colors ${
+                      active
+                        ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
+                        : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {splitMode === 'income' && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="income-a" className="block text-xs font-medium mb-1">
+                  Salario neto mensual · {nameA} (€)
+                </label>
+                <input
+                  id="income-a"
+                  type="text"
+                  inputMode="decimal"
+                  value={incomeA}
+                  onChange={(e) => setIncomeA(e.target.value)}
+                  className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-base font-semibold"
+                />
+              </div>
+              <div>
+                <label htmlFor="income-b" className="block text-xs font-medium mb-1">
+                  Salario neto mensual · {nameB} (€)
+                </label>
+                <input
+                  id="income-b"
+                  type="text"
+                  inputMode="decimal"
+                  value={incomeB}
+                  onChange={(e) => setIncomeB(e.target.value)}
+                  className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-base font-semibold"
+                />
+              </div>
+            </div>
+          )}
+
+          {splitMode === 'custom' && (
+            <div className="space-y-3">
+              <div className="flex justify-between text-sm font-semibold tabular-nums">
+                <span>
+                  {nameA}: {presetA}%
+                </span>
+                <span>
+                  {nameB}: {Math.round((100 - presetA) * 10) / 10}%
+                </span>
+              </div>
+              <input
+                aria-label="Porcentaje de reparto"
+                type="range"
+                min={0}
+                max={100}
+                step={0.5}
+                value={presetA}
+                onChange={(e) => setPresetA(Number(e.target.value))}
+                className="w-full accent-[#0E5A64]"
+              />
+            </div>
+          )}
+
+          {/* Live Preview */}
+          <div className="rounded-xl bg-[#F6F8F8] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-1">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Vista previa del reparto</p>
+            <p className="font-display text-base sm:text-lg font-bold tabular-nums">
+              De cada 100 €, {previewPctA.toLocaleString('es-ES')} € {nameA} / {previewPctB.toLocaleString('es-ES')} € {nameB}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void handleSaveSplit()}
+            className="w-full sm:w-auto min-h-[44px] px-6 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-semibold transition-colors"
+          >
+            Guardar reparto
+          </button>
+        </section>
+
+        {/* Preferences + Household Invite */}
+        <div className="lg:col-span-5 space-y-6">
+          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+            <h2 className="font-display text-base font-bold">Tu interfaz y tema</h2>
+
+            <div className="flex items-center justify-between gap-3 py-1">
+              <div>
+                <p className="text-sm font-semibold">Modo de uso</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Sencillo oculta filtros avanzados y gráficas detalladas.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void toggleUiMode()}
+                className="min-h-[44px] px-4 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-bold whitespace-nowrap"
+              >
+                {uiMode === 'sencillo' ? 'Sencillo' : 'Avanzado'}
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 py-1 border-t border-slate-100 dark:border-slate-800 pt-3">
+              <div>
+                <p className="text-sm font-semibold">Apariencia</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Tema claro u oscuro.</p>
+              </div>
+              <button
+                type="button"
+                onClick={toggleTheme}
+                className="min-h-[44px] px-4 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-bold flex items-center gap-1.5 whitespace-nowrap"
+              >
+                {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                <span>{theme === 'dark' ? 'Claro' : 'Oscuro'}</span>
+              </button>
+            </div>
+
+            <div className="pt-2">
+              <PWAInstallButton variant="full" />
+            </div>
+          </section>
+
+          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+            <h2 className="font-display text-base font-bold">Hogar compartido</h2>
+
+            <form onSubmit={handleSaveName} className="flex gap-2">
+              <input
+                aria-label="Nombre del hogar"
+                type="text"
+                maxLength={80}
+                value={householdName}
+                onChange={(e) => setHouseholdName(e.target.value)}
+                className="flex-1 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              />
+              <button
+                type="submit"
+                className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                Guardar
+              </button>
+            </form>
+
+            <div className="rounded-xl bg-[#F6F8F8] dark:bg-slate-900 p-3.5 flex items-center justify-between gap-2">
+              <div>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Código de invitación</p>
+                <p className="font-mono text-lg font-bold tracking-widest">
+                  {household?.inviteCode || '—'}
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-label="Copiar código de invitación"
+                  onClick={() => void handleCopyInvite()}
+                  className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] flex items-center justify-center"
+                >
+                  {copied ? <Check className="w-4 h-4 text-[#15803D]" /> : <Copy className="w-4 h-4" />}
+                </button>
+                <button
+                  type="button"
+                  aria-label="Regenerar código de invitación"
+                  onClick={() =>
+                    householdId &&
+                    household &&
+                    currentUserProfile &&
+                    void repo.regenerateInviteCode(
+                      householdId,
+                      household.inviteCode,
+                      currentUserProfile
+                    )
+                  }
+                  className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] flex items-center justify-center"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5 text-xs">
+              <p className="font-semibold text-slate-500 dark:text-slate-400">
+                Miembros ({members.length}/2)
+              </p>
+              {members.map((m) => (
+                <div key={m.uid} className="flex items-center justify-between py-1">
+                  <span className="font-medium">{m.displayName}</span>
+                  <span className="text-slate-500 dark:text-slate-400">
+                    {m.uiMode === 'avanzado' ? 'Avanzado' : 'Sencillo'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      </div>
+
+      {/* Full Reports & JSON Backup */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <h2 className="font-display text-base font-bold">Informe completo por fechas</h2>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="rep-from" className="block text-xs font-medium mb-1">Desde</label>
+              <input
+                id="rep-from"
+                type="date"
+                value={reportFrom}
+                onChange={(e) => setReportFrom(e.target.value)}
+                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              />
+            </div>
+            <div>
+              <label htmlFor="rep-to" className="block text-xs font-medium mb-1">Hasta</label>
+              <input
+                id="rep-to"
+                type="date"
+                value={reportTo}
+                onChange={(e) => setReportTo(e.target.value)}
+                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              />
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleFullReportCSV}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center gap-1.5"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              <span>Exportar CSV (Excel ES)</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleFullReportPDF}
+              className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5"
+            >
+              <Download className="w-4 h-4" />
+              <span>Generar informe PDF</span>
+            </button>
+          </div>
+        </section>
+
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+          <div className="space-y-1">
+            <h2 className="font-display text-base font-bold">Copia de seguridad (JSON)</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Exporta todo vuestro historial o restaura una copia validada contra esquema.
+            </p>
+          </div>
+
+          {importError && (
+            <div role="alert" className="rounded-xl bg-[#DC4C3E]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs">
+              {importError}
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void handleExportJSON()}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center gap-1.5"
+            >
+              <Download className="w-4 h-4" />
+              <span>Exportar JSON</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json,.json"
+              onChange={(e) => void handleFileChange(e)}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center gap-1.5"
+            >
+              <Upload className="w-4 h-4" />
+              <span>Importar JSON</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void logout()}
+              className="min-h-[44px] px-4 rounded-xl border border-[#DC4C3E]/40 text-[#DC4C3E] text-xs sm:text-sm font-semibold flex items-center gap-1.5 ml-auto"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Cerrar sesión</span>
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <ConfirmDialog
+        open={Boolean(pendingBackup)}
+        title="Restaurar copia de seguridad JSON"
+        description={
+          pendingBackup
+            ? `Se importarán ${pendingBackup.transactions.length} gastos, ${pendingBackup.items.length} muebles, ${pendingBackup.goals.length} metas y la configuración de "${pendingBackup.householdName}".`
+            : ''
+        }
+        confirmLabel="Restaurar copia"
+        destructive={false}
+        onConfirm={() => void handleConfirmImport()}
+        onCancel={() => setPendingBackup(null)}
+      />
+    </div>
+  );
+};
