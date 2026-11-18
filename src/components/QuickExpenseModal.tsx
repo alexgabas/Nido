@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
-import { getTodayLocalISO } from '../domain/finance';
+import { clampSplitPct, getTodayLocalISO } from '../domain/finance';
 import { EXPENSE_CATEGORY_LABELS } from '../domain/presets';
-import type { ExpenseCategory, Transaction } from '../types/nido';
+import { toUserFriendlyErrorMessage } from '../services/firebase';
+import { COMMON_ACCOUNT_ID, type ExpenseCategory, type Transaction } from '../types/nido';
 
 interface QuickExpenseModalProps {
   open: boolean;
@@ -44,9 +45,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   const [amount, setAmount] = useState('');
   const [concept, setConcept] = useState('');
   const [category, setCategory] = useState<ExpenseCategory>('supermercado');
-  const [paidBy, setPaidBy] = useState<string>('cuenta_comun');
+  const [paidBy, setPaidBy] = useState<string>(COMMON_ACCOUNT_ID);
   const [date, setDate] = useState(getTodayLocalISO());
-  const [splitPctA, setSplitPctA] = useState(effectiveSplitPctA);
+  const [splitPctInput, setSplitPctInput] = useState(() => String(effectiveSplitPctA));
   const [notes, setNotes] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,9 +59,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       setAmount(String(editingTx.amount));
       setConcept(editingTx.concept);
       setCategory(editingTx.category === 'liquidacion' ? 'otros' : editingTx.category);
-      setPaidBy(editingTx.paidBy);
+      setPaidBy(editingTx.paidBy === 'comun' ? COMMON_ACCOUNT_ID : editingTx.paidBy);
       setDate(editingTx.date);
-      setSplitPctA(editingTx.splitPctA);
+      setSplitPctInput(String(clampSplitPct(editingTx.splitPctA, effectiveSplitPctA)));
       setNotes(editingTx.notes);
     } else {
       const today = getTodayLocalISO();
@@ -68,9 +69,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       setAmount('');
       setConcept('');
       setCategory('supermercado');
-      setPaidBy(currentUserProfile?.uid || memberA?.uid || 'cuenta_comun');
+      setPaidBy(currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID);
       setDate(defaultDate);
-      setSplitPctA(effectiveSplitPctA);
+      setSplitPctInput(String(clampSplitPct(effectiveSplitPctA, 50)));
       setNotes('');
     }
   }, [open, editingTx, selectedMonthKey, currentUserProfile, memberA, effectiveSplitPctA]);
@@ -97,6 +98,18 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       setError(`El mes ${targetMonthKey} está cerrado. Desbloquéalo en Modo Avanzado para editar.`);
       return;
     }
+    const rawSplit = splitPctInput.trim().replace(',', '.');
+    if (rawSplit !== '') {
+      const numSplit = Number(rawSplit);
+      if (!Number.isFinite(numSplit) || numSplit < 0 || numSplit > 100) {
+        setError('El reparto debe estar entre 0 % y 100 %.');
+        return;
+      }
+    }
+    const safeSplitPctA =
+      rawSplit === ''
+        ? clampSplitPct(effectiveSplitPctA, 50)
+        : clampSplitPct(Number(rawSplit), effectiveSplitPctA);
 
     setSaving(true);
     setError(null);
@@ -112,7 +125,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
           date,
           paidBy,
           recurringId: editingTx?.recurringId ?? null,
-          splitPctA,
+          splitPctA: safeSplitPctA,
           isSettlement: false,
           settlementTo: '',
           notes,
@@ -122,7 +135,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       showToast(editingTx ? 'Gasto actualizado' : 'Gasto guardado');
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'No se pudo guardar el gasto.');
+      setError(toUserFriendlyErrorMessage(err, 'No se pudo guardar el gasto. Inténtalo de nuevo.'));
     } finally {
       setSaving(false);
     }
@@ -289,8 +302,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                   min={0}
                   max={100}
                   step={0.5}
-                  value={splitPctA}
-                  onChange={(e) => setSplitPctA(Number(e.target.value))}
+                  value={splitPctInput}
+                  onChange={(e) => setSplitPctInput(e.target.value)}
                   className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm tabular-nums"
                 />
               </div>

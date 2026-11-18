@@ -217,7 +217,7 @@ export const MensualView: React.FC = () => {
         amount: Math.round(amt * 100) / 100,
         frequency: recFrequency,
         dayOfMonth: day,
-        splitOverride: null,
+        splitOverride: editingRec?.splitOverride ?? null,
         paidByDefault: recPaidBy,
         active: recActive,
       },
@@ -231,7 +231,7 @@ export const MensualView: React.FC = () => {
     const draft: Record<string, string> = {};
     for (const cat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
       const val = budget?.limits?.[cat];
-      draft[cat] = val ? String(val) : '';
+      draft[cat] = val !== undefined ? String(val) : '';
     }
     setDraftLimits(draft);
     setBudgetModalOpen(true);

@@ -68,12 +68,24 @@ service cloud.firestore {
         && data.updatedAt == request.time;
     }
 
+    function isHouseholdPayer(hid, val) {
+      return val is string
+        && (
+          val == 'cuenta_comun'
+          || (
+            exists(/databases/$(database)/documents/households/$(hid))
+            && (val in get(/databases/$(database)/documents/households/$(hid)).data.memberUids)
+          )
+        );
+    }
+
     function isValidInvite(data) {
-      return data.keys().hasAll(['householdId', 'householdName', 'createdBy', 'createdAt'])
-        && data.keys().hasOnly(['householdId', 'householdName', 'createdBy', 'createdAt'])
+      return data.keys().hasAll(['householdId', 'householdName', 'createdBy', 'memberCount', 'createdAt'])
+        && data.keys().hasOnly(['householdId', 'householdName', 'createdBy', 'memberCount', 'createdAt'])
         && isValidId(data.householdId)
         && data.householdName is string && data.householdName.size() >= 1 && data.householdName.size() <= 80
         && data.createdBy is string && data.createdBy == request.auth.uid
+        && (data.memberCount == 1 || data.memberCount == 2)
         && data.createdAt == request.time;
     }
 
@@ -84,6 +96,7 @@ service cloud.firestore {
         && (s.splitMode in ['income', 'preset', 'custom'])
         && isFiniteNumber(s.presetA) && s.presetA >= 0 && s.presetA <= 100
         && isFiniteNumber(s.presetB) && s.presetB >= 0 && s.presetB <= 100
+        && (s.presetA + s.presetB) == 100
         && isNonNegNumber(s.incomeA)
         && isNonNegNumber(s.incomeB)
         && s.currency == 'EUR';
@@ -126,13 +139,13 @@ service cloud.firestore {
         && data.timestamp == request.time;
     }
 
-    function isValidInitialCost(data) {
+    function isValidInitialCost(data, hid) {
       return data.keys().hasAll(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'createdAt', 'updatedAt'])
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
         && (data.category in ['alquiler', 'fianza', 'garantia_adicional', 'suministros', 'cerrajeria', 'mudanza', 'mobiliario', 'otros'])
         && isNonNegNumber(data.amount)
-        && data.paidBy is string && data.paidBy.size() >= 1 && data.paidBy.size() <= 128
+        && isHouseholdPayer(hid, data.paidBy)
         && (data.status in ['pendiente', 'pagado'])
         && (data.dueDate == '' || isValidDateStr(data.dueDate))
         && data.notes is string && data.notes.size() <= 500
@@ -170,7 +183,7 @@ service cloud.firestore {
         && data.updatedAt == request.time;
     }
 
-    function isValidRecurring(data) {
+    function isValidRecurring(data, hid) {
       return data.keys().hasAll(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
@@ -179,13 +192,13 @@ service cloud.firestore {
         && (data.frequency in ['mensual', 'bimestral', 'trimestral', 'anual'])
         && isFiniteNumber(data.dayOfMonth) && data.dayOfMonth >= 1 && data.dayOfMonth <= 31
         && (data.splitOverride == null || (isFiniteNumber(data.splitOverride) && data.splitOverride >= 0 && data.splitOverride <= 100))
-        && data.paidByDefault is string && data.paidByDefault.size() >= 1 && data.paidByDefault.size() <= 128
+        && isHouseholdPayer(hid, data.paidByDefault)
         && data.active is bool
         && data.createdAt is timestamp
         && data.updatedAt == request.time;
     }
 
-    function isValidTransaction(data) {
+    function isValidTransaction(data, hid) {
       return data.keys().hasAll(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'notes', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'notes', 'createdAt', 'updatedAt'])
         && isValidMonthKey(data.monthKey)
@@ -193,14 +206,18 @@ service cloud.firestore {
         && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros', 'liquidacion'])
         && isNonNegNumber(data.amount)
         && isValidDateStr(data.date)
-        && data.paidBy is string && data.paidBy.size() >= 1 && data.paidBy.size() <= 128
+        && isHouseholdPayer(hid, data.paidBy)
         && (data.recurringId == null || (data.recurringId is string && data.recurringId.size() <= 128))
         && isFiniteNumber(data.splitPctA) && data.splitPctA >= 0 && data.splitPctA <= 100
         && data.isSettlement is bool
-        && data.settlementTo is string && data.settlementTo.size() <= 128
+        && (data.settlementTo == '' || (data.settlementTo is string && exists(/databases/$(database)/documents/households/$(hid)) && (data.settlementTo in get(/databases/$(database)/documents/households/$(hid)).data.memberUids)))
         && data.notes is string && data.notes.size() <= 500
         && data.createdAt is timestamp
         && data.updatedAt == request.time;
+    }
+
+    function isValidBudgetLimitValue(limits, key) {
+      return !(key in limits) || isNonNegNumber(limits[key]);
     }
 
     function isValidBudget(data, monthKey) {
@@ -209,7 +226,24 @@ service cloud.firestore {
         && data.monthKey == monthKey
         && isValidMonthKey(data.monthKey)
         && data.limits is map
-        && data.limits.size() <= 20
+        && data.limits.keys().hasOnly([
+          'alquiler', 'luz', 'agua', 'gas', 'internet', 'movil',
+          'suscripciones', 'seguros', 'comunidad', 'supermercado',
+          'transporte', 'ocio', 'otros'
+        ])
+        && isValidBudgetLimitValue(data.limits, 'alquiler')
+        && isValidBudgetLimitValue(data.limits, 'luz')
+        && isValidBudgetLimitValue(data.limits, 'agua')
+        && isValidBudgetLimitValue(data.limits, 'gas')
+        && isValidBudgetLimitValue(data.limits, 'internet')
+        && isValidBudgetLimitValue(data.limits, 'movil')
+        && isValidBudgetLimitValue(data.limits, 'suscripciones')
+        && isValidBudgetLimitValue(data.limits, 'seguros')
+        && isValidBudgetLimitValue(data.limits, 'comunidad')
+        && isValidBudgetLimitValue(data.limits, 'supermercado')
+        && isValidBudgetLimitValue(data.limits, 'transporte')
+        && isValidBudgetLimitValue(data.limits, 'ocio')
+        && isValidBudgetLimitValue(data.limits, 'otros')
         && data.updatedAt == request.time;
     }
 
@@ -244,12 +278,12 @@ service cloud.firestore {
         && data.updatedAt == request.time;
     }
 
-    function isValidGoalMovement(data) {
+    function isValidGoalMovement(data, hid) {
       return data.keys().hasAll(['goalId', 'amount', 'by', 'date', 'note', 'createdAt'])
         && data.keys().hasOnly(['goalId', 'amount', 'by', 'date', 'note', 'createdAt'])
         && isValidId(data.goalId)
         && isFiniteNumber(data.amount) && data.amount != 0
-        && data.by is string && data.by.size() >= 1 && data.by.size() <= 128
+        && isHouseholdPayer(hid, data.by)
         && isValidDateStr(data.date)
         && data.note is string && data.note.size() <= 240
         && data.createdAt == request.time;
@@ -270,8 +304,15 @@ service cloud.firestore {
       allow get: if isSignedIn() && isValidInviteCode(inviteCode);
       allow list: if false;
       allow create: if isSignedIn() && isValidInviteCode(inviteCode) && isValidInvite(incoming())
-        && isHouseholdMemberAfter(incoming().householdId);
-      allow update: if false;
+        && isHouseholdMemberAfter(incoming().householdId)
+        && incoming().memberCount == getAfter(/databases/$(database)/documents/households/$(incoming().householdId)).data.memberUids.size();
+      allow update: if isSignedIn() && isValidInviteCode(inviteCode)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['memberCount'])
+        && existing().memberCount == 1
+        && incoming().memberCount == 2
+        && existsAfter(/databases/$(database)/documents/households/$(existing().householdId))
+        && getAfter(/databases/$(database)/documents/households/$(existing().householdId)).data.memberUids.size() == 2
+        && (request.auth.uid in getAfter(/databases/$(database)/documents/households/$(existing().householdId)).data.memberUids);
       allow delete: if isSignedIn() && isValidInviteCode(inviteCode)
         && isHouseholdMember(existing().householdId);
     }
@@ -287,7 +328,8 @@ service cloud.firestore {
         && incoming().createdAt == request.time
         && incoming().memberUids.size() == 1
         && incoming().memberUids[0] == request.auth.uid
-        && existsAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode));
+        && existsAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode))
+        && getAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode)).data.householdId == hid;
 
       allow update: if isSignedIn() && isValidId(hid) && isValidHousehold(incoming())
         && incoming().createdAt == existing().createdAt
@@ -303,6 +345,7 @@ service cloud.firestore {
             (request.auth.uid in existing().memberUids)
             && incoming().diff(existing()).affectedKeys().hasOnly(['inviteCode', 'updatedAt'])
             && existsAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode))
+            && getAfter(/databases/$(database)/documents/invites/$(incoming().inviteCode)).data.householdId == hid
           )
           ||
           // Action 3: Join household as second member (max 2)
@@ -315,6 +358,7 @@ service cloud.firestore {
             && incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'updatedAt'])
             && exists(/databases/$(database)/documents/invites/$(existing().inviteCode))
             && get(/databases/$(database)/documents/invites/$(existing().inviteCode)).data.householdId == hid
+            && getAfter(/databases/$(database)/documents/invites/$(existing().inviteCode)).data.memberCount == 2
           )
         );
 
@@ -355,11 +399,11 @@ service cloud.firestore {
         allow list: if isValidId(hid) && isHouseholdMember(hid);
         allow create: if isValidId(hid) && isValidId(costId)
           && isHouseholdMember(hid)
-          && isValidInitialCost(incoming())
+          && isValidInitialCost(incoming(), hid)
           && incoming().createdAt == request.time;
         allow update: if isValidId(hid) && isValidId(costId)
           && isHouseholdMember(hid)
-          && isValidInitialCost(incoming())
+          && isValidInitialCost(incoming(), hid)
           && incoming().createdAt == existing().createdAt
           && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'updatedAt']);
         allow delete: if isValidId(hid) && isValidId(costId) && isHouseholdMember(hid);
@@ -409,11 +453,11 @@ service cloud.firestore {
         allow list: if isValidId(hid) && isHouseholdMember(hid);
         allow create: if isValidId(hid) && isValidId(recId)
           && isHouseholdMember(hid)
-          && isValidRecurring(incoming())
+          && isValidRecurring(incoming(), hid)
           && incoming().createdAt == request.time;
         allow update: if isValidId(hid) && isValidId(recId)
           && isHouseholdMember(hid)
-          && isValidRecurring(incoming())
+          && isValidRecurring(incoming(), hid)
           && incoming().createdAt == existing().createdAt
           && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'updatedAt']);
         allow delete: if isValidId(hid) && isValidId(recId) && isHouseholdMember(hid);
@@ -425,11 +469,11 @@ service cloud.firestore {
         allow list: if isValidId(hid) && isHouseholdMember(hid);
         allow create: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
-          && isValidTransaction(incoming())
+          && isValidTransaction(incoming(), hid)
           && incoming().createdAt == request.time;
         allow update: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
-          && isValidTransaction(incoming())
+          && isValidTransaction(incoming(), hid)
           && incoming().createdAt == existing().createdAt
           && incoming().diff(existing()).affectedKeys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'splitPctA', 'notes', 'updatedAt']);
         allow delete: if isValidId(hid) && isValidId(txId) && isHouseholdMember(hid);
@@ -482,8 +526,11 @@ service cloud.firestore {
         allow list: if isValidId(hid) && isHouseholdMember(hid);
         allow create: if isValidId(hid) && isValidId(movId)
           && isHouseholdMember(hid)
-          && isValidGoalMovement(incoming())
-          && exists(/databases/$(database)/documents/households/$(hid)/goals/$(incoming().goalId));
+          && isValidGoalMovement(incoming(), hid)
+          && (
+            exists(/databases/$(database)/documents/households/$(hid)/goals/$(incoming().goalId))
+            || existsAfter(/databases/$(database)/documents/households/$(hid)/goals/$(incoming().goalId))
+          );
         allow update: if false;
         allow delete: if isValidId(hid) && isValidId(movId) && isHouseholdMember(hid);
       }

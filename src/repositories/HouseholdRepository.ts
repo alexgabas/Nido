@@ -25,11 +25,37 @@ export interface UserProfileInput {
   photoURL: string;
 }
 
+export interface JoinHouseholdOptions {
+  confirmSwitch?: boolean;
+}
+
+export class HouseholdSwitchConfirmationRequiredError extends Error {
+  readonly currentHouseholdId: string;
+  readonly targetHouseholdId: string;
+  readonly targetHouseholdName: string;
+
+  constructor(currentHouseholdId: string, targetHouseholdId: string, targetHouseholdName: string) {
+    super(
+      `Ya perteneces a otro hogar. Confirma si quieres cambiar a "${targetHouseholdName}".`
+    );
+    this.name = 'HouseholdSwitchConfirmationRequiredError';
+    this.currentHouseholdId = currentHouseholdId;
+    this.targetHouseholdId = targetHouseholdId;
+    this.targetHouseholdName = targetHouseholdName;
+  }
+}
+
 export interface HouseholdRepository {
   // User / Onboarding
   getUserHouseholdId(uid: string): Promise<string | null>;
   createHousehold(user: UserProfileInput, name: string): Promise<string>;
-  joinHouseholdByCode(user: UserProfileInput, inviteCode: string): Promise<string>;
+  joinHouseholdByCode(
+    user: UserProfileInput,
+    inviteCode: string,
+    options?: JoinHouseholdOptions
+  ): Promise<string>;
+  seedDefaultLists(householdId: string, actor: UserProfileInput): Promise<number>;
+  hasPendingDefaultSeed(householdId: string): boolean;
   regenerateInviteCode(householdId: string, oldCode: string, actor: UserProfileInput): Promise<string>;
 
   // Subscriptions

@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { ArrowRight, Home, KeyRound, LogOut, ShieldCheck, Users } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
+import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
+import { toUserFriendlyErrorMessage } from '../services/firebase';
+import { ConfirmDialog } from './ConfirmDialog';
 import { PWAInstallButton } from './PWAInstallButton';
 
 export const LoginOnboarding: React.FC = () => {
@@ -23,6 +26,7 @@ export const LoginOnboarding: React.FC = () => {
   const [inviteCode, setInviteCode] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [switchConfirm, setSwitchConfirm] = useState<{ code: string; targetName: string } | null>(null);
 
   const handleGoogleLogin = async () => {
     setErrorMsg(null);
@@ -31,9 +35,7 @@ export const LoginOnboarding: React.FC = () => {
       await signInWithGoogle();
     } catch (err) {
       setErrorMsg(
-        err instanceof Error
-          ? err.message
-          : 'No se pudo iniciar sesión con Google. Inténtalo de nuevo.'
+        toUserFriendlyErrorMessage(err, 'No se pudo iniciar sesión con Google. Inténtalo de nuevo.')
       );
     } finally {
       setSubmitting(false);
@@ -52,7 +54,31 @@ export const LoginOnboarding: React.FC = () => {
     try {
       await createHousehold(clean);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'No se pudo crear el hogar.');
+      setErrorMsg(
+        toUserFriendlyErrorMessage(err, 'No se ha podido crear el hogar, inténtalo de nuevo.')
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const runJoin = async (code: string, confirmSwitch: boolean) => {
+    setErrorMsg(null);
+    setSubmitting(true);
+    try {
+      await joinHousehold(code, { confirmSwitch });
+      setSwitchConfirm(null);
+    } catch (err) {
+      if (err instanceof HouseholdSwitchConfirmationRequiredError && !confirmSwitch) {
+        setSwitchConfirm({ code, targetName: err.targetHouseholdName });
+        return;
+      }
+      setErrorMsg(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudo unir al hogar. Comprueba el código e inténtalo de nuevo.'
+        )
+      );
     } finally {
       setSubmitting(false);
     }
@@ -65,20 +91,7 @@ export const LoginOnboarding: React.FC = () => {
       setErrorMsg('El código debe tener exactamente 6 letras o números.');
       return;
     }
-    setErrorMsg(null);
-    setSubmitting(true);
-    try {
-      await joinHousehold(code);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'No se pudo unir al hogar.';
-      setErrorMsg(
-        msg.includes('Missing or insufficient permissions')
-          ? 'No pudimos unirte. Comprueba que el código es correcto y que el hogar no tiene ya 2 miembros.'
-          : msg
-      );
-    } finally {
-      setSubmitting(false);
-    }
+    await runJoin(code, false);
   };
 
   if (!authReady || householdLoading) {
@@ -314,6 +327,22 @@ export const LoginOnboarding: React.FC = () => {
         <span>Nido · Gestión del hogar en pareja</span>
         <span>Moneda EUR (es-ES)</span>
       </footer>
+
+      <ConfirmDialog
+        open={Boolean(switchConfirm)}
+        title="Cambiar de hogar activo"
+        description={
+          switchConfirm
+            ? `Tu cuenta ya pertenece a otro hogar. Si continúas, pasarás a usar "${switchConfirm.targetName}" como hogar activo.`
+            : ''
+        }
+        confirmLabel="Cambiar de hogar"
+        destructive={false}
+        onConfirm={() => {
+          if (switchConfirm) void runJoin(switchConfirm.code, true);
+        }}
+        onCancel={() => setSwitchConfirm(null)}
+      />
     </div>
   );
 };

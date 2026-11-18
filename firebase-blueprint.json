@@ -38,12 +38,16 @@
           "minLength": 1,
           "maxLength": 128
         },
+        "memberCount": {
+          "type": "integer",
+          "description": "Current number of members in the linked household (1 or 2)."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
         }
       },
-      "required": ["householdId", "householdName", "createdBy", "createdAt"]
+      "required": ["householdId", "householdName", "createdBy", "memberCount", "createdAt"]
     },
     "Household": {
       "title": "Household",
@@ -173,6 +177,7 @@
         },
         "paidBy": {
           "type": "string",
+          "description": "Household member UID or 'cuenta_comun'.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -414,7 +419,23 @@
         },
         "limits": {
           "type": "object",
-          "description": "Map of category to monthly EUR limit."
+          "description": "Map of known ExpenseCategory keys to non-negative monthly EUR limits.",
+          "properties": {
+            "alquiler": { "type": "number" },
+            "luz": { "type": "number" },
+            "agua": { "type": "number" },
+            "gas": { "type": "number" },
+            "internet": { "type": "number" },
+            "movil": { "type": "number" },
+            "suscripciones": { "type": "number" },
+            "seguros": { "type": "number" },
+            "comunidad": { "type": "number" },
+            "supermercado": { "type": "number" },
+            "transporte": { "type": "number" },
+            "ocio": { "type": "number" },
+            "otros": { "type": "number" }
+          },
+          "additionalProperties": false
         },
         "updatedAt": {
           "type": "string",

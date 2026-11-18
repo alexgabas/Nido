@@ -29,13 +29,15 @@ import {
   ROOM_LABELS,
 } from '../domain/presets';
 import { exportNidoPDF } from '../services/pdfExport';
-import type {
-  FurnitureItem,
-  FurniturePriority,
-  FurnitureRoom,
-  FurnitureStatus,
-  InitialCost,
-  InitialCostCategory,
+import { toUserFriendlyErrorMessage } from '../services/firebase';
+import {
+  COMMON_ACCOUNT_ID,
+  type FurnitureItem,
+  type FurniturePriority,
+  type FurnitureRoom,
+  type FurnitureStatus,
+  type InitialCost,
+  type InitialCostCategory,
 } from '../types/nido';
 
 type MudanzaSubTab = 'gastos' | 'checklist' | 'mobiliario';
@@ -59,6 +61,8 @@ export const MudanzaView: React.FC = () => {
     repo,
     showToast,
     scheduleUndo,
+    seedingDefaults,
+    retryDefaultSeed,
   } = useNido();
 
   const [subTab, setSubTab] = useState<MudanzaSubTab>('gastos');
@@ -69,7 +73,7 @@ export const MudanzaView: React.FC = () => {
   const [costConcept, setCostConcept] = useState('');
   const [costCategory, setCostCategory] = useState<InitialCostCategory>('alquiler');
   const [costAmount, setCostAmount] = useState('');
-  const [costPaidBy, setCostPaidBy] = useState('comun');
+  const [costPaidBy, setCostPaidBy] = useState<string>(COMMON_ACCOUNT_ID);
   const [costStatus, setCostStatus] = useState<'pendiente' | 'pagado'>('pendiente');
   const [costDueDate, setCostDueDate] = useState('');
   const [costNotes, setCostNotes] = useState('');
@@ -145,7 +149,9 @@ export const MudanzaView: React.FC = () => {
     setCostConcept(cost?.concept ?? '');
     setCostCategory(cost?.category ?? 'otros');
     setCostAmount(cost ? String(cost.amount) : '');
-    setCostPaidBy(cost?.paidBy ?? 'comun');
+    const normalizedPaidBy =
+      !cost?.paidBy || cost.paidBy === 'comun' ? COMMON_ACCOUNT_ID : cost.paidBy;
+    setCostPaidBy(normalizedPaidBy);
     setCostStatus(cost?.status ?? 'pendiente');
     setCostDueDate(cost?.dueDate ?? '');
     setCostNotes(cost?.notes ?? '');
@@ -157,22 +163,26 @@ export const MudanzaView: React.FC = () => {
     if (!householdId || !currentUserProfile) return;
     const numeric = Number(costAmount.replace(',', '.'));
     if (!Number.isFinite(numeric) || numeric < 0) return;
-    await repo.upsertInitialCost(
-      householdId,
-      {
-        id: editingCost?.id,
-        concept: costConcept.trim(),
-        category: costCategory,
-        amount: Math.round(numeric * 100) / 100,
-        paidBy: costPaidBy,
-        status: costStatus,
-        dueDate: costDueDate,
-        notes: costNotes,
-      },
-      currentUserProfile
-    );
-    setCostModalOpen(false);
-    showToast('Gasto inicial guardado');
+    try {
+      await repo.upsertInitialCost(
+        householdId,
+        {
+          id: editingCost?.id,
+          concept: costConcept.trim(),
+          category: costCategory,
+          amount: Math.round(numeric * 100) / 100,
+          paidBy: costPaidBy,
+          status: costStatus,
+          dueDate: costDueDate,
+          notes: costNotes,
+        },
+        currentUserProfile
+      );
+      setCostModalOpen(false);
+      showToast('Gasto inicial guardado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el gasto inicial.'));
+    }
   };
 
   const openFurnitureModal = (item: FurnitureItem | null) => {
@@ -281,7 +291,7 @@ export const MudanzaView: React.FC = () => {
   };
 
   const memberLabel = (uid: string) => {
-    if (uid === 'comun' || uid === 'cuenta_comun') return 'Común';
+    if (uid === COMMON_ACCOUNT_ID || uid === 'comun') return 'Común';
     return members.find((m) => m.uid === uid)?.displayName?.split(' ')[0] || 'Pareja';
   };
 
@@ -383,11 +393,21 @@ export const MudanzaView: React.FC = () => {
           </div>
 
           {initialCosts.length === 0 ? (
-            <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
+            <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-3">
               <p className="text-sm font-semibold">No hay gastos iniciales registrados</p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 Añade la fianza, el primer mes o los cambios de titular para calcular cuánto os corresponde.
               </p>
+              <div className="pt-1">
+                <button
+                  type="button"
+                  disabled={seedingDefaults}
+                  onClick={() => void retryDefaultSeed()}
+                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-60"
+                >
+                  {seedingDefaults ? 'Cargando listas...' : 'Cargar listas por defecto'}
+                </button>
+              </div>
             </div>
           ) : (
             <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-800">
@@ -833,7 +853,7 @@ export const MudanzaView: React.FC = () => {
                     onChange={(e) => setCostPaidBy(e.target.value)}
                     className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                   >
-                    <option value="comun">Cuenta común</option>
+                    <option value={COMMON_ACCOUNT_ID}>Cuenta común</option>
                     {memberA && <option value={memberA.uid}>{nameA}</option>}
                     {memberB && <option value={memberB.uid}>{nameB}</option>}
                   </select>

@@ -112,6 +112,19 @@ export function roundCents(value: number): number {
 
 // ─── Split Formula ───────────────────────────────────────────────────────────
 
+export function clampSplitPct(value: unknown, fallback = 50): number {
+  if (value === null || value === undefined || value === '') return fallback;
+  const n = typeof value === 'number' ? value : Number(String(value).replace(',', '.'));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(n * 10) / 10));
+}
+
+export function normalizeSplitPair(presetAValue: unknown): { presetA: number; presetB: number } {
+  const presetA = clampSplitPct(presetAValue, 50);
+  const presetB = Math.round((100 - presetA) * 10) / 10;
+  return { presetA, presetB };
+}
+
 export function computeEffectiveSplitPctA(settings: HouseholdSettings): number {
   if (settings.splitMode === 'income') {
     const a = Math.max(0, Number(settings.incomeA) || 0);
@@ -120,9 +133,7 @@ export function computeEffectiveSplitPctA(settings: HouseholdSettings): number {
     if (total <= 0) return 50;
     return Math.round((a / total) * 1000) / 10;
   }
-  const pct = Number(settings.presetA);
-  if (!Number.isFinite(pct)) return 50;
-  return Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
+  return clampSplitPct(settings.presetA, 50);
 }
 
 // ─── Couple Balance & Settlement Calculation ─────────────────────────────────
@@ -179,7 +190,7 @@ export function calculateCoupleBalance(
     }
 
     personalTotalSpent += amount;
-    const pctA = Math.max(0, Math.min(100, Number(tx.splitPctA) || 50)) / 100;
+    const pctA = clampSplitPct(tx.splitPctA, 50) / 100;
     const txShareA = amount * pctA;
     const txShareB = amount - txShareA;
 
@@ -390,7 +401,7 @@ export function computeInitialCostsSummary(
     }
   }
 
-  const pctA = Math.max(0, Math.min(100, splitPctA)) / 100;
+  const pctA = clampSplitPct(splitPctA, 50) / 100;
   const shareA = roundCents(totalPlanned * pctA);
   const shareB = roundCents(totalPlanned - shareA);
 

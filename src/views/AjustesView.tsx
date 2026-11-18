@@ -25,6 +25,8 @@ import {
   shiftMonthKey,
 } from '../domain/finance';
 import { SPLIT_PRESETS, TRANSACTION_CATEGORY_LABELS } from '../domain/presets';
+import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
+import { toUserFriendlyErrorMessage } from '../services/firebase';
 import { exportNidoPDF } from '../services/pdfExport';
 import type { HouseholdSettings, NidoBackupV1, SplitMode } from '../types/nido';
 
@@ -47,6 +49,11 @@ export const AjustesView: React.FC = () => {
     goalMovements,
     repo,
     logout,
+    joinHousehold,
+    isDemoMode,
+    seedPending,
+    seedingDefaults,
+    retryDefaultSeed,
     showToast,
   } = useNido();
 
@@ -56,6 +63,10 @@ export const AjustesView: React.FC = () => {
   const [incomeB, setIncomeB] = useState('2000');
   const [householdName, setHouseholdName] = useState('');
   const [copied, setCopied] = useState(false);
+  const [switchInviteCode, setSwitchInviteCode] = useState('');
+  const [switchError, setSwitchError] = useState<string | null>(null);
+  const [switchingHousehold, setSwitchingHousehold] = useState(false);
+  const [switchConfirm, setSwitchConfirm] = useState<{ code: string; targetName: string } | null>(null);
 
   // Full report date range
   const todayISO = getTodayLocalISO();
@@ -93,16 +104,55 @@ export const AjustesView: React.FC = () => {
 
   const handleSaveSplit = async () => {
     if (!householdId || !currentUserProfile) return;
-    const summary = `Actualizó el reparto a ${previewPctA}% / ${previewPctB}% (${splitMode === 'income' ? 'proporcional al salario' : splitMode === 'preset' ? 'predefinido' : 'personalizado'})`;
-    await repo.updateSettings(householdId, draftSettings, currentUserProfile, summary);
-    showToast('Reparto guardado y sincronizado');
+    try {
+      const summary = `Actualizó el reparto a ${previewPctA}% / ${previewPctB}% (${splitMode === 'income' ? 'proporcional al salario' : splitMode === 'preset' ? 'predefinido' : 'personalizado'})`;
+      await repo.updateSettings(householdId, draftSettings, currentUserProfile, summary);
+      showToast('Reparto guardado y sincronizado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el reparto. Inténtalo de nuevo.'));
+    }
   };
 
   const handleSaveName = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!householdId || !currentUserProfile || !householdName.trim()) return;
-    await repo.updateHouseholdName(householdId, householdName.trim(), currentUserProfile);
-    showToast('Nombre del hogar actualizado');
+    try {
+      await repo.updateHouseholdName(householdId, householdName.trim(), currentUserProfile);
+      showToast('Nombre del hogar actualizado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el nombre del hogar.'));
+    }
+  };
+
+  const runSwitchHousehold = async (code: string, confirmSwitch: boolean) => {
+    setSwitchError(null);
+    setSwitchingHousehold(true);
+    try {
+      await joinHousehold(code, { confirmSwitch });
+      setSwitchInviteCode('');
+      setSwitchConfirm(null);
+      showToast('Hogar cambiado correctamente');
+    } catch (err) {
+      if (err instanceof HouseholdSwitchConfirmationRequiredError && !confirmSwitch) {
+        setSwitchConfirm({ code, targetName: err.targetHouseholdName });
+        return;
+      }
+      setSwitchError(
+        toUserFriendlyErrorMessage(err, 'No se pudo cambiar de hogar. Revisa el código e inténtalo de nuevo.')
+      );
+    } finally {
+      setSwitchingHousehold(false);
+    }
+  };
+
+  const handleSwitchSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const code = switchInviteCode.trim().toUpperCase();
+    if (!/^[A-Z0-9]{6}$/.test(code)) {
+      setSwitchError('El código debe tener exactamente 6 letras o números.');
+      return;
+    }
+    await runSwitchHousehold(code, false);
   };
 
   const handleCopyInvite = async () => {
@@ -140,7 +190,7 @@ export const AjustesView: React.FC = () => {
       setPendingBackup(validated);
     } catch (err) {
       setImportError(
-        err instanceof Error ? err.message : 'El archivo no tiene un formato válido de Nido.'
+        toUserFriendlyErrorMessage(err, 'El archivo no tiene un formato válido de Nido.')
       );
     }
   };
@@ -149,8 +199,14 @@ export const AjustesView: React.FC = () => {
     if (!pendingBackup || !householdId || !currentUserProfile) return;
     const backup = pendingBackup;
     setPendingBackup(null);
-    await repo.importBackup(householdId, backup, currentUserProfile);
-    showToast('Copia de seguridad restaurada');
+    try {
+      await repo.importBackup(householdId, backup, currentUserProfile);
+      showToast('Copia de seguridad restaurada');
+    } catch (err) {
+      setImportError(
+        toUserFriendlyErrorMessage(err, 'No se pudo restaurar la copia de seguridad. Inténtalo de nuevo.')
+      );
+    }
   };
 
   const handleFullReportCSV = () => {
@@ -438,6 +494,59 @@ export const AjustesView: React.FC = () => {
                 </div>
               ))}
             </div>
+
+            {seedPending && (
+              <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-2">
+                <p className="text-xs text-amber-800 dark:text-amber-300">
+                  Faltan por cargar las listas iniciales por defecto en este hogar.
+                </p>
+                <button
+                  type="button"
+                  disabled={seedingDefaults}
+                  onClick={() => void retryDefaultSeed()}
+                  className="w-full min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-60 text-white text-xs font-semibold transition-colors"
+                >
+                  {seedingDefaults ? 'Cargando listas...' : 'Cargar listas por defecto'}
+                </button>
+              </div>
+            )}
+
+            {!isDemoMode && (
+              <form
+                onSubmit={handleSwitchSubmit}
+                className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2"
+              >
+                <label
+                  htmlFor="switch-invite-code"
+                  className="block text-xs font-semibold text-slate-600 dark:text-slate-300"
+                >
+                  Unirse a otro hogar con código
+                </label>
+                {switchError && (
+                  <p role="alert" className="text-xs text-[#B42318] dark:text-[#FCA5A5]">
+                    {switchError}
+                  </p>
+                )}
+                <div className="flex gap-2">
+                  <input
+                    id="switch-invite-code"
+                    type="text"
+                    maxLength={6}
+                    value={switchInviteCode}
+                    onChange={(e) => setSwitchInviteCode(e.target.value.toUpperCase())}
+                    placeholder="Código de 6 caracteres"
+                    className="flex-1 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono text-sm uppercase tracking-widest"
+                  />
+                  <button
+                    type="submit"
+                    disabled={switchingHousehold}
+                    className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-60 whitespace-nowrap"
+                  >
+                    {switchingHousehold ? 'Cambiando...' : 'Cambiar hogar'}
+                  </button>
+                </div>
+              </form>
+            )}
           </section>
         </div>
       </div>
@@ -552,6 +661,22 @@ export const AjustesView: React.FC = () => {
         destructive={false}
         onConfirm={() => void handleConfirmImport()}
         onCancel={() => setPendingBackup(null)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(switchConfirm)}
+        title="Cambiar de hogar activo"
+        description={
+          switchConfirm
+            ? `Ahora perteneces a "${household?.name || 'tu hogar actual'}". Si confirmas, tu cuenta pasará a conectarse con "${switchConfirm.targetName}" (los datos del hogar actual no se borran, pero dejarán de mostrarse como activos).`
+            : ''
+        }
+        confirmLabel="Cambiar de hogar"
+        destructive={false}
+        onConfirm={() => {
+          if (switchConfirm) void runSwitchHousehold(switchConfirm.code, true);
+        }}
+        onCancel={() => setSwitchConfirm(null)}
       />
     </div>
   );

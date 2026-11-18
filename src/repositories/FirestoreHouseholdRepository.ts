@@ -17,7 +17,13 @@ import {
   writeBatch,
   type DocumentData,
 } from 'firebase/firestore';
-import { clampDateForMonth, computeEffectiveSplitPctA, getTodayLocalISO } from '../domain/finance';
+import {
+  clampDateForMonth,
+  clampSplitPct,
+  computeEffectiveSplitPctA,
+  getTodayLocalISO,
+  normalizeSplitPair,
+} from '../domain/finance';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -26,6 +32,7 @@ import {
 } from '../domain/presets';
 import { db, handleFirestoreError, OperationType } from '../services/firebase';
 import {
+  COMMON_ACCOUNT_ID,
   MAX_LENGTHS,
   type ActivityAction,
   type ActivityEntry,
@@ -45,7 +52,42 @@ import {
   type Transaction,
   type UiMode,
 } from '../types/nido';
-import type { HouseholdRepository, Unsubscribe, UserProfileInput } from './HouseholdRepository';
+import {
+  HouseholdSwitchConfirmationRequiredError,
+  type HouseholdRepository,
+  type JoinHouseholdOptions,
+  type Unsubscribe,
+  type UserProfileInput,
+} from './HouseholdRepository';
+
+const MAX_BATCH_DOCS = 15;
+const PENDING_SEED_KEY_PREFIX = 'nido_seed_pending_';
+
+function normalizePayerValue(val: unknown): string {
+  const s = typeof val === 'string' ? val.trim() : '';
+  if (!s || s === 'comun') return COMMON_ACCOUNT_ID;
+  return s;
+}
+
+function setPendingSeedFlag(householdId: string, pending: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const key = `${PENDING_SEED_KEY_PREFIX}${householdId}`;
+    if (pending) window.localStorage.setItem(key, '1');
+    else window.localStorage.removeItem(key);
+  } catch {
+    // ignore storage access issues
+  }
+}
+
+function getPendingSeedFlag(householdId: string): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(`${PENDING_SEED_KEY_PREFIX}${householdId}`) === '1';
+  } catch {
+    return false;
+  }
+}
 
 function tsToIso(val: unknown): string {
   if (val instanceof Timestamp) return val.toDate().toISOString();
@@ -67,6 +109,7 @@ function generateInviteCode(): string {
 }
 
 function mapHousehold(id: string, d: DocumentData): Household {
+  const { presetA, presetB } = normalizeSplitPair(d.settings?.presetA);
   return {
     id,
     name: String(d.name ?? 'Mi hogar'),
@@ -74,8 +117,8 @@ function mapHousehold(id: string, d: DocumentData): Household {
     inviteCode: String(d.inviteCode ?? ''),
     settings: {
       splitMode: d.settings?.splitMode ?? 'preset',
-      presetA: Number(d.settings?.presetA ?? 50),
-      presetB: Number(d.settings?.presetB ?? 50),
+      presetA,
+      presetB: d.settings?.presetB !== undefined ? clampSplitPct(d.settings.presetB, presetB) : presetB,
       incomeA: Number(d.settings?.incomeA ?? 0),
       incomeB: Number(d.settings?.incomeB ?? 0),
       currency: 'EUR',
@@ -103,7 +146,7 @@ function mapInitialCost(id: string, d: DocumentData): InitialCost {
     concept: String(d.concept ?? ''),
     category: d.category ?? 'otros',
     amount: Number(d.amount ?? 0),
-    paidBy: String(d.paidBy ?? 'comun'),
+    paidBy: normalizePayerValue(d.paidBy),
     status: d.status === 'pagado' ? 'pagado' : 'pendiente',
     dueDate: String(d.dueDate ?? ''),
     notes: String(d.notes ?? ''),
@@ -152,8 +195,11 @@ function mapRecurring(id: string, d: DocumentData): RecurringExpense {
     amount: Number(d.amount ?? 0),
     frequency: d.frequency ?? 'mensual',
     dayOfMonth: Number(d.dayOfMonth ?? 1),
-    splitOverride: d.splitOverride === null || d.splitOverride === undefined ? null : Number(d.splitOverride),
-    paidByDefault: String(d.paidByDefault ?? 'cuenta_comun'),
+    splitOverride:
+      d.splitOverride === null || d.splitOverride === undefined
+        ? null
+        : clampSplitPct(d.splitOverride, 50),
+    paidByDefault: normalizePayerValue(d.paidByDefault),
     active: Boolean(d.active),
     createdAt: tsToIso(d.createdAt),
     updatedAt: tsToIso(d.updatedAt),
@@ -168,9 +214,9 @@ function mapTransaction(id: string, d: DocumentData): Transaction {
     category: d.category ?? 'otros',
     amount: Number(d.amount ?? 0),
     date: String(d.date ?? ''),
-    paidBy: String(d.paidBy ?? 'cuenta_comun'),
+    paidBy: normalizePayerValue(d.paidBy),
     recurringId: d.recurringId ? String(d.recurringId) : null,
-    splitPctA: Number(d.splitPctA ?? 50),
+    splitPctA: clampSplitPct(d.splitPctA, 50),
     isSettlement: Boolean(d.isSettlement),
     settlementTo: String(d.settlementTo ?? ''),
     notes: String(d.notes ?? ''),
@@ -228,6 +274,33 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     });
   }
 
+  private pendingSeedHouseholds = new Set<string>();
+
+  hasPendingDefaultSeed(householdId: string): boolean {
+    return this.pendingSeedHouseholds.has(householdId) || getPendingSeedFlag(householdId);
+  }
+
+  private async commitBatchOps(
+    ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }>,
+    operationType: OperationType,
+    fallbackPath: string,
+    customUserMessage?: string
+  ): Promise<void> {
+    for (let i = 0; i < ops.length; i += MAX_BATCH_DOCS) {
+      const slice = ops.slice(i, i + MAX_BATCH_DOCS);
+      const uniquePaths = Array.from(new Set(slice.map((item) => item.path))).join(', ') || fallbackPath;
+      const batch = writeBatch(db);
+      for (const item of slice) {
+        item.apply(batch);
+      }
+      try {
+        await batch.commit();
+      } catch (error) {
+        handleFirestoreError(error, operationType, uniquePaths, customUserMessage);
+      }
+    }
+  }
+
   async getUserHouseholdId(uid: string): Promise<string | null> {
     const path = `users/${uid}`;
     try {
@@ -247,15 +320,17 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const displayName = clampStr(user.displayName || 'Usuario', MAX_LENGTHS.displayName) || 'Usuario';
     const photoURL = (user.photoURL || '').slice(0, 500);
 
+    // Fase A (mínimo): invites/{code}, households/{hid}, members/{uid}, users/{uid}, activity de creación
     try {
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'invites', code), {
+      const batchA = writeBatch(db);
+      batchA.set(doc(db, 'invites', code), {
         householdId: hid,
         householdName: cleanName,
         createdBy: user.uid,
+        memberCount: 1,
         createdAt: serverTimestamp(),
       });
-      batch.set(doc(db, 'households', hid), {
+      batchA.set(doc(db, 'households', hid), {
         name: cleanName,
         memberUids: [user.uid],
         inviteCode: code,
@@ -270,7 +345,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      batch.set(doc(db, 'households', hid, 'members', user.uid), {
+      batchA.set(doc(db, 'households', hid, 'members', user.uid), {
         displayName,
         photoURL,
         role: 'member_a',
@@ -278,97 +353,236 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         joinedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      batch.set(doc(db, 'users', user.uid), {
+      batchA.set(doc(db, 'users', user.uid), {
         householdId: hid,
         updatedAt: serverTimestamp(),
       });
-      this.addActivityToBatch(batch, hid, user, 'create', 'hogar', hid, `Creó el hogar "${cleanName}"`);
-
-      for (const ic of DEFAULT_INITIAL_COSTS) {
-        const ref = doc(collection(db, 'households', hid, 'initialCosts'));
-        batch.set(ref, {
-          concept: ic.concept,
-          category: ic.category,
-          amount: ic.amount,
-          paidBy: 'comun',
-          status: ic.status,
-          dueDate: '',
-          notes: ic.notes,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      for (const task of DEFAULT_CHECKLIST_CATALUNYA) {
-        const ref = doc(collection(db, 'households', hid, 'checklist'));
-        batch.set(ref, {
-          text: task.text,
-          done: false,
-          doneBy: '',
-          doneAt: '',
-          group: task.group,
-          order: task.order,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      for (const item of DEFAULT_FURNITURE_ITEMS) {
-        const ref = doc(collection(db, 'households', hid, 'items'));
-        batch.set(ref, {
-          name: item.name,
-          room: item.room,
-          priority: item.priority,
-          status: item.status,
-          store: item.store,
-          productUrl: '',
-          articleNumber: '',
-          unitPrice: 0,
-          qty: item.qty,
-          notes: '',
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      for (const g of DEFAULT_GOALS) {
-        const ref = doc(collection(db, 'households', hid, 'goals'));
-        batch.set(ref, {
-          name: g.name,
-          icon: g.icon,
-          color: g.color,
-          targetAmount: g.targetAmount,
-          targetDate: g.targetDate,
-          type: g.type,
-          archived: false,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      await batch.commit();
-      return hid;
+      this.addActivityToBatch(batchA, hid, user, 'create', 'hogar', hid, `Creó el hogar "${cleanName}"`);
+      await batchA.commit();
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, `households/${hid}`);
+      handleFirestoreError(
+        error,
+        OperationType.CREATE,
+        `households/${hid}`,
+        'No se ha podido crear el hogar, inténtalo de nuevo'
+      );
     }
+
+    // Fase B (seeds): tras confirmar el commit de A, en lotes pequeños (<= 15 docs)
+    try {
+      await this.seedDefaultLists(hid, user, false);
+      this.pendingSeedHouseholds.delete(hid);
+      setPendingSeedFlag(hid, false);
+    } catch (seedError) {
+      // El hogar ya existe tras Fase A y sigue siendo usable; marcamos reintento idempotente.
+      console.error('Error en Fase B de siembra inicial (el hogar sigue usable):', seedError);
+      this.pendingSeedHouseholds.add(hid);
+      setPendingSeedFlag(hid, true);
+    }
+
+    return hid;
   }
 
-  async joinHouseholdByCode(user: UserProfileInput, inviteCode: string): Promise<string> {
+  async seedDefaultLists(
+    householdId: string,
+    actor: UserProfileInput,
+    logActivityEntry = true
+  ): Promise<number> {
+    const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
+
+    let icSnap, clSnap, itSnap, gSnap;
+    try {
+      [icSnap, clSnap, itSnap, gSnap] = await Promise.all([
+        getDocs(collection(db, 'households', householdId, 'initialCosts')),
+        getDocs(collection(db, 'households', householdId, 'checklist')),
+        getDocs(collection(db, 'households', householdId, 'items')),
+        getDocs(collection(db, 'households', householdId, 'goals')),
+      ]);
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.LIST,
+        `households/${householdId}/initialCosts`,
+        'No se pudieron comprobar las listas actuales. Inténtalo de nuevo.'
+      );
+    }
+
+    const existingIcIds = new Set(icSnap.docs.map((d) => d.id));
+    const existingIcConcepts = new Set(icSnap.docs.map((d) => norm(d.data().concept)));
+
+    const existingClIds = new Set(clSnap.docs.map((d) => d.id));
+    const existingClTexts = new Set(clSnap.docs.map((d) => norm(d.data().text)));
+
+    const existingItIds = new Set(itSnap.docs.map((d) => d.id));
+    const existingItNames = new Set(itSnap.docs.map((d) => norm(d.data().name)));
+
+    const existingGIds = new Set(gSnap.docs.map((d) => d.id));
+    const existingGNames = new Set(gSnap.docs.map((d) => norm(d.data().name)));
+
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+
+    DEFAULT_INITIAL_COSTS.forEach((ic, idx) => {
+      const id = `seed_ic_${idx}`;
+      if (existingIcIds.has(id) || existingIcConcepts.has(norm(ic.concept))) return;
+      const ref = doc(db, 'households', householdId, 'initialCosts', id);
+      ops.push({
+        path: `households/${householdId}/initialCosts/${id}`,
+        apply: (b) =>
+          b.set(ref, {
+            concept: ic.concept,
+            category: ic.category,
+            amount: ic.amount,
+            paidBy: COMMON_ACCOUNT_ID,
+            status: ic.status,
+            dueDate: '',
+            notes: ic.notes,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    });
+
+    DEFAULT_CHECKLIST_CATALUNYA.forEach((task, idx) => {
+      const id = `seed_cl_${idx}`;
+      if (existingClIds.has(id) || existingClTexts.has(norm(task.text))) return;
+      const ref = doc(db, 'households', householdId, 'checklist', id);
+      ops.push({
+        path: `households/${householdId}/checklist/${id}`,
+        apply: (b) =>
+          b.set(ref, {
+            text: task.text,
+            done: false,
+            doneBy: '',
+            doneAt: '',
+            group: task.group,
+            order: task.order,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    });
+
+    DEFAULT_FURNITURE_ITEMS.forEach((item, idx) => {
+      const id = `seed_fur_${idx}`;
+      if (existingItIds.has(id) || existingItNames.has(norm(item.name))) return;
+      const ref = doc(db, 'households', householdId, 'items', id);
+      ops.push({
+        path: `households/${householdId}/items/${id}`,
+        apply: (b) =>
+          b.set(ref, {
+            name: item.name,
+            room: item.room,
+            priority: item.priority,
+            status: item.status,
+            store: item.store,
+            productUrl: '',
+            articleNumber: '',
+            unitPrice: 0,
+            qty: item.qty,
+            notes: '',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    });
+
+    DEFAULT_GOALS.forEach((g, idx) => {
+      const id = `seed_goal_${idx}`;
+      if (existingGIds.has(id) || existingGNames.has(norm(g.name))) return;
+      const ref = doc(db, 'households', householdId, 'goals', id);
+      ops.push({
+        path: `households/${householdId}/goals/${id}`,
+        apply: (b) =>
+          b.set(ref, {
+            name: g.name,
+            icon: g.icon,
+            color: g.color,
+            targetAmount: g.targetAmount,
+            targetDate: g.targetDate,
+            type: g.type,
+            archived: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    });
+
+    const createdCount = ops.length;
+    if (createdCount === 0) {
+      this.pendingSeedHouseholds.delete(householdId);
+      setPendingSeedFlag(householdId, false);
+      return 0;
+    }
+
+    if (logActivityEntry) {
+      ops.push({
+        path: `households/${householdId}/activity`,
+        apply: (b) =>
+          this.addActivityToBatch(
+            b,
+            householdId,
+            actor,
+            'create',
+            'hogar',
+            householdId,
+            `Cargó ${createdCount} elementos iniciales por defecto`
+          ),
+      });
+    }
+
+    await this.commitBatchOps(
+      ops,
+      OperationType.CREATE,
+      `households/${householdId}`,
+      'No se pudieron cargar las listas por defecto. Puedes volver a intentarlo.'
+    );
+
+    this.pendingSeedHouseholds.delete(householdId);
+    setPendingSeedFlag(householdId, false);
+    return createdCount;
+  }
+
+  async joinHouseholdByCode(
+    user: UserProfileInput,
+    inviteCode: string,
+    options?: JoinHouseholdOptions
+  ): Promise<string> {
     const code = inviteCode.trim().toUpperCase();
     if (!/^[A-Z0-9]{6}$/.test(code)) {
       throw new Error('El código de invitación debe tener 6 caracteres alfanuméricos.');
     }
 
     let hid = '';
+    let householdName = 'Hogar compartido';
+    let memberCount = 1;
     try {
       const inviteSnap = await getDoc(doc(db, 'invites', code));
       if (!inviteSnap.exists()) {
         throw new Error('No hemos encontrado ningún hogar con ese código de invitación.');
       }
-      hid = String(inviteSnap.data().householdId);
+      const inviteData = inviteSnap.data();
+      hid = String(inviteData.householdId ?? '');
+      householdName = String(inviteData.householdName ?? 'Hogar compartido');
+      memberCount = Number(inviteData.memberCount ?? 1);
     } catch (error) {
       if (error instanceof Error && error.message.includes('No hemos encontrado')) throw error;
       handleFirestoreError(error, OperationType.GET, `invites/${code}`);
+    }
+
+    if (!hid) {
+      throw new Error('El código de invitación no es válido.');
+    }
+
+    if (memberCount >= 2) {
+      throw new Error('Este hogar ya está completo');
+    }
+
+    const existingHid = await this.getUserHouseholdId(user.uid);
+    if (existingHid && existingHid === hid) {
+      return hid;
+    }
+    if (existingHid && existingHid !== hid && !options?.confirmSwitch) {
+      throw new HouseholdSwitchConfirmationRequiredError(existingHid, hid, householdName);
     }
 
     const displayName = clampStr(user.displayName || 'Pareja', MAX_LENGTHS.displayName) || 'Pareja';
@@ -379,6 +593,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       batch.update(doc(db, 'households', hid), {
         memberUids: arrayUnion(user.uid),
         updatedAt: serverTimestamp(),
+      });
+      batch.update(doc(db, 'invites', code), {
+        memberCount: 2,
       });
       batch.set(doc(db, 'households', hid, 'members', user.uid), {
         displayName,
@@ -396,7 +613,22 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       await batch.commit();
       return hid;
     } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `households/${hid}`);
+      try {
+        const recheck = await getDoc(doc(db, 'invites', code));
+        if (recheck.exists() && Number(recheck.data().memberCount ?? 1) >= 2) {
+          throw new Error('Este hogar ya está completo');
+        }
+      } catch (recheckErr) {
+        if (recheckErr instanceof Error && recheckErr.message === 'Este hogar ya está completo') {
+          throw recheckErr;
+        }
+      }
+      handleFirestoreError(
+        error,
+        OperationType.UPDATE,
+        `households/${hid}`,
+        'No se pudo completar la unión al hogar. Comprueba el código o si el hogar ya está completo.'
+      );
     }
   }
 
@@ -408,12 +640,18 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const newCode = generateInviteCode();
     try {
       const hSnap = await getDoc(doc(db, 'households', householdId));
-      const hName = hSnap.exists() ? String(hSnap.data().name) : 'Nuestro hogar';
+      const hData = hSnap.exists() ? hSnap.data() : null;
+      const hName = hData ? String(hData.name) : 'Nuestro hogar';
+      const currentMemberCount =
+        hData && Array.isArray(hData.memberUids)
+          ? Math.max(1, Math.min(2, hData.memberUids.length))
+          : 1;
       const batch = writeBatch(db);
       batch.set(doc(db, 'invites', newCode), {
         householdId,
         householdName: hName,
         createdBy: actor.uid,
+        memberCount: currentMemberCount,
         createdAt: serverTimestamp(),
       });
       batch.update(doc(db, 'households', householdId), {
@@ -784,13 +1022,14 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     summary: string
   ): Promise<void> {
     const path = `households/${householdId}`;
+    const { presetA, presetB } = normalizeSplitPair(settings.presetA);
     try {
       const batch = writeBatch(db);
       batch.update(doc(db, 'households', householdId), {
         settings: {
           splitMode: settings.splitMode,
-          presetA: Number(settings.presetA),
-          presetB: Number(settings.presetB),
+          presetA,
+          presetB,
           incomeA: Math.max(0, Number(settings.incomeA) || 0),
           incomeB: Math.max(0, Number(settings.incomeB) || 0),
           currency: 'EUR',
@@ -848,7 +1087,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       concept,
       category: cost.category,
       amount: Math.max(0, Number(cost.amount) || 0),
-      paidBy: cost.paidBy || 'comun',
+      paidBy: normalizePayerValue(cost.paidBy),
       status: cost.status,
       dueDate: cost.dueDate || '',
       notes: clampStr(cost.notes || '', MAX_LENGTHS.notes),
@@ -883,7 +1122,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         concept: clampStr(cost.concept, MAX_LENGTHS.concept),
         category: cost.category,
         amount: Math.max(0, cost.amount),
-        paidBy: cost.paidBy,
+        paidBy: normalizePayerValue(cost.paidBy),
         status: cost.status,
         dueDate: cost.dueDate,
         notes: clampStr(cost.notes, MAX_LENGTHS.notes),
@@ -1108,8 +1347,11 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       amount: Math.max(0, Number(rec.amount) || 0),
       frequency: rec.frequency,
       dayOfMonth: Math.max(1, Math.min(31, Math.round(Number(rec.dayOfMonth) || 1))),
-      splitOverride: rec.splitOverride === null ? null : Math.max(0, Math.min(100, Number(rec.splitOverride))),
-      paidByDefault: rec.paidByDefault || 'cuenta_comun',
+      splitOverride:
+        rec.splitOverride === null || rec.splitOverride === undefined
+          ? null
+          : clampSplitPct(rec.splitOverride, 50),
+      paidByDefault: normalizePayerValue(rec.paidByDefault),
       active: Boolean(rec.active),
       updatedAt: serverTimestamp(),
     };
@@ -1155,41 +1397,52 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     actor: UserProfileInput
   ): Promise<number> {
     if (missing.length === 0) return 0;
-    const path = `households/${householdId}/transactions`;
-    try {
-      const batch = writeBatch(db);
-      for (const rec of missing) {
-        const ref = doc(collection(db, 'households', householdId, 'transactions'));
-        batch.set(ref, {
-          monthKey,
-          concept: clampStr(rec.concept, MAX_LENGTHS.concept),
-          category: rec.category,
-          amount: Math.max(0, rec.amount),
-          date: clampDateForMonth(monthKey, rec.dayOfMonth),
-          paidBy: rec.paidByDefault || 'cuenta_comun',
-          recurringId: rec.id,
-          splitPctA: rec.splitOverride !== null ? rec.splitOverride : defaultSplitPctA,
-          isSettlement: false,
-          settlementTo: '',
-          notes: 'Generado desde plantilla recurrente',
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-      this.addActivityToBatch(
-        batch,
-        householdId,
-        actor,
-        'create',
-        'gastos_mes',
-        monthKey,
-        `Generó ${missing.length} gastos recurrentes para ${monthKey}`
-      );
-      await batch.commit();
-      return missing.length;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+    const baseSplit = clampSplitPct(defaultSplitPctA, 50);
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+
+    for (const rec of missing) {
+      const ref = doc(collection(db, 'households', householdId, 'transactions'));
+      const splitPctA =
+        rec.splitOverride !== null && rec.splitOverride !== undefined
+          ? clampSplitPct(rec.splitOverride, baseSplit)
+          : baseSplit;
+      ops.push({
+        path: `households/${householdId}/transactions/${ref.id}`,
+        apply: (batch) =>
+          batch.set(ref, {
+            monthKey,
+            concept: clampStr(rec.concept, MAX_LENGTHS.concept),
+            category: rec.category,
+            amount: Math.max(0, Number(rec.amount) || 0),
+            date: clampDateForMonth(monthKey, rec.dayOfMonth),
+            paidBy: normalizePayerValue(rec.paidByDefault),
+            recurringId: rec.id,
+            splitPctA,
+            isSettlement: false,
+            settlementTo: '',
+            notes: 'Generado desde plantilla recurrente',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
     }
+
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (batch) =>
+        this.addActivityToBatch(
+          batch,
+          householdId,
+          actor,
+          'create',
+          'gastos_mes',
+          monthKey,
+          `Generó ${missing.length} gastos recurrentes para ${monthKey}`
+        ),
+    });
+
+    await this.commitBatchOps(ops, OperationType.CREATE, `households/${householdId}/transactions`);
+    return missing.length;
   }
 
   async upsertTransaction(
@@ -1206,9 +1459,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       category: tx.category,
       amount: Math.max(0, Number(tx.amount) || 0),
       date: tx.date,
-      paidBy: tx.paidBy,
+      paidBy: normalizePayerValue(tx.paidBy),
       recurringId: tx.recurringId ?? null,
-      splitPctA: Math.max(0, Math.min(100, Number(tx.splitPctA) || 50)),
+      splitPctA: clampSplitPct(tx.splitPctA, 50),
       isSettlement: Boolean(tx.isSettlement),
       settlementTo: tx.settlementTo || '',
       notes: clampStr(tx.notes || '', MAX_LENGTHS.notes),
@@ -1254,9 +1507,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         category: tx.category,
         amount: Math.max(0, tx.amount),
         date: tx.date,
-        paidBy: tx.paidBy,
+        paidBy: normalizePayerValue(tx.paidBy),
         recurringId: tx.recurringId,
-        splitPctA: tx.splitPctA,
+        splitPctA: clampSplitPct(tx.splitPctA, 50),
         isSettlement: tx.isSettlement,
         settlementTo: tx.settlementTo,
         notes: clampStr(tx.notes, MAX_LENGTHS.notes),
@@ -1550,9 +1803,12 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     backup: NidoBackupV1,
     actor: UserProfileInput
   ): Promise<void> {
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+
+    let hSnap, icEx, clEx, itEx, recEx, txEx, budEx, mcEx, gEx, gmEx;
     try {
-      const ops: Array<(batch: ReturnType<typeof writeBatch>) => void> = [];
-      const [icEx, clEx, itEx, recEx, txEx, budEx, mcEx, gEx, gmEx] = await Promise.all([
+      [hSnap, icEx, clEx, itEx, recEx, txEx, budEx, mcEx, gEx, gmEx] = await Promise.all([
+        getDoc(doc(db, 'households', householdId)),
         getDocs(collection(db, 'households', householdId, 'initialCosts')),
         getDocs(collection(db, 'households', householdId, 'checklist')),
         getDocs(collection(db, 'households', householdId, 'items')),
@@ -1563,71 +1819,112 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         getDocs(collection(db, 'households', householdId, 'goals')),
         getDocs(collection(db, 'households', householdId, 'goalMovements')),
       ]);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
+    }
 
-      const existsSet = (snap: Awaited<ReturnType<typeof getDocs>>) =>
-        new Set(snap.docs.map((d) => d.id));
-      const icSet = existsSet(icEx);
-      const clSet = existsSet(clEx);
-      const itSet = existsSet(itEx);
-      const recSet = existsSet(recEx);
-      const txSet = existsSet(txEx);
-      const budSet = existsSet(budEx);
-      const mcSet = existsSet(mcEx);
-      const gSet = existsSet(gEx);
-      const gmSet = existsSet(gmEx);
+    const memberUids = new Set<string>(
+      hSnap.exists() && Array.isArray(hSnap.data().memberUids)
+        ? hSnap.data().memberUids.map(String)
+        : [actor.uid]
+    );
+    const resolvePayer = (raw: string): string => {
+      const clean = normalizePayerValue(raw);
+      if (clean === COMMON_ACCOUNT_ID || memberUids.has(clean)) return clean;
+      return COMMON_ACCOUNT_ID;
+    };
+    const resolveMemberUid = (raw: string): string => {
+      if (raw && memberUids.has(raw)) return raw;
+      return actor.uid;
+    };
 
-      ops.push((b) =>
+    const existsSet = (snap: Awaited<ReturnType<typeof getDocs>>) =>
+      new Set(snap.docs.map((d) => d.id));
+    const icSet = existsSet(icEx);
+    const clSet = existsSet(clEx);
+    const itSet = existsSet(itEx);
+    const recSet = existsSet(recEx);
+    const txSet = existsSet(txEx);
+    const budSet = existsSet(budEx);
+    const mcSet = existsSet(mcEx);
+    const gSet = existsSet(gEx);
+    const gmSet = existsSet(gmEx);
+
+    const { presetA, presetB } = normalizeSplitPair(backup.settings.presetA);
+    ops.push({
+      path: `households/${householdId}`,
+      apply: (b) =>
         b.update(doc(db, 'households', householdId), {
           name: backup.householdName,
-          settings: backup.settings,
+          settings: {
+            ...backup.settings,
+            presetA,
+            presetB,
+            currency: 'EUR',
+          },
           updatedAt: serverTimestamp(),
-        })
-      );
+        }),
+    });
 
-      for (const item of backup.initialCosts) {
-        const { id, ...fields } = item;
-        const ref = doc(db, 'households', householdId, 'initialCosts', id);
-        ops.push((b) =>
+    for (const item of backup.initialCosts) {
+      const { id, ...fields } = item;
+      const safeFields = { ...fields, paidBy: resolvePayer(fields.paidBy) };
+      const ref = doc(db, 'households', householdId, 'initialCosts', id);
+      ops.push({
+        path: `households/${householdId}/initialCosts/${id}`,
+        apply: (b) =>
           icSet.has(id)
-            ? b.update(ref, { ...fields, updatedAt: serverTimestamp() })
-            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
-        );
-      }
+            ? b.update(ref, { ...safeFields, updatedAt: serverTimestamp() })
+            : b.set(ref, { ...safeFields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }),
+      });
+    }
 
-      for (const item of backup.checklist) {
-        const { id, ...fields } = item;
-        const ref = doc(db, 'households', householdId, 'checklist', id);
-        ops.push((b) =>
+    for (const item of backup.checklist) {
+      const { id, ...fields } = item;
+      const ref = doc(db, 'households', householdId, 'checklist', id);
+      ops.push({
+        path: `households/${householdId}/checklist/${id}`,
+        apply: (b) =>
           clSet.has(id)
             ? b.update(ref, { text: fields.text, group: fields.group, order: fields.order, updatedAt: serverTimestamp() })
-            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
-        );
-      }
+            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }),
+      });
+    }
 
-      for (const item of backup.items) {
-        const { id, ...fields } = item;
-        const ref = doc(db, 'households', householdId, 'items', id);
-        ops.push((b) =>
+    for (const item of backup.items) {
+      const { id, ...fields } = item;
+      const ref = doc(db, 'households', householdId, 'items', id);
+      ops.push({
+        path: `households/${householdId}/items/${id}`,
+        apply: (b) =>
           itSet.has(id)
             ? b.update(ref, { ...fields, updatedAt: serverTimestamp() })
-            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
-        );
-      }
+            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }),
+      });
+    }
 
-      for (const item of backup.recurring) {
-        const { id, ...fields } = item;
-        const ref = doc(db, 'households', householdId, 'recurring', id);
-        ops.push((b) =>
+    for (const item of backup.recurring) {
+      const { id, ...fields } = item;
+      const safeFields = { ...fields, paidByDefault: resolvePayer(fields.paidByDefault) };
+      const ref = doc(db, 'households', householdId, 'recurring', id);
+      ops.push({
+        path: `households/${householdId}/recurring/${id}`,
+        apply: (b) =>
           recSet.has(id)
-            ? b.update(ref, { ...fields, updatedAt: serverTimestamp() })
-            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
-        );
-      }
+            ? b.update(ref, { ...safeFields, updatedAt: serverTimestamp() })
+            : b.set(ref, { ...safeFields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }),
+      });
+    }
 
-      for (const item of backup.transactions) {
-        const { id, ...fields } = item;
-        const ref = doc(db, 'households', householdId, 'transactions', id);
-        ops.push((b) =>
+    for (const item of backup.transactions) {
+      const { id, ...fields } = item;
+      const safePaidBy = resolvePayer(fields.paidBy);
+      const safeSplitPctA = clampSplitPct(fields.splitPctA, 50);
+      const safeSettlementTo = fields.settlementTo ? resolveMemberUid(fields.settlementTo) : '';
+      const ref = doc(db, 'households', householdId, 'transactions', id);
+      ops.push({
+        path: `households/${householdId}/transactions/${id}`,
+        apply: (b) =>
           txSet.has(id)
             ? b.update(ref, {
                 monthKey: fields.monthKey,
@@ -1635,52 +1932,71 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
                 category: fields.category,
                 amount: fields.amount,
                 date: fields.date,
-                paidBy: fields.paidBy,
-                splitPctA: fields.splitPctA,
+                paidBy: safePaidBy,
+                splitPctA: safeSplitPctA,
                 notes: fields.notes,
                 updatedAt: serverTimestamp(),
               })
-            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
-        );
-      }
+            : b.set(ref, {
+                ...fields,
+                paidBy: safePaidBy,
+                splitPctA: safeSplitPctA,
+                settlementTo: safeSettlementTo,
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              }),
+      });
+    }
 
-      for (const item of backup.budgets) {
-        const ref = doc(db, 'households', householdId, 'budgets', item.monthKey);
-        ops.push((b) =>
+    for (const item of backup.budgets) {
+      const ref = doc(db, 'households', householdId, 'budgets', item.monthKey);
+      ops.push({
+        path: `households/${householdId}/budgets/${item.monthKey}`,
+        apply: (b) =>
           budSet.has(item.monthKey)
             ? b.update(ref, { limits: item.limits, updatedAt: serverTimestamp() })
-            : b.set(ref, { monthKey: item.monthKey, limits: item.limits, updatedAt: serverTimestamp() })
-        );
-      }
+            : b.set(ref, { monthKey: item.monthKey, limits: item.limits, updatedAt: serverTimestamp() }),
+      });
+    }
 
-      for (const item of backup.monthClosures) {
-        if (!mcSet.has(item.monthKey)) {
-          const ref = doc(db, 'households', householdId, 'monthClosures', item.monthKey);
-          ops.push((b) =>
-            b.set(ref, { ...item, closedBy: actor.uid, closedAt: serverTimestamp() })
-          );
-        }
+    for (const item of backup.monthClosures) {
+      if (!mcSet.has(item.monthKey)) {
+        const ref = doc(db, 'households', householdId, 'monthClosures', item.monthKey);
+        ops.push({
+          path: `households/${householdId}/monthClosures/${item.monthKey}`,
+          apply: (b) =>
+            b.set(ref, { ...item, closedBy: actor.uid, closedAt: serverTimestamp() }),
+        });
       }
+    }
 
-      for (const item of backup.goals) {
-        const { id, ...fields } = item;
-        const ref = doc(db, 'households', householdId, 'goals', id);
-        ops.push((b) =>
+    for (const item of backup.goals) {
+      const { id, ...fields } = item;
+      const ref = doc(db, 'households', householdId, 'goals', id);
+      ops.push({
+        path: `households/${householdId}/goals/${id}`,
+        apply: (b) =>
           gSet.has(id)
             ? b.update(ref, { ...fields, updatedAt: serverTimestamp() })
-            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() })
-        );
-      }
+            : b.set(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }),
+      });
+    }
 
-      for (const item of backup.goalMovements) {
-        if (!gmSet.has(item.id)) {
-          const { id, ...fields } = item;
-          const ref = doc(db, 'households', householdId, 'goalMovements', id);
-          ops.push((b) => b.set(ref, { ...fields, createdAt: serverTimestamp() }));
-        }
+    for (const item of backup.goalMovements) {
+      if (!gmSet.has(item.id)) {
+        const { id, ...fields } = item;
+        const safeBy = resolvePayer(fields.by);
+        const ref = doc(db, 'households', householdId, 'goalMovements', id);
+        ops.push({
+          path: `households/${householdId}/goalMovements/${id}`,
+          apply: (b) => b.set(ref, { ...fields, by: safeBy, createdAt: serverTimestamp() }),
+        });
       }
+    }
 
-      ops.push((b) =>
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (b) =>
         this.addActivityToBatch(
           b,
           householdId,
@@ -1689,20 +2005,10 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           'copia_json',
           householdId,
           `Importó copia de seguridad (${backup.transactions.length} gastos, ${backup.items.length} muebles)`
-        )
-      );
+        ),
+    });
 
-      const CHUNK = 400;
-      for (let i = 0; i < ops.length; i += CHUNK) {
-        const batch = writeBatch(db);
-        for (const fn of ops.slice(i, i + CHUNK)) {
-          fn(batch);
-        }
-        await batch.commit();
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `households/${householdId}`);
-    }
+    await this.commitBatchOps(ops, OperationType.WRITE, `households/${householdId}`);
   }
 }
 

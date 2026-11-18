@@ -7,8 +7,12 @@ import {
 } from '../domain/finance';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import { FirestoreHouseholdRepository } from '../repositories/FirestoreHouseholdRepository';
-import type { HouseholdRepository, UserProfileInput } from '../repositories/HouseholdRepository';
-import { auth, googleProvider } from '../services/firebase';
+import type {
+  HouseholdRepository,
+  JoinHouseholdOptions,
+  UserProfileInput,
+} from '../repositories/HouseholdRepository';
+import { auth, googleProvider, toUserFriendlyErrorMessage } from '../services/firebase';
 import type {
   ActivityEntry,
   ChecklistItem,
@@ -54,8 +58,11 @@ interface NidoContextValue {
   memberB: HouseholdMember | undefined;
   currentMember: HouseholdMember | undefined;
   effectiveSplitPctA: number;
+  seedPending: boolean;
+  seedingDefaults: boolean;
+  retryDefaultSeed: () => Promise<void>;
   createHousehold: (name: string) => Promise<void>;
-  joinHousehold: (code: string) => Promise<void>;
+  joinHousehold: (code: string, options?: JoinHouseholdOptions) => Promise<void>;
 
   // Navigation & Preferences
   activeTab: NavTab;
@@ -135,6 +142,8 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [monthClosures, setMonthClosures] = useState<MonthClosure[]>([]);
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
   const [goalMovements, setGoalMovements] = useState<GoalMovement[]>([]);
+  const [seedPending, setSeedPending] = useState(false);
+  const [seedingDefaults, setSeedingDefaults] = useState(false);
 
   const [activeTab, setActiveTab] = useState<NavTab>('inicio');
   const [selectedMonthKey, setSelectedMonthKey] = useState<string>(() => getCurrentMonthKeyLocal());
@@ -229,7 +238,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       })
       .catch((err) => {
         if (!cancelled) {
-          setHouseholdError(err instanceof Error ? err.message : 'Error cargando tu hogar');
+          setHouseholdError(
+            toUserFriendlyErrorMessage(err, 'No se pudo cargar tu hogar. Inténtalo de nuevo.')
+          );
           setHouseholdLoading(false);
         }
       });
@@ -244,6 +255,14 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [isDemoMode]
   );
 
+  useEffect(() => {
+    if (!householdId) {
+      setSeedPending(false);
+      return;
+    }
+    setSeedPending(repo.hasPendingDefaultSeed(householdId));
+  }, [householdId, repo]);
+
   // Real-time household & collections subscriptions
   useEffect(() => {
     if (!householdId) return;
@@ -251,7 +270,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const minRecentMonth = shiftMonthKey(getCurrentMonthKeyLocal(), -11);
     const onErr = (e: Error) => {
-      setHouseholdError(e.message);
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudieron sincronizar los datos del hogar.')
+      );
     };
 
     const unsubs = [
@@ -278,7 +299,10 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!householdId) return;
     if (!isDemoMode && !authUser) return;
 
-    const onErr = (e: Error) => setHouseholdError(e.message);
+    const onErr = (e: Error) =>
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudieron cargar los movimientos del mes.')
+      );
     const unsubTx = repo.subscribeTransactionsByMonth(
       householdId,
       selectedMonthKey,
@@ -352,20 +376,47 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const createHousehold = useCallback(
     async (name: string) => {
       if (!currentUserProfile) return;
+      setHouseholdError(null);
       const hid = await repo.createHousehold(currentUserProfile, name);
       setHouseholdId(hid);
+      setSeedPending(repo.hasPendingDefaultSeed(hid));
     },
     [currentUserProfile, repo]
   );
 
   const joinHousehold = useCallback(
-    async (code: string) => {
+    async (code: string, options?: JoinHouseholdOptions) => {
       if (!currentUserProfile) return;
-      const hid = await repo.joinHouseholdByCode(currentUserProfile, code);
+      setHouseholdError(null);
+      const hid = await repo.joinHouseholdByCode(currentUserProfile, code, options);
       setHouseholdId(hid);
+      setSeedPending(repo.hasPendingDefaultSeed(hid));
     },
     [currentUserProfile, repo]
   );
+
+  const retryDefaultSeed = useCallback(async () => {
+    if (!householdId || !currentUserProfile) return;
+    setSeedingDefaults(true);
+    try {
+      const created = await repo.seedDefaultLists(householdId, currentUserProfile);
+      setSeedPending(repo.hasPendingDefaultSeed(householdId));
+      showToast(
+        created > 0
+          ? `Listas por defecto cargadas (${created} elementos)`
+          : 'Las listas por defecto ya estaban cargadas'
+      );
+    } catch (err) {
+      showToast(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudieron cargar las listas por defecto. Inténtalo de nuevo.'
+        )
+      );
+    } finally {
+      setSeedingDefaults(false);
+    }
+  }, [householdId, currentUserProfile, repo, showToast]);
 
   const toggleUiMode = useCallback(async () => {
     if (!householdId || !currentUserProfile) return;
@@ -392,6 +443,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     memberB,
     currentMember,
     effectiveSplitPctA,
+    seedPending,
+    seedingDefaults,
+    retryDefaultSeed,
     createHousehold,
     joinHousehold,
     activeTab,

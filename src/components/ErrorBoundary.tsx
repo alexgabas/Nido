@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { toUserFriendlyErrorMessage } from '../services/firebase';
 
 interface State {
   hasError: boolean;
@@ -10,21 +11,21 @@ export class ErrorBoundary extends React.Component<{ children: React.ReactNode }
   state: State = { hasError: false, message: '' };
 
   static getDerivedStateFromError(error: Error): State {
-    return { hasError: true, message: error.message || 'Ha ocurrido un error inesperado.' };
+    return {
+      hasError: true,
+      message: toUserFriendlyErrorMessage(
+        error,
+        'Ha ocurrido un error inesperado al cargar la pantalla.'
+      ),
+    };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+    console.error('ErrorBoundary:', error, info.componentStack);
   }
 
   render() {
     if (!this.state.hasError) return this.props.children;
-
-    let displayDetail = this.state.message;
-    try {
-      const parsed = JSON.parse(this.state.message) as { error?: string; path?: string };
-      if (parsed.error) {
-        displayDetail = `${parsed.error}${parsed.path ? ` (${parsed.path})` : ''}`;
-      }
-    } catch {
-      // keep raw message
-    }
 
     return (
       <div className="min-h-screen flex items-center justify-center p-6 bg-[#F6F8F8] dark:bg-[#0B1316]">
@@ -38,8 +39,8 @@ export class ErrorBoundary extends React.Component<{ children: React.ReactNode }
           <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
             No se ha perdido ningún dato guardado. Revisa tu conexión o recarga la aplicación para continuar.
           </p>
-          <p className="text-xs font-mono bg-slate-100 dark:bg-slate-900 text-slate-700 dark:text-slate-300 p-3 rounded-xl break-words">
-            {displayDetail}
+          <p className="text-xs bg-slate-100 dark:bg-slate-900 text-slate-700 dark:text-slate-300 p-3 rounded-xl break-words">
+            {this.state.message}
           </p>
           <button
             type="button"

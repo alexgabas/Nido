@@ -34,6 +34,9 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
     dismissUndo,
     isDemoMode,
     exitDemoMode,
+    seedPending,
+    seedingDefaults,
+    retryDefaultSeed,
   } = useNido();
   const isOnline = useOnlineStatus();
 
@@ -105,6 +108,28 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
               className="font-semibold underline underline-offset-2 hover:opacity-80"
             >
               Conectar con Google
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Pending default lists banner if Phase B seed failed */}
+      {seedPending && (
+        <div
+          role="status"
+          className="bg-amber-500/12 border-b border-amber-500/30 px-4 py-2.5 text-xs text-amber-900 dark:text-amber-200"
+        >
+          <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2">
+            <span>
+              Tu hogar está listo, pero faltan por cargar las listas iniciales (mudanza, checklist, mobiliario y metas).
+            </span>
+            <button
+              type="button"
+              disabled={seedingDefaults}
+              onClick={() => void retryDefaultSeed()}
+              className="min-h-[36px] px-3 rounded-lg bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-60 text-white font-semibold transition-colors"
+            >
+              {seedingDefaults ? 'Cargando listas...' : 'Cargar listas por defecto'}
             </button>
           </div>
         </div>

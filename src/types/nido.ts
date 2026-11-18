@@ -79,12 +79,14 @@ export type InitialCostCategory =
 
 export type InitialCostStatus = 'pendiente' | 'pagado';
 
+export const COMMON_ACCOUNT_ID = 'cuenta_comun' as const;
+
 export interface InitialCost {
   id: string;
   concept: string;
   category: InitialCostCategory;
   amount: number;
-  paidBy: string; // uid | 'comun'
+  paidBy: string; // uid | 'cuenta_comun'
   status: InitialCostStatus;
   dueDate: string; // '' or YYYY-MM-DD
   notes: string;

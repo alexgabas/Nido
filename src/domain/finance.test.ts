@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   calculateCoupleBalance,
+  clampSplitPct,
   computeBudgetProgress,
   computeEffectiveSplitPctA,
   computeEmergencyTarget,
@@ -147,6 +148,35 @@ test('calculateCoupleBalance aplica fórmula de reparto, cuenta común y liquida
   assert.equal(settled.balanceA, 0);
   assert.equal(settled.owesDirection, 'peace');
   assert.equal(settled.summaryText, 'Estáis en paz');
+
+  // splitPctA === 0 must be preserved as 0 (never converted to 50%)
+  assert.equal(clampSplitPct(0, 50), 0);
+  const zeroSplitBal = calculateCoupleBalance(
+    [
+      {
+        id: 't_zero',
+        monthKey: '2026-11',
+        concept: 'Capricho B pagado por A',
+        category: 'ocio',
+        amount: 100,
+        date: '2026-11-10',
+        paidBy: 'uid_alex',
+        recurringId: null,
+        splitPctA: 0,
+        isSettlement: false,
+        settlementTo: '',
+        notes: '',
+        createdAt: '',
+        updatedAt: '',
+      },
+    ],
+    memberA,
+    memberB
+  );
+  assert.equal(zeroSplitBal.shareA, 0);
+  assert.equal(zeroSplitBal.shareB, 100);
+  assert.equal(zeroSplitBal.balanceA, 100);
+  assert.equal(zeroSplitBal.owesDirection, 'b_owes_a');
 });
 
 test('formatLocalDateISO usa fecha local sin desplazamiento UTC', () => {
@@ -343,6 +373,41 @@ test('backup JSON round-trip y rechazo de entradas corruptas + CSV español', ()
 
   const parsed = validateAndMigrateBackup(JSON.parse(JSON.stringify(validBackup)));
   assert.equal(parsed.transactions[0].amount, 850);
+
+  // Legacy 'comun' payer is migrated to 'cuenta_comun' and splitPctA=0 is preserved
+  const legacyBackup = validateAndMigrateBackup({
+    ...validBackup,
+    initialCosts: [
+      {
+        id: 'ic1',
+        concept: 'Fianza',
+        category: 'fianza',
+        amount: 850,
+        paidBy: 'comun',
+        status: 'pendiente',
+        dueDate: '',
+        notes: '',
+      },
+    ],
+    transactions: [
+      {
+        ...validBackup.transactions[0],
+        paidBy: 'comun',
+        splitPctA: 0,
+      },
+    ],
+  });
+  assert.equal(legacyBackup.initialCosts[0].paidBy, 'cuenta_comun');
+  assert.equal(legacyBackup.transactions[0].paidBy, 'cuenta_comun');
+  assert.equal(legacyBackup.transactions[0].splitPctA, 0);
+
+  // Settings with presetA + presetB != 100 must be rejected
+  assert.throws(() =>
+    validateAndMigrateBackup({
+      ...validBackup,
+      settings: { ...validBackup.settings, presetA: 60, presetB: 60 },
+    })
+  );
 
   assert.throws(() => validateAndMigrateBackup({ ...validBackup, schemaVersion: 99 }));
   assert.throws(() =>

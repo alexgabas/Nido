@@ -1,14 +1,18 @@
 import {
   clampDateForMonth,
+  clampSplitPct,
   getCurrentMonthKeyLocal,
   getTodayLocalISO,
+  normalizeSplitPair,
   shiftMonthKey,
 } from '../domain/finance';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
   DEFAULT_GOALS,
+  DEFAULT_INITIAL_COSTS,
 } from '../domain/presets';
+import { COMMON_ACCOUNT_ID } from '../types/nido';
 import type {
   ActivityAction,
   ActivityEntry,
@@ -60,13 +64,13 @@ function buildInitialDemoState(): DemoState {
   const hid = 'demo_hogar_santsadurni';
 
   const initialCosts: InitialCost[] = [
-    { id: 'ic_1', concept: 'Primer mes de alquiler', category: 'alquiler', amount: 850, paidBy: 'comun', status: 'pagado', dueDate: `${currentMonth}-01`, notes: 'Transferencia al firmar llaves', createdAt: ts, updatedAt: ts },
+    { id: 'ic_1', concept: 'Primer mes de alquiler', category: 'alquiler', amount: 850, paidBy: COMMON_ACCOUNT_ID, status: 'pagado', dueDate: `${currentMonth}-01`, notes: 'Transferencia al firmar llaves', createdAt: ts, updatedAt: ts },
     { id: 'ic_2', concept: 'Fianza legal (1 mensualidad)', category: 'fianza', amount: 850, paidBy: uidA, status: 'pagado', dueDate: `${currentMonth}-01`, notes: 'Depositar en INCASÒL', createdAt: ts, updatedAt: ts },
     { id: 'ic_3', concept: 'Garantía adicional (1 mes)', category: 'garantia_adicional', amount: 850, paidBy: uidB, status: 'pagado', dueDate: `${currentMonth}-01`, notes: 'Devuelta al finalizar contrato', createdAt: ts, updatedAt: ts },
     { id: 'ic_4', concept: 'Alta / cambio titular luz', category: 'suministros', amount: 45, paidBy: uidA, status: 'pendiente', dueDate: `${currentMonth}-22`, notes: '', createdAt: ts, updatedAt: ts },
-    { id: 'ic_5', concept: 'Alta / cambio titular agua', category: 'suministros', amount: 35, paidBy: 'comun', status: 'pendiente', dueDate: `${currentMonth}-22`, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'ic_5', concept: 'Alta / cambio titular agua', category: 'suministros', amount: 35, paidBy: COMMON_ACCOUNT_ID, status: 'pendiente', dueDate: `${currentMonth}-22`, notes: '', createdAt: ts, updatedAt: ts },
     { id: 'ic_6', concept: 'Cambio de bombín', category: 'cerrajeria', amount: 110, paidBy: uidB, status: 'pagado', dueDate: `${currentMonth}-03`, notes: 'Bombín antibumping', createdAt: ts, updatedAt: ts },
-    { id: 'ic_7', concept: 'Seguro de hogar (anual)', category: 'otros', amount: 168, paidBy: 'comun', status: 'pendiente', dueDate: `${currentMonth}-25`, notes: '', createdAt: ts, updatedAt: ts },
+    { id: 'ic_7', concept: 'Seguro de hogar (anual)', category: 'otros', amount: 168, paidBy: COMMON_ACCOUNT_ID, status: 'pendiente', dueDate: `${currentMonth}-25`, notes: '', createdAt: ts, updatedAt: ts },
     { id: 'ic_8', concept: 'Furgoneta mudanza', category: 'mudanza', amount: 95, paidBy: uidA, status: 'pendiente', dueDate: `${currentMonth}-20`, notes: '', createdAt: ts, updatedAt: ts },
   ];
 
@@ -220,6 +224,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         loaded = JSON.parse(raw) as DemoState;
+        if (loaded && Array.isArray(loaded.initialCosts)) {
+          loaded.initialCosts = loaded.initialCosts.map((ic) => ({
+            ...ic,
+            paidBy: ic.paidBy === 'comun' ? COMMON_ACCOUNT_ID : ic.paidBy,
+          }));
+        }
       }
     } catch {
       loaded = null;
@@ -278,6 +288,103 @@ export class DemoHouseholdRepository implements HouseholdRepository {
 
   async joinHouseholdByCode(): Promise<string> {
     return this.state.household.id;
+  }
+
+  hasPendingDefaultSeed(): boolean {
+    return false;
+  }
+
+  async seedDefaultLists(_hid: string, actor: UserProfileInput): Promise<number> {
+    const now = new Date().toISOString();
+    let count = 0;
+
+    const icConcepts = new Set(this.state.initialCosts.map((c) => c.concept.trim().toLowerCase()));
+    DEFAULT_INITIAL_COSTS.forEach((ic, idx) => {
+      const id = `seed_ic_${idx}`;
+      if (!this.state.initialCosts.some((c) => c.id === id) && !icConcepts.has(ic.concept.trim().toLowerCase())) {
+        this.state.initialCosts.push({
+          id,
+          concept: ic.concept,
+          category: ic.category,
+          amount: ic.amount,
+          paidBy: COMMON_ACCOUNT_ID,
+          status: ic.status,
+          dueDate: '',
+          notes: ic.notes,
+          createdAt: now,
+          updatedAt: now,
+        });
+        count++;
+      }
+    });
+
+    const clTexts = new Set(this.state.checklist.map((c) => c.text.trim().toLowerCase()));
+    DEFAULT_CHECKLIST_CATALUNYA.forEach((t, idx) => {
+      const id = `seed_cl_${idx}`;
+      if (!this.state.checklist.some((c) => c.id === id) && !clTexts.has(t.text.trim().toLowerCase())) {
+        this.state.checklist.push({
+          id,
+          text: t.text,
+          done: false,
+          doneBy: '',
+          doneAt: '',
+          group: t.group,
+          order: t.order,
+          createdAt: now,
+          updatedAt: now,
+        });
+        count++;
+      }
+    });
+
+    const furNames = new Set(this.state.items.map((c) => c.name.trim().toLowerCase()));
+    DEFAULT_FURNITURE_ITEMS.forEach((it, idx) => {
+      const id = `seed_fur_${idx}`;
+      if (!this.state.items.some((c) => c.id === id) && !furNames.has(it.name.trim().toLowerCase())) {
+        this.state.items.push({
+          id,
+          name: it.name,
+          room: it.room,
+          priority: it.priority,
+          status: it.status,
+          store: it.store,
+          productUrl: '',
+          articleNumber: '',
+          unitPrice: 0,
+          qty: it.qty,
+          notes: '',
+          createdAt: now,
+          updatedAt: now,
+        });
+        count++;
+      }
+    });
+
+    const goalNames = new Set(this.state.goals.map((g) => g.name.trim().toLowerCase()));
+    DEFAULT_GOALS.forEach((g, idx) => {
+      const id = `seed_goal_${idx}`;
+      if (!this.state.goals.some((x) => x.id === id) && !goalNames.has(g.name.trim().toLowerCase())) {
+        this.state.goals.push({
+          id,
+          name: g.name,
+          icon: g.icon,
+          color: g.color,
+          targetAmount: g.targetAmount,
+          targetDate: g.targetDate,
+          type: g.type,
+          archived: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        count++;
+      }
+    });
+
+    if (count > 0) {
+      this.logActivity(actor, 'create', 'hogar', this.state.household.id, 'Cargó las listas iniciales por defecto');
+      this.emit();
+    }
+    return count;
   }
 
   async regenerateInviteCode(_hid: string, _old: string, actor: UserProfileInput): Promise<string> {
@@ -370,7 +477,8 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     actor: UserProfileInput,
     summary: string
   ): Promise<void> {
-    this.state.household.settings = { ...settings, currency: 'EUR' };
+    const { presetA, presetB } = normalizeSplitPair(settings.presetA);
+    this.state.household.settings = { ...settings, presetA, presetB, currency: 'EUR' };
     this.state.household.updatedAt = new Date().toISOString();
     this.logActivity(actor, 'update', 'reparto', hid, summary);
     this.emit();
@@ -560,9 +668,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         category: rec.category,
         amount: rec.amount,
         date: clampDateForMonth(monthKey, rec.dayOfMonth),
-        paidBy: rec.paidByDefault || 'cuenta_comun',
+        paidBy: rec.paidByDefault || COMMON_ACCOUNT_ID,
         recurringId: rec.id,
-        splitPctA: rec.splitOverride !== null ? rec.splitOverride : defaultSplitPctA,
+        splitPctA:
+          rec.splitOverride !== null && rec.splitOverride !== undefined
+            ? clampSplitPct(rec.splitOverride, defaultSplitPctA)
+            : clampSplitPct(defaultSplitPctA, 50),
         isSettlement: false,
         settlementTo: '',
         notes: 'Generado desde plantilla recurrente',
@@ -588,13 +699,18 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   ): Promise<string> {
     const now = new Date().toISOString();
     const id = tx.id || `tx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const normalizedTx = {
+      ...tx,
+      splitPctA: clampSplitPct(tx.splitPctA, 50),
+      paidBy: tx.paidBy === 'comun' || !tx.paidBy ? COMMON_ACCOUNT_ID : tx.paidBy,
+    };
     if (tx.id) {
       this.state.transactions = this.state.transactions.map((t) =>
-        t.id === id ? { ...t, ...tx, id, updatedAt: now } : t
+        t.id === id ? { ...t, ...normalizedTx, id, updatedAt: now } : t
       );
       this.logActivity(actor, 'update', 'gasto', id, `Editó "${tx.concept}" (${tx.amount} €)`);
     } else {
-      this.state.transactions.push({ ...tx, id, createdAt: now, updatedAt: now });
+      this.state.transactions.push({ ...normalizedTx, id, createdAt: now, updatedAt: now });
       this.logActivity(
         actor,
         'create',

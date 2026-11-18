@@ -142,8 +142,16 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
   if (presetA < 0 || presetA > 100 || presetB < 0 || presetB > 100) {
     throw new Error('Los porcentajes de reparto deben estar entre 0 y 100.');
   }
+  if (Math.abs(presetA + presetB - 100) > 0.01) {
+    throw new Error('Los porcentajes de reparto (presetA + presetB) deben sumar 100.');
+  }
   const incomeA = assertNonNegNum(s.incomeA, 'settings.incomeA');
   const incomeB = assertNonNegNum(s.incomeB, 'settings.incomeB');
+
+  const normalizePayer = (rawPayer: unknown, label: string): string => {
+    const val = assertStr(rawPayer, label, 128, 1);
+    return val === 'comun' ? 'cuenta_comun' : val;
+  };
 
   const arr = (key: string): unknown[] => {
     const val = raw[key];
@@ -164,7 +172,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       concept: assertStr(item.concept, `initialCosts[${idx}].concept`, 120, 1),
       category: cat as NidoBackupV1['initialCosts'][number]['category'],
       amount: assertNonNegNum(item.amount, `initialCosts[${idx}].amount`),
-      paidBy: assertStr(item.paidBy, `initialCosts[${idx}].paidBy`, 128, 1),
+      paidBy: normalizePayer(item.paidBy, `initialCosts[${idx}].paidBy`),
       status: status as NidoBackupV1['initialCosts'][number]['status'],
       dueDate: assertDateOrEmpty(item.dueDate ?? '', `initialCosts[${idx}].dueDate`),
       notes: assertStr(item.notes ?? '', `initialCosts[${idx}].notes`, 500),
@@ -235,7 +243,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       frequency: freq as NidoBackupV1['recurring'][number]['frequency'],
       dayOfMonth: day,
       splitOverride,
-      paidByDefault: assertStr(item.paidByDefault, `recurring[${idx}].paidByDefault`, 128, 1),
+      paidByDefault: normalizePayer(item.paidByDefault, `recurring[${idx}].paidByDefault`),
       active: item.active,
     };
   });
@@ -256,7 +264,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       category: cat as NidoBackupV1['transactions'][number]['category'],
       amount: assertNonNegNum(item.amount, `transactions[${idx}].amount`),
       date: assertDateOrEmpty(item.date, `transactions[${idx}].date`),
-      paidBy: assertStr(item.paidBy, `transactions[${idx}].paidBy`, 128, 1),
+      paidBy: normalizePayer(item.paidBy, `transactions[${idx}].paidBy`),
       recurringId:
         item.recurringId === null || item.recurringId === undefined
           ? null
