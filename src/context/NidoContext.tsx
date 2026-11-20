@@ -71,6 +71,9 @@ interface NidoContextValue {
   setActiveTab: (tab: NavTab) => void;
   selectedMonthKey: string;
   setSelectedMonthKey: (mk: string) => void;
+  focusMensualSection: 'plantillas' | null;
+  clearFocusMensualSection: () => void;
+  openHabitualSetupInAvanzado: () => Promise<void>;
   uiMode: UiMode;
   toggleUiMode: () => Promise<void>;
   theme: ThemeMode;
@@ -161,9 +164,14 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const [activeTab, setActiveTab] = useState<NavTab>('inicio');
   const [selectedMonthKey, setSelectedMonthKey] = useState<string>(() => getCurrentMonthKeyLocal());
+  const [focusMensualSection, setFocusMensualSection] = useState<'plantillas' | null>(null);
   const [quickExpenseOpen, setQuickExpenseOpen] = useState(false);
   const [quickExpensePrefill, setQuickExpensePrefill] = useState<ExpensePrefill | null>(null);
   const quickExpenseOnSavedRef = useRef<(() => Promise<void> | void) | null>(null);
+
+  const clearFocusMensualSection = useCallback(() => {
+    setFocusMensualSection(null);
+  }, []);
 
   const openQuickExpenseWithPrefill = useCallback(
     (prefill: ExpensePrefill, onSaved?: () => Promise<void> | void) => {
@@ -608,6 +616,17 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     showToast(next === 'avanzado' ? 'Modo Avanzado activado' : 'Modo Sencillo activado');
   }, [householdId, currentUserProfile, uiMode, activeTab, repo, showToast]);
 
+  const openHabitualSetupInAvanzado = useCallback(async () => {
+    if (uiMode !== 'avanzado' && householdId && currentUserProfile) {
+      await repo.updateMemberUiMode(householdId, currentUserProfile.uid, 'avanzado');
+    }
+    setSelectedMonthKey(getCurrentMonthKeyLocal());
+    setFocusMensualSection('plantillas');
+    setActiveTab('mensual');
+  }, [uiMode, householdId, currentUserProfile, repo]);
+
+  const effectiveSeedPending = Boolean(household?.seedPending) || seedPending;
+
   const value: NidoContextValue = {
     authReady,
     authUser,
@@ -626,7 +645,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     memberB,
     currentMember,
     effectiveSplitPctA,
-    seedPending,
+    seedPending: effectiveSeedPending,
     seedingDefaults,
     retryDefaultSeed,
     createHousehold,
@@ -635,6 +654,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setActiveTab,
     selectedMonthKey,
     setSelectedMonthKey,
+    focusMensualSection,
+    clearFocusMensualSection,
+    openHabitualSetupInAvanzado,
     uiMode,
     toggleUiMode,
     theme,

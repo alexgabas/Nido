@@ -30,6 +30,10 @@ import {
   DEFAULT_GOALS,
   DEFAULT_INITIAL_COSTS,
   EXPENSE_CATEGORY_LABELS,
+  findMatchingRecurringForPreset,
+  RECURRING_CATALOG_PRESETS,
+  RECURRING_CATALOG_SEED_VERSION,
+  type RecurringCatalogPreset,
 } from '../domain/presets';
 import { db, handleFirestoreError, OperationType } from '../services/firebase';
 import {
@@ -155,6 +159,10 @@ function mapHousehold(id: string, d: DocumentData): Household {
       currency: 'EUR',
     },
     ...(csvKeywords ? { csvKeywords } : {}),
+    ...(typeof d.seedPending === 'boolean' ? { seedPending: d.seedPending } : {}),
+    ...(typeof d.recurringSeedVersion === 'number'
+      ? { recurringSeedVersion: d.recurringSeedVersion }
+      : {}),
     createdAt: tsToIso(d.createdAt),
     updatedAt: tsToIso(d.updatedAt),
   };
@@ -388,6 +396,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           incomeB: 0,
           currency: 'EUR',
         },
+        seedPending: true,
+        recurringSeedVersion: 0,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -436,13 +446,15 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
   ): Promise<number> {
     const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
 
-    let icSnap, clSnap, itSnap, gSnap;
+    let hSnap, icSnap, clSnap, itSnap, gSnap, recSnap;
     try {
-      [icSnap, clSnap, itSnap, gSnap] = await Promise.all([
+      [hSnap, icSnap, clSnap, itSnap, gSnap, recSnap] = await Promise.all([
+        getDoc(doc(db, 'households', householdId)),
         getDocs(collection(db, 'households', householdId, 'initialCosts')),
         getDocs(collection(db, 'households', householdId, 'checklist')),
         getDocs(collection(db, 'households', householdId, 'items')),
         getDocs(collection(db, 'households', householdId, 'goals')),
+        getDocs(collection(db, 'households', householdId, 'recurring')),
       ]);
     } catch (error) {
       handleFirestoreError(
@@ -452,6 +464,11 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         'No se pudieron comprobar las listas actuales. Inténtalo de nuevo.'
       );
     }
+
+    const hData = hSnap.exists() ? hSnap.data() : {};
+    const currentSeedPending = Boolean(hData.seedPending);
+    const currentRecSeedVersion =
+      typeof hData.recurringSeedVersion === 'number' ? hData.recurringSeedVersion : 0;
 
     const existingIcIds = new Set(icSnap.docs.map((d) => d.id));
     const existingIcConcepts = new Set(icSnap.docs.map((d) => norm(d.data().concept)));
@@ -464,6 +481,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     const existingGIds = new Set(gSnap.docs.map((d) => d.id));
     const existingGNames = new Set(gSnap.docs.map((d) => norm(d.data().name)));
+
+    const existingRecurring = recSnap.docs.map((d) => mapRecurring(d.id, d.data()));
 
     const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
 
@@ -553,14 +572,42 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       });
     });
 
+    // Solo sembramos el catálogo de gastos habituales si aún no se ha completado esta versión,
+    // para no recrear plantillas que el usuario haya eliminado voluntariamente después.
+    if (currentRecSeedVersion < RECURRING_CATALOG_SEED_VERSION) {
+      for (const preset of RECURRING_CATALOG_PRESETS) {
+        if (findMatchingRecurringForPreset(preset, existingRecurring)) continue;
+        const ref = doc(db, 'households', householdId, 'recurring', preset.id);
+        ops.push({
+          path: `households/${householdId}/recurring/${preset.id}`,
+          apply: (b) =>
+            b.set(ref, {
+              concept: clampStr(preset.concept, MAX_LENGTHS.concept),
+              category: preset.category,
+              amount: 0,
+              frequency: preset.frequency,
+              dayOfMonth: 1,
+              splitOverride: null,
+              paidByDefault: COMMON_ACCOUNT_ID,
+              active: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            }),
+        });
+      }
+    }
+
     const createdCount = ops.length;
-    if (createdCount === 0) {
+    const needsSeedStateFinalize =
+      currentSeedPending || currentRecSeedVersion < RECURRING_CATALOG_SEED_VERSION;
+
+    if (createdCount === 0 && !needsSeedStateFinalize) {
       this.pendingSeedHouseholds.delete(householdId);
       setPendingSeedFlag(householdId, false);
       return 0;
     }
 
-    if (logActivityEntry) {
+    if (createdCount > 0 && logActivityEntry) {
       ops.push({
         path: `households/${householdId}/activity`,
         apply: (b) =>
@@ -573,6 +620,19 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
             householdId,
             `Cargó ${createdCount} elementos iniciales por defecto`
           ),
+      });
+    }
+
+    if (needsSeedStateFinalize) {
+      const hRef = doc(db, 'households', householdId);
+      ops.push({
+        path: `households/${householdId}`,
+        apply: (b) =>
+          b.update(hRef, {
+            seedPending: false,
+            recurringSeedVersion: Math.max(currentRecSeedVersion, RECURRING_CATALOG_SEED_VERSION),
+            updatedAt: serverTimestamp(),
+          }),
       });
     }
 
@@ -1546,6 +1606,78 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
     }
+  }
+
+  async addHabitualRecurringTemplates(
+    householdId: string,
+    presets: readonly RecurringCatalogPreset[],
+    actor: UserProfileInput
+  ): Promise<number> {
+    if (presets.length === 0) return 0;
+
+    let recSnap;
+    try {
+      recSnap = await getDocs(collection(db, 'households', householdId, 'recurring'));
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.LIST,
+        `households/${householdId}/recurring`,
+        'No se pudieron comprobar las plantillas existentes.'
+      );
+    }
+
+    const existingRecurring = recSnap.docs.map((d) => mapRecurring(d.id, d.data()));
+    const seenIds = new Set<string>();
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+
+    for (const preset of presets) {
+      if (seenIds.has(preset.id)) continue;
+      seenIds.add(preset.id);
+      if (findMatchingRecurringForPreset(preset, existingRecurring)) continue;
+      const ref = doc(db, 'households', householdId, 'recurring', preset.id);
+      ops.push({
+        path: `households/${householdId}/recurring/${preset.id}`,
+        apply: (batch) =>
+          batch.set(ref, {
+            concept: clampStr(preset.concept, MAX_LENGTHS.concept),
+            category: preset.category,
+            amount: 0,
+            frequency: preset.frequency,
+            dayOfMonth: 1,
+            splitOverride: null,
+            paidByDefault: COMMON_ACCOUNT_ID,
+            active: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    }
+
+    const addedCount = ops.length;
+    if (addedCount === 0) return 0;
+
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (batch) =>
+        this.addActivityToBatch(
+          batch,
+          householdId,
+          actor,
+          'create',
+          'recurrente',
+          presets[0].id,
+          `Añadió ${addedCount} ${addedCount === 1 ? 'plantilla habitual' : 'plantillas habituales'}`
+        ),
+    });
+
+    await this.commitBatchOps(
+      ops,
+      OperationType.CREATE,
+      `households/${householdId}/recurring`,
+      'No se pudieron añadir las plantillas habituales.'
+    );
+    return addedCount;
   }
 
   async deleteRecurring(

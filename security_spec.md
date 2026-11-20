@@ -11,6 +11,7 @@
 8. **Private Expenses (`isPrivate` + `createdBy`)**: Transactions with `isPrivate == true` are readable (`get`, `list`), updatable, restorable, and deletable ONLY when `createdBy == request.auth.uid`. Client queries on `transactions` MUST filter (`isPrivate == false` or `createdBy == request.auth.uid`) so Firestore `list` rules reject unfiltered queries. Private transactions cannot be settlements (`isSettlement == false`, `category != 'liquidacion'`, `settlementTo == ''`) and `paidBy` must equal `createdBy`. Only `createdBy` can mark their own expense as private.
 9. **Shared Shopping List (`shopping/{id}`)**: Readable/writable only by household members, `qty` in `[1, 999]`, `text` `1..120`, `addedBy == request.auth.uid` on create and immutable on update.
 10. **Strict Schema Keys**: Every `create` validates `keys().hasAll(...) && keys().hasOnly(...)`; every `update` validates `diff().affectedKeys().hasOnly(...)` per named action.
+11. **Seed State Persistence (`seedPending`, `recurringSeedVersion`)**: Optional on `households/{hid}`. `seedPending` must be `bool` and `recurringSeedVersion` must be `int` in `[0, 1000]`. Only existing household members may update `['seedPending', 'recurringSeedVersion', 'updatedAt']` without mixing unrelated fields (`memberUids`, `name`, `inviteCode`, `settings`).
 
 ## 2. The "Dirty Dozen" + Privacy & Shopping Payloads (Expected: PERMISSION_DENIED)
 1. **Unauthenticated read/write** on `/households/h1` -> Denied (`request.auth == null`).
@@ -29,4 +30,4 @@
 14. **Private expense hijacking / spoofing**: Partner B tries to create or restore a **private** transaction with `createdBy: uid_alex`, restore a shared transaction with non-member `createdBy: 'intruder'`, flip Partner A's shared transaction to `isPrivate: true`, delete Partner A's private transaction, or mark a private transaction as `paidBy: 'cuenta_comun'` / `isSettlement: true` -> Denied.
 15. **Shopping tampering / non-member access**: Non-member reads/writes `/households/h1/shopping/s1`, member mutates `addedBy` on update, or writes invalid `qty: 0` / `qty: 1000` -> Denied.
 16. **Household csvKeywords shadow key injection**: Member writes an unknown key inside `csvKeywords` (e.g. `adminNote`) -> Denied.
-
+17. **Household seed state tampering**: Negative/non-int `recurringSeedVersion`, non-bool `seedPending`, non-member updating `seedPending`, or mixing `seedPending` with `memberUids`/`name` -> Denied.

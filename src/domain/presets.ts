@@ -9,6 +9,7 @@ import type {
   InitialCost,
   InitialCostCategory,
   RecurrenceFrequency,
+  RecurringExpense,
   SavingsGoal,
   TransactionCategory,
 } from '../types/nido';
@@ -182,6 +183,172 @@ export const DEFAULT_GOALS: Array<
   { name: 'Navidad', icon: 'gift', color: '#D97706', targetAmount: 600, targetDate: '', type: 'navidad' },
   { name: 'Cumpleaños', icon: 'cake', color: '#9333EA', targetAmount: 400, targetDate: '', type: 'cumpleaños' },
 ];
+
+export const RECURRING_CATALOG_SEED_VERSION = 1;
+
+export type RecurringCatalogGroup =
+  | 'Vivienda'
+  | 'Suministros y comunicaciones'
+  | 'Suscripciones';
+
+export interface RecurringCatalogPreset {
+  id: string;
+  group: RecurringCatalogGroup;
+  concept: string;
+  category: ExpenseCategory;
+  frequency: RecurrenceFrequency;
+  hint?: string;
+  aliases?: string[];
+}
+
+export const RECURRING_CATALOG_GROUPS: readonly RecurringCatalogGroup[] = [
+  'Vivienda',
+  'Suministros y comunicaciones',
+  'Suscripciones',
+];
+
+export const RECURRING_CATALOG_PRESETS: readonly RecurringCatalogPreset[] = [
+  // Vivienda
+  {
+    id: 'seed_rec_alquiler',
+    group: 'Vivienda',
+    concept: 'Alquiler',
+    category: 'alquiler',
+    frequency: 'mensual',
+    aliases: ['alquiler piso', 'renta piso'],
+  },
+  {
+    id: 'seed_rec_comunidad',
+    group: 'Vivienda',
+    concept: 'Comunidad',
+    category: 'comunidad',
+    frequency: 'mensual',
+    hint: 'Solo si nos corresponde pagarla',
+    aliases: ['gastos de comunidad'],
+  },
+  {
+    id: 'seed_rec_seguro_hogar',
+    group: 'Vivienda',
+    concept: 'Seguro de hogar / contenido',
+    category: 'seguros',
+    frequency: 'anual',
+    aliases: ['seguro de hogar', 'seguro hogar', 'seguro contenido'],
+  },
+  // Suministros y comunicaciones
+  {
+    id: 'seed_rec_electricidad',
+    group: 'Suministros y comunicaciones',
+    concept: 'Electricidad',
+    category: 'luz',
+    frequency: 'mensual',
+    aliases: ['luz', 'factura luz'],
+  },
+  {
+    id: 'seed_rec_agua',
+    group: 'Suministros y comunicaciones',
+    concept: 'Agua',
+    category: 'agua',
+    frequency: 'bimestral',
+    aliases: ['agua (bimestral)', 'factura agua'],
+  },
+  {
+    id: 'seed_rec_gas',
+    group: 'Suministros y comunicaciones',
+    concept: 'Gas',
+    category: 'gas',
+    frequency: 'mensual',
+    aliases: ['factura gas'],
+  },
+  {
+    id: 'seed_rec_fibra_internet',
+    group: 'Suministros y comunicaciones',
+    concept: 'Fibra / internet',
+    category: 'internet',
+    frequency: 'mensual',
+    aliases: ['fibra y moviles', 'fibra', 'internet'],
+  },
+  {
+    id: 'seed_rec_lineas_moviles',
+    group: 'Suministros y comunicaciones',
+    concept: 'Líneas móviles compartidas',
+    category: 'movil',
+    frequency: 'mensual',
+    aliases: ['movil', 'moviles', 'lineas moviles'],
+  },
+  // Suscripciones
+  {
+    id: 'seed_rec_plataformas_video',
+    group: 'Suscripciones',
+    concept: 'Plataformas de vídeo',
+    category: 'suscripciones',
+    frequency: 'mensual',
+  },
+  {
+    id: 'seed_rec_musica',
+    group: 'Suscripciones',
+    concept: 'Música',
+    category: 'suscripciones',
+    frequency: 'mensual',
+  },
+  {
+    id: 'seed_rec_nube',
+    group: 'Suscripciones',
+    concept: 'Almacenamiento en la nube',
+    category: 'suscripciones',
+    frequency: 'mensual',
+  },
+  {
+    id: 'seed_rec_otras_suscripciones',
+    group: 'Suscripciones',
+    concept: 'Otras suscripciones compartidas',
+    category: 'suscripciones',
+    frequency: 'mensual',
+  },
+];
+
+export interface VariableBudgetSuggestion {
+  id: string;
+  concept: string;
+  category: ExpenseCategory;
+  hint?: string;
+}
+
+export const VARIABLE_BUDGET_SUGGESTIONS: readonly VariableBudgetSuggestion[] = [
+  { id: 'var_supermercado', concept: 'Supermercado y alimentación', category: 'supermercado' },
+  { id: 'var_limpieza', concept: 'Limpieza y productos del hogar', category: 'otros' },
+  { id: 'var_higiene', concept: 'Higiene y cuidado personal compartido', category: 'otros' },
+  { id: 'var_transporte', concept: 'Transporte compartido', category: 'transporte' },
+  { id: 'var_ocio', concept: 'Ocio, restaurantes y pedidos a domicilio', category: 'ocio' },
+  { id: 'var_mascotas', concept: 'Mascotas', category: 'otros' },
+  { id: 'var_mantenimiento', concept: 'Mantenimiento y pequeñas reparaciones', category: 'otros' },
+  {
+    id: 'var_tasas',
+    concept: 'Tasas o recibos del hogar',
+    category: 'otros',
+    hint: 'Solo si nos corresponden',
+  },
+];
+
+export function normalizePresetText(value: unknown): string {
+  return String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+export function findMatchingRecurringForPreset(
+  preset: RecurringCatalogPreset,
+  existing: RecurringExpense[]
+): RecurringExpense | undefined {
+  const targetConcept = normalizePresetText(preset.concept);
+  const aliasSet = new Set((preset.aliases ?? []).map(normalizePresetText));
+  return existing.find((rec) => {
+    if (rec.id === preset.id) return true;
+    const normConcept = normalizePresetText(rec.concept);
+    return normConcept === targetConcept || aliasSet.has(normConcept);
+  });
+}
 
 export const SPLIT_PRESETS: Array<{ label: string; a: number; b: number }> = [
   { label: '50 / 50', a: 50, b: 50 },

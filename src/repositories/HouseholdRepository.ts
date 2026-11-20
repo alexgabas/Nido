@@ -1,3 +1,4 @@
+import type { RecurringCatalogPreset } from '../domain/presets';
 import type {
   ActivityEntry,
   ChecklistItem,
@@ -245,6 +246,11 @@ export interface HouseholdRepository {
     rec: Omit<RecurringExpense, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
     actor: UserProfileInput
   ): Promise<string>;
+  addHabitualRecurringTemplates(
+    householdId: string,
+    presets: readonly RecurringCatalogPreset[],
+    actor: UserProfileInput
+  ): Promise<number>;
   deleteRecurring(
     householdId: string,
     id: string,

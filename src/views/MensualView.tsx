@@ -42,15 +42,22 @@ import {
   formatMonthLabelES,
   formatPctES,
   getTodayLocalISO,
+  inferSplitChoice,
+  isRecurringTemplatePending,
   monthlyEquivalent,
+  resolveSplitPctForChoice,
   roundCents,
   shiftMonthKey,
   type ComparisonDirection,
 } from '../domain/finance';
 import {
   EXPENSE_CATEGORY_LABELS,
+  findMatchingRecurringForPreset,
   FREQUENCY_LABELS,
+  RECURRING_CATALOG_GROUPS,
+  RECURRING_CATALOG_PRESETS,
   TRANSACTION_CATEGORY_LABELS,
+  VARIABLE_BUDGET_SUGGESTIONS,
 } from '../domain/presets';
 import { exportNidoPDF } from '../services/pdfExport';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
@@ -60,6 +67,7 @@ import {
   type MonthlyBudget,
   type RecurrenceFrequency,
   type RecurringExpense,
+  type SplitPresetChoice,
   type Transaction,
   type TransactionCategory,
 } from '../types/nido';
@@ -78,6 +86,8 @@ export const MensualView: React.FC = () => {
     effectiveSplitPctA,
     selectedMonthKey,
     setSelectedMonthKey,
+    focusMensualSection,
+    clearFocusMensualSection,
     uiMode,
     recurring,
     monthTransactions,
@@ -129,7 +139,21 @@ export const MensualView: React.FC = () => {
   const [recFrequency, setRecFrequency] = useState<RecurrenceFrequency>('mensual');
   const [recDay, setRecDay] = useState('1');
   const [recPaidBy, setRecPaidBy] = useState<string>(COMMON_ACCOUNT_ID);
+  const [recSplitChoice, setRecSplitChoice] = useState<SplitPresetChoice>('segun_reparto');
+  const [recCustomSplitA, setRecCustomSplitA] = useState('50');
   const [recActive, setRecActive] = useState(true);
+  const [recModalError, setRecModalError] = useState<string | null>(null);
+  const [savingRec, setSavingRec] = useState(false);
+
+  // Habitual expenses catalog modal
+  const [habitualModalOpen, setHabitualModalOpen] = useState(false);
+  const [selectedCatalogIds, setSelectedCatalogIds] = useState<Set<string>>(new Set());
+  const [selectedVariableIds, setSelectedVariableIds] = useState<Set<string>>(new Set());
+  const [habitualVarBudgets, setHabitualVarBudgets] = useState<Record<string, string>>({});
+  const [habitualError, setHabitualError] = useState<string | null>(null);
+  const [savingHabitual, setSavingHabitual] = useState(false);
+
+  const plantillasSectionRef = useRef<HTMLElement | null>(null);
 
   // Budget modal
   const [budgetModalOpen, setBudgetModalOpen] = useState(false);
@@ -160,6 +184,19 @@ export const MensualView: React.FC = () => {
     setSelectedTxIds(new Set());
     setInlineEditId(null);
   }, [selectedMonthKey, isClosed]);
+
+  // Focus plantillas section when navigated from Modo Sencillo CTA
+  useEffect(() => {
+    if (uiMode !== 'avanzado' || focusMensualSection !== 'plantillas') return;
+    const prefersReduced =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    plantillasSectionRef.current?.scrollIntoView({
+      behavior: prefersReduced ? 'auto' : 'smooth',
+      block: 'start',
+    });
+    clearFocusMensualSection();
+  }, [uiMode, focusMensualSection, clearFocusMensualSection]);
 
   const balance = useMemo(
     () => calculateCoupleBalance(monthTransactions, memberA, memberB),
@@ -432,40 +469,175 @@ export const MensualView: React.FC = () => {
     showToast(`Mes ${selectedMonthKey} cerrado`);
   };
 
-  const openRecModal = (rec: RecurringExpense | null) => {
+  const viewerIsMemberA = currentMember
+    ? currentMember.role !== 'member_b'
+    : !memberB || currentUserProfile?.uid !== memberB.uid;
+
+  const openRecModal = (rec: RecurringExpense | null, activateOnOpen = false) => {
     setEditingRec(rec);
     setRecConcept(rec?.concept ?? '');
     setRecCategory(rec?.category ?? 'alquiler');
-    setRecAmount(rec ? String(rec.amount) : '');
+    setRecAmount(rec ? (rec.amount > 0 ? String(rec.amount) : '') : '');
     setRecFrequency(rec?.frequency ?? 'mensual');
     setRecDay(rec ? String(rec.dayOfMonth) : '1');
     setRecPaidBy(rec?.paidByDefault ?? COMMON_ACCOUNT_ID);
-    setRecActive(rec?.active ?? true);
+    if (rec && rec.splitOverride !== null && rec.splitOverride !== undefined) {
+      const inferred = inferSplitChoice(rec.splitOverride, viewerIsMemberA, effectiveSplitPctA);
+      setRecSplitChoice(inferred);
+      setRecCustomSplitA(String(rec.splitOverride));
+    } else {
+      setRecSplitChoice('segun_reparto');
+      setRecCustomSplitA(String(effectiveSplitPctA));
+    }
+    setRecActive(activateOnOpen ? true : rec ? rec.active : true);
+    setRecModalError(null);
     setRecModalOpen(true);
   };
 
   const handleSaveRecurring = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!householdId || !currentUserProfile) return;
-    const amt = Math.max(0, Number(recAmount.replace(',', '.')) || 0);
-    const day = Math.max(1, Math.min(31, Math.round(Number(recDay) || 1)));
-    await repo.upsertRecurring(
-      householdId,
-      {
-        id: editingRec?.id,
-        concept: recConcept.trim(),
-        category: recCategory,
-        amount: Math.round(amt * 100) / 100,
-        frequency: recFrequency,
-        dayOfMonth: day,
-        splitOverride: editingRec?.splitOverride ?? null,
-        paidByDefault: recPaidBy,
-        active: recActive,
-      },
-      currentUserProfile
-    );
-    setRecModalOpen(false);
-    showToast('Plantilla recurrente guardada');
+    const cleanConcept = recConcept.trim();
+    if (!cleanConcept) {
+      setRecModalError('Escribe un concepto para la plantilla.');
+      return;
+    }
+    const rawAmount = recAmount.trim();
+    const parsedAmount = rawAmount === '' ? 0 : Number(rawAmount.replace(',', '.'));
+    if (!Number.isFinite(parsedAmount) || parsedAmount < 0) {
+      setRecModalError('Introduce un importe válido igual o mayor que 0.');
+      return;
+    }
+    if (recActive && parsedAmount <= 0) {
+      setRecModalError('Introduce un importe mayor que 0 para activar esta plantilla.');
+      return;
+    }
+    const parsedDay = Number(recDay);
+    if (!Number.isInteger(parsedDay) || parsedDay < 1 || parsedDay > 31) {
+      setRecModalError('El día de cobro debe estar entre 1 y 31.');
+      return;
+    }
+    const splitOverride =
+      recPaidBy === COMMON_ACCOUNT_ID || recSplitChoice === 'segun_reparto'
+        ? null
+        : resolveSplitPctForChoice(
+            recSplitChoice,
+            viewerIsMemberA,
+            effectiveSplitPctA,
+            Number(recCustomSplitA.replace(',', '.')) || effectiveSplitPctA
+          );
+
+    setSavingRec(true);
+    setRecModalError(null);
+    try {
+      await repo.upsertRecurring(
+        householdId,
+        {
+          id: editingRec?.id,
+          concept: cleanConcept,
+          category: recCategory,
+          amount: Math.round(parsedAmount * 100) / 100,
+          frequency: recFrequency,
+          dayOfMonth: parsedDay,
+          splitOverride,
+          paidByDefault: recPaidBy,
+          active: recActive,
+        },
+        currentUserProfile
+      );
+      setRecModalOpen(false);
+      showToast('Plantilla recurrente guardada');
+    } catch (err) {
+      setRecModalError(
+        toUserFriendlyErrorMessage(err, 'No se pudo guardar la plantilla recurrente.')
+      );
+    } finally {
+      setSavingRec(false);
+    }
+  };
+
+  const openHabitualModal = () => {
+    setSelectedCatalogIds(new Set());
+    setSelectedVariableIds(new Set());
+    const initBudgets: Record<string, string> = {};
+    for (const cat of ['supermercado', 'transporte', 'ocio', 'otros'] as const) {
+      const existingLimit = budget?.limits?.[cat];
+      initBudgets[cat] = existingLimit && existingLimit > 0 ? String(existingLimit) : '';
+    }
+    setHabitualVarBudgets(initBudgets);
+    setHabitualError(null);
+    setHabitualModalOpen(true);
+  };
+
+  const handleSaveHabitualCatalog = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!householdId || !currentUserProfile) return;
+
+    const presetsToAdd = RECURRING_CATALOG_PRESETS.filter((p) => selectedCatalogIds.has(p.id));
+    const nextLimits: MonthlyBudget['limits'] = { ...(budget?.limits ?? {}) };
+    let budgetChanged = false;
+
+    if (!isClosed) {
+      for (const cat of ['supermercado', 'transporte', 'ocio', 'otros'] as const) {
+        const raw = (habitualVarBudgets[cat] ?? '').trim();
+        if (raw === '') continue;
+        const parsed = Number(raw.replace(',', '.'));
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          setHabitualError(
+            `El presupuesto para ${EXPENSE_CATEGORY_LABELS[cat]} debe ser un número válido.`
+          );
+          return;
+        }
+        if (parsed > 0) {
+          const rounded = Math.round(parsed * 100) / 100;
+          if (nextLimits[cat] !== rounded) {
+            nextLimits[cat] = rounded;
+            budgetChanged = true;
+          }
+        }
+      }
+    }
+
+    if (presetsToAdd.length === 0 && !budgetChanged) {
+      setHabitualError(
+        'Marca al menos un gasto habitual disponible o introduce un presupuesto orientativo mayor que 0.'
+      );
+      return;
+    }
+
+    setSavingHabitual(true);
+    setHabitualError(null);
+    try {
+      let addedCount = 0;
+      if (presetsToAdd.length > 0) {
+        addedCount = await repo.addHabitualRecurringTemplates(
+          householdId,
+          presetsToAdd,
+          currentUserProfile
+        );
+      }
+      if (!isClosed && budgetChanged) {
+        await repo.saveBudget(householdId, selectedMonthKey, nextLimits, currentUserProfile);
+      }
+      setHabitualModalOpen(false);
+      if (addedCount > 0 && budgetChanged) {
+        showToast(`Añadidas ${addedCount} plantillas y actualizado el presupuesto`);
+      } else if (addedCount > 0) {
+        showToast(
+          `Añadidas ${addedCount} ${addedCount === 1 ? 'plantilla habitual' : 'plantillas habituales'}`
+        );
+      } else if (budgetChanged) {
+        showToast('Presupuesto orientativo guardado');
+      } else {
+        showToast('Las plantillas seleccionadas ya estaban añadidas');
+      }
+    } catch (err) {
+      setHabitualError(
+        toUserFriendlyErrorMessage(err, 'No se pudieron guardar los gastos habituales.')
+      );
+    } finally {
+      setSavingHabitual(false);
+    }
   };
 
   const openBudgetEditor = () => {
@@ -1535,65 +1707,186 @@ export const MensualView: React.FC = () => {
           )}
         </section>
 
-        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-          <div className="flex items-center justify-between">
+        <section
+          ref={plantillasSectionRef}
+          id="plantillas-section"
+          className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4 scroll-mt-20"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <CalendarClock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
               <h2 className="font-display text-base font-bold">Plantillas y calendario</h2>
             </div>
-            <button
-              type="button"
-              onClick={() => openRecModal(null)}
-              className="min-h-[44px] px-3.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Plantilla</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={openHabitualModal}
+                className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/30 dark:border-[#2AA1AE]/40 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#0E5A64]/5"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Añadir gastos habituales</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openRecModal(null)}
+                className="min-h-[44px] px-3.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Plantilla</span>
+              </button>
+            </div>
           </div>
 
-          {recurring.length === 0 ? (
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Añade alquiler, luz, agua o seguros para generar el mes en un toque.
-            </p>
-          ) : (
-            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {recurring.map((rec) => {
-                const equiv = monthlyEquivalent(rec.amount, rec.frequency);
-                return (
-                  <li key={rec.id} className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className={`text-sm font-semibold truncate ${!rec.active ? 'opacity-50' : ''}`}>
-                        Día {rec.dayOfMonth} · {rec.concept}
-                      </p>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">
-                        {FREQUENCY_LABELS[rec.frequency]} · {memberLabel(rec.paidByDefault)}
-                        {rec.frequency !== 'mensual' ? ` · Equiv. mensual: ${formatEUR(equiv)}` : ''}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <span className="font-mono-num text-xs font-bold">{formatEUR(rec.amount)}</span>
-                      <button
-                        type="button"
-                        aria-label={`Editar plantilla ${rec.concept}`}
-                        onClick={() => openRecModal(rec)}
-                        className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
-                      >
-                        <Pencil className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Eliminar plantilla ${rec.concept}`}
-                        onClick={() => setDeleteTarget({ kind: 'rec', item: rec })}
-                        className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+          {(() => {
+            const activeTemplates = recurring.filter((r) => r.active);
+            const pendingTemplates = recurring.filter((r) => !r.active);
+            const pendingConfigCount = recurring.filter(isRecurringTemplatePending).length;
+
+            if (recurring.length === 0) {
+              return (
+                <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 p-4 space-y-2">
+                  <p className="text-xs text-slate-600 dark:text-slate-300">
+                    Añade alquiler, luz, agua o seguros para generar el mes en un toque y tener previsión real.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={openHabitualModal}
+                    className="min-h-[44px] px-3.5 rounded-xl bg-[#0E5A64] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Explorar catálogo habitual</span>
+                  </button>
+                </div>
+              );
+            }
+
+            return (
+              <div className="space-y-4">
+                {pendingConfigCount > 0 && (
+                  <div className="rounded-xl bg-[#0E5A64]/6 dark:bg-[#2AA1AE]/10 border border-[#0E5A64]/20 px-3.5 py-2.5 text-xs text-slate-700 dark:text-slate-200">
+                    Tenéis <strong>{pendingConfigCount}</strong>{' '}
+                    {pendingConfigCount === 1
+                      ? 'gasto habitual pendiente de configurar'
+                      : 'gastos habituales pendientes de configurar'}
+                    . Añade su importe y actívalo para incluirlo en previsiones y recordatorios.
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                    Activas ({activeTemplates.length})
+                  </h3>
+                  {activeTemplates.length === 0 ? (
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      Ninguna plantilla activa todavía. Configura alguna de las pendientes o crea una nueva.
+                    </p>
+                  ) : (
+                    <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                      {activeTemplates.map((rec) => {
+                        const equiv = monthlyEquivalent(rec.amount, rec.frequency);
+                        return (
+                          <li
+                            key={rec.id}
+                            className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-2"
+                          >
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold truncate">
+                                Día {rec.dayOfMonth} · {rec.concept}
+                              </p>
+                              <p className="text-xs text-slate-500 dark:text-slate-400">
+                                {EXPENSE_CATEGORY_LABELS[rec.category]} · {FREQUENCY_LABELS[rec.frequency]} ·{' '}
+                                {memberLabel(rec.paidByDefault)}
+                                {rec.frequency !== 'mensual'
+                                  ? ` · Equiv. mensual: ${formatEUR(equiv)}`
+                                  : ''}
+                                {rec.splitOverride !== null &&
+                                rec.splitOverride !== undefined &&
+                                rec.paidByDefault !== COMMON_ACCOUNT_ID
+                                  ? ` · Reparto ${rec.splitOverride}/${Math.round((100 - rec.splitOverride) * 10) / 10}%`
+                                  : ''}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <span className="font-mono-num text-xs font-bold">
+                                {formatEUR(rec.amount)}
+                              </span>
+                              <button
+                                type="button"
+                                aria-label={`Editar plantilla ${rec.concept}`}
+                                onClick={() => openRecModal(rec)}
+                                className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                              >
+                                <Pencil className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label={`Eliminar plantilla ${rec.concept}`}
+                                onClick={() => setDeleteTarget({ kind: 'rec', item: rec })}
+                                className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+
+                {pendingTemplates.length > 0 && (
+                  <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                    <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      Pendientes de configurar ({pendingTemplates.length})
+                    </h3>
+                    <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                      {pendingTemplates.map((rec) => {
+                        const isPendingSeed = isRecurringTemplatePending(rec);
+                        return (
+                          <li
+                            key={rec.id}
+                            className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-2"
+                          >
+                            <div className="min-w-0 space-y-0.5">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <p className="text-sm font-semibold truncate text-slate-700 dark:text-slate-200">
+                                  {rec.concept}
+                                </p>
+                                <span className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-950/50 text-amber-900 dark:text-amber-200 text-[10px] font-semibold">
+                                  {isPendingSeed ? 'Pendiente de configurar' : 'Inactiva'}
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-500 dark:text-slate-400">
+                                {EXPENSE_CATEGORY_LABELS[rec.category]} · {FREQUENCY_LABELS[rec.frequency]}
+                                {rec.amount > 0 ? ` · ${formatEUR(rec.amount)}` : ''}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => openRecModal(rec, isPendingSeed)}
+                                className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-semibold hover:bg-[#0E5A64]/15"
+                              >
+                                Configurar
+                              </button>
+                              <button
+                                type="button"
+                                aria-label={`Eliminar plantilla ${rec.concept}`}
+                                onClick={() => setDeleteTarget({ kind: 'rec', item: rec })}
+                                className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </section>
       </div>
 
@@ -1801,14 +2094,25 @@ export const MensualView: React.FC = () => {
           aria-modal="true"
           aria-labelledby="rec-modal-title"
         >
-          <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4">
+          <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4 max-h-[90vh] overflow-y-auto">
             <h2 id="rec-modal-title" className="font-display text-lg font-bold">
               {editingRec ? 'Editar plantilla recurrente' : 'Nueva plantilla recurrente'}
             </h2>
-            <form onSubmit={handleSaveRecurring} className="space-y-3">
+            {recModalError && (
+              <div
+                role="alert"
+                className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs font-medium"
+              >
+                {recModalError}
+              </div>
+            )}
+            <form onSubmit={handleSaveRecurring} noValidate className="space-y-3">
               <div>
-                <label className="block text-xs font-medium mb-1">Concepto</label>
+                <label htmlFor="rec-concept" className="block text-xs font-medium mb-1">
+                  Concepto
+                </label>
                 <input
+                  id="rec-concept"
                   type="text"
                   required
                   maxLength={120}
@@ -1819,8 +2123,11 @@ export const MensualView: React.FC = () => {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium mb-1">Categoría</label>
+                  <label htmlFor="rec-category" className="block text-xs font-medium mb-1">
+                    Categoría
+                  </label>
                   <select
+                    id="rec-category"
                     value={recCategory}
                     onChange={(e) => setRecCategory(e.target.value as ExpenseCategory)}
                     className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
@@ -1833,11 +2140,14 @@ export const MensualView: React.FC = () => {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium mb-1">Importe (€)</label>
+                  <label htmlFor="rec-amount" className="block text-xs font-medium mb-1">
+                    Importe (€)
+                  </label>
                   <input
+                    id="rec-amount"
                     type="text"
                     inputMode="decimal"
-                    required
+                    placeholder={recActive ? 'Ej: 850' : '0'}
                     value={recAmount}
                     onChange={(e) => setRecAmount(e.target.value)}
                     className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm"
@@ -1846,8 +2156,11 @@ export const MensualView: React.FC = () => {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium mb-1">Frecuencia</label>
+                  <label htmlFor="rec-frequency" className="block text-xs font-medium mb-1">
+                    Frecuencia
+                  </label>
                   <select
+                    id="rec-frequency"
                     value={recFrequency}
                     onChange={(e) => setRecFrequency(e.target.value as RecurrenceFrequency)}
                     className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
@@ -1860,8 +2173,11 @@ export const MensualView: React.FC = () => {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium mb-1">Día de cobro (1-31)</label>
+                  <label htmlFor="rec-day" className="block text-xs font-medium mb-1">
+                    Día de cobro (1-31)
+                  </label>
                   <input
+                    id="rec-day"
                     type="number"
                     min={1}
                     max={31}
@@ -1872,8 +2188,11 @@ export const MensualView: React.FC = () => {
                 </div>
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">Pagado por defecto</label>
+                <label htmlFor="rec-paid-by" className="block text-xs font-medium mb-1">
+                  Pagado por defecto
+                </label>
                 <select
+                  id="rec-paid-by"
                   value={recPaidBy}
                   onChange={(e) => setRecPaidBy(e.target.value)}
                   className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
@@ -1883,6 +2202,46 @@ export const MensualView: React.FC = () => {
                   {memberB && <option value={memberB.uid}>{shortNameB}</option>}
                 </select>
               </div>
+              {recPaidBy === COMMON_ACCOUNT_ID ? (
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Al pagarse desde Cuenta común se asume como gasto conjunto del hogar sin deuda entre miembros.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  <label htmlFor="rec-split-choice" className="block text-xs font-medium">
+                    Reparto de este gasto fijo
+                  </label>
+                  <select
+                    id="rec-split-choice"
+                    value={recSplitChoice}
+                    onChange={(e) => setRecSplitChoice(e.target.value as SplitPresetChoice)}
+                    className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                  >
+                    <option value="segun_reparto">Según reparto del hogar ({effectiveSplitPctA}% / {Math.round((100 - effectiveSplitPctA) * 10) / 10}%)</option>
+                    <option value="a_medias">A medias (50% / 50%)</option>
+                    <option value="solo_yo">Solo yo (100% mío)</option>
+                    <option value="solo_pareja">Solo mi pareja (100% pareja)</option>
+                    <option value="personalizado">Personalizado</option>
+                  </select>
+                  {recSplitChoice === 'personalizado' && (
+                    <div className="flex items-center gap-2">
+                      <label htmlFor="rec-custom-split" className="text-xs text-slate-600 dark:text-slate-300">
+                        % para {shortNameA}:
+                      </label>
+                      <input
+                        id="rec-custom-split"
+                        type="number"
+                        min={0}
+                        max={100}
+                        step={0.5}
+                        value={recCustomSplitA}
+                        onChange={(e) => setRecCustomSplitA(e.target.value)}
+                        className="w-24 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm text-right"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
               <label className="flex items-center gap-2 text-sm pt-1">
                 <input
                   type="checkbox"
@@ -1890,21 +2249,316 @@ export const MensualView: React.FC = () => {
                   onChange={(e) => setRecActive(e.target.checked)}
                   className="w-4 h-4 accent-[#0E5A64]"
                 />
-                <span>Plantilla activa</span>
+                <span>Plantilla activa (se incluye en previsiones y calendario)</span>
               </label>
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                <div>
+                  {editingRec && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const target = editingRec;
+                        setRecModalOpen(false);
+                        setDeleteTarget({ kind: 'rec', item: target });
+                      }}
+                      className="min-h-[44px] px-3 rounded-xl text-[#B42318] dark:text-[#FCA5A5] text-xs font-semibold hover:bg-[#B42318]/10 inline-flex items-center gap-1.5"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Eliminar plantilla</span>
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRecModalOpen(false)}
+                    className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingRec}
+                    className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold disabled:opacity-50"
+                  >
+                    {savingRec ? 'Guardando...' : 'Guardar'}
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {habitualModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="habitual-modal-title"
+        >
+          <div className="w-full sm:max-w-xl rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4 max-h-[88vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="habitual-modal-title" className="font-display text-lg font-bold">
+                  Añadir gastos habituales
+                </h2>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  Las plantillas marcadas se añadirán pendientes de configurar (0 €, inactivas) para que pongáis vuestro importe real cuando queráis.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Cerrar catálogo de gastos habituales"
+                onClick={() => setHabitualModalOpen(false)}
+                className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {habitualError && (
+              <div
+                role="alert"
+                className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs font-medium"
+              >
+                {habitualError}
+              </div>
+            )}
+
+            <form onSubmit={handleSaveHabitualCatalog} className="space-y-5">
+              {(() => {
+                const missingPresets = RECURRING_CATALOG_PRESETS.filter(
+                  (p) => !findMatchingRecurringForPreset(p, recurring)
+                );
+                return (
+                  <div className="space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                        Plantillas periódicas ({missingPresets.length} disponibles)
+                      </h3>
+                      {missingPresets.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (selectedCatalogIds.size === missingPresets.length) {
+                              setSelectedCatalogIds(new Set());
+                            } else {
+                              setSelectedCatalogIds(new Set(missingPresets.map((p) => p.id)));
+                            }
+                          }}
+                          className="min-h-[44px] px-3 rounded-lg text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-[#0E5A64]/10"
+                        >
+                          {selectedCatalogIds.size === missingPresets.length
+                            ? 'Desmarcar todas'
+                            : 'Seleccionar disponibles'}
+                        </button>
+                      )}
+                    </div>
+
+                    {RECURRING_CATALOG_GROUPS.map((group) => {
+                      const items = RECURRING_CATALOG_PRESETS.filter((p) => p.group === group);
+                      return (
+                        <div key={group} className="space-y-2">
+                          <h4 className="text-xs font-bold text-slate-700 dark:text-slate-200">
+                            {group}
+                          </h4>
+                          <div className="space-y-1.5">
+                            {items.map((preset) => {
+                              const existing = findMatchingRecurringForPreset(preset, recurring);
+                              const checked = existing ? true : selectedCatalogIds.has(preset.id);
+                              return (
+                                <label
+                                  key={preset.id}
+                                  className={`flex items-start gap-3 rounded-xl border p-3 min-h-[44px] ${
+                                    existing
+                                      ? 'border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/40 opacity-75'
+                                      : 'border-slate-200 dark:border-slate-700 cursor-pointer hover:border-[#0E5A64]/40'
+                                  }`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    disabled={Boolean(existing)}
+                                    checked={checked}
+                                    onChange={(ev) => {
+                                      setSelectedCatalogIds((prev) => {
+                                        const next = new Set(prev);
+                                        if (ev.target.checked) next.add(preset.id);
+                                        else next.delete(preset.id);
+                                        return next;
+                                      });
+                                    }}
+                                    className="w-4 h-4 mt-0.5 accent-[#0E5A64]"
+                                  />
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                      <span className="text-sm font-semibold">{preset.concept}</span>
+                                      <div className="flex items-center gap-1.5">
+                                        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                                          {FREQUENCY_LABELS[preset.frequency]}
+                                        </span>
+                                        {existing && (
+                                          <span className="px-2 py-0.5 rounded-md bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] text-[10px] font-bold">
+                                            Ya añadido
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                    {preset.hint && (
+                                      <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                                        {preset.hint}
+                                      </p>
+                                    )}
+                                  </div>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+
+              {/* Variable budget reminders (NOT recurring templates) */}
+              <div className="space-y-3 pt-4 border-t border-slate-200 dark:border-slate-800">
+                <div>
+                  <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                    Otras partidas que conviene recordar
+                  </h3>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
+                    Reserva un presupuesto y registra las compras cuando se produzcan. No crean cobros periódicos.
+                  </p>
+                  {isClosed && (
+                    <p className="text-xs text-amber-800 dark:text-amber-200 mt-1">
+                      {formatMonthLabelES(selectedMonthKey)} está cerrado: solo se añadirán las plantillas seleccionadas arriba.
+                    </p>
+                  )}
+                </div>
+
+                {(['supermercado', 'transporte', 'ocio'] as const).map((cat) => {
+                  const item = VARIABLE_BUDGET_SUGGESTIONS.find((v) => v.category === cat);
+                  if (!item) return null;
+                  const existingLimit = budget?.limits?.[cat];
+                  return (
+                    <div
+                      key={item.id}
+                      className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold">{item.concept}</p>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Categoría {EXPENSE_CATEGORY_LABELS[cat]}
+                          {existingLimit && existingLimit > 0
+                            ? ` · Presupuesto actual: ${formatEUR(existingLimit)}`
+                            : ''}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <label htmlFor={`hab-bud-${cat}`} className="sr-only">
+                          Presupuesto mensual para {EXPENSE_CATEGORY_LABELS[cat]}
+                        </label>
+                        <input
+                          id={`hab-bud-${cat}`}
+                          type="text"
+                          inputMode="decimal"
+                          disabled={isClosed}
+                          placeholder="Sin límite (€)"
+                          value={habitualVarBudgets[cat] ?? ''}
+                          onChange={(ev) =>
+                            setHabitualVarBudgets((prev) => ({ ...prev, [cat]: ev.target.value }))
+                          }
+                          className="w-32 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm text-right disabled:opacity-50"
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* Grouped "Otros" reminders feeding ONE shared Otros budget input */}
+                {(() => {
+                  const otrosItems = VARIABLE_BUDGET_SUGGESTIONS.filter(
+                    (v) => v.category === 'otros'
+                  );
+                  const existingOtros = budget?.limits?.otros;
+                  return (
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3.5 space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold">
+                            Presupuesto conjunto para Otros
+                          </p>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Marca qué partidas quieres tener en mente para este mes (se agrupan en el límite único de «Otros»).
+                            {existingOtros && existingOtros > 0
+                              ? ` Actual: ${formatEUR(existingOtros)}.`
+                              : ''}
+                          </p>
+                        </div>
+                        <div className="shrink-0">
+                          <label htmlFor="hab-bud-otros" className="sr-only">
+                            Presupuesto mensual para Otros
+                          </label>
+                          <input
+                            id="hab-bud-otros"
+                            type="text"
+                            inputMode="decimal"
+                            disabled={isClosed}
+                            placeholder="Sin límite (€)"
+                            value={habitualVarBudgets.otros ?? ''}
+                            onChange={(ev) =>
+                              setHabitualVarBudgets((prev) => ({
+                                ...prev,
+                                otros: ev.target.value,
+                              }))
+                            }
+                            className="w-32 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm text-right disabled:opacity-50"
+                          />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1 border-t border-slate-100 dark:border-slate-800">
+                        {otrosItems.map((item) => (
+                          <label
+                            key={item.id}
+                            className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300 min-h-[44px] cursor-pointer"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedVariableIds.has(item.id)}
+                              onChange={(ev) => {
+                                setSelectedVariableIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (ev.target.checked) next.add(item.id);
+                                  else next.delete(item.id);
+                                  return next;
+                                });
+                              }}
+                              className="w-4 h-4 accent-[#0E5A64]"
+                            />
+                            <span>{item.concept}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setRecModalOpen(false)}
+                  onClick={() => setHabitualModalOpen(false)}
                   className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold"
+                  disabled={savingHabitual}
+                  className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold disabled:opacity-50"
                 >
-                  Guardar
+                  {savingHabitual ? 'Guardando...' : 'Añadir seleccionados'}
                 </button>
               </div>
             </form>

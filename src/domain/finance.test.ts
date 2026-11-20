@@ -17,8 +17,10 @@ import {
   formatEUR,
   formatLocalDateISO,
   getBudgetThresholdAlerts,
+  getUpcomingCharges,
   getUpcomingChargesWithinDays,
   inferSplitChoice,
+  isRecurringTemplatePending,
   monthlyEquivalent,
   resolveSplitPctForChoice,
 } from './finance';
@@ -31,17 +33,25 @@ import {
   parseBankDateToISO,
   parseCsvMatrix,
 } from './csvImport';
+import {
+  findMatchingRecurringForPreset,
+  RECURRING_CATALOG_PRESETS,
+  RECURRING_CATALOG_SEED_VERSION,
+  VARIABLE_BUDGET_SUGGESTIONS,
+} from './presets';
 import { generateSpanishCSV, validateAndMigrateBackup } from './backup';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
-import type {
-  FurnitureItem,
-  GoalMovement,
-  HouseholdMember,
-  HouseholdSettings,
-  NidoBackupV1,
-  RecurringExpense,
-  SavingsGoal,
-  Transaction,
+import {
+  COMMON_ACCOUNT_ID,
+  type FurnitureItem,
+  type GoalMovement,
+  type Household,
+  type HouseholdMember,
+  type HouseholdSettings,
+  type NidoBackupV1,
+  type RecurringExpense,
+  type SavingsGoal,
+  type Transaction,
 } from '../types/nido';
 
 const memberA: HouseholdMember = {
@@ -1465,5 +1475,158 @@ test('11. Importación bancaria CSV: separador, decimales españoles, duplicados
   assert.ok(allAlex.some((t) => t.concept === 'Movimiento privado CSV' && t.isPrivate));
   uA();
 });
+
+test('12. Catálogo de gastos habituales: siembra en hogar nuevo, idempotencia, no recrear borrados y efecto financiero cero si inactivos/0 €', async () => {
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'uid_alex', displayName: 'Alex', photoURL: '' };
+
+  let currentHousehold: Household | null = null;
+  let recurringList: RecurringExpense[] = [];
+  let txs: Transaction[] = [];
+
+  const uH = repo.subscribeHousehold('unused', (h) => {
+    currentHousehold = h;
+  });
+  const uR = repo.subscribeRecurring('unused', (r) => {
+    recurringList = r;
+  });
+  const uT = repo.subscribeTransactionsByMonth('unused', 'uid_alex', '2026-11', (list) => {
+    txs = list;
+  });
+
+  // 1) Crear hogar nuevo siembra automáticamente las 12 plantillas del catálogo a 0 € e inactivas, sin transacciones
+  const hid = await repo.createHousehold(actor, 'Piso Nuevo');
+  assert.equal(recurringList.length, RECURRING_CATALOG_PRESETS.length);
+  assert.equal(RECURRING_CATALOG_PRESETS.length, 12);
+  assert.equal(txs.length, 0);
+  const householdSnap = currentHousehold as Household | null;
+  assert.equal(householdSnap?.seedPending, false);
+  assert.equal(householdSnap?.recurringSeedVersion, RECURRING_CATALOG_SEED_VERSION);
+  assert.equal(repo.hasPendingDefaultSeed(), false);
+
+  for (const rec of recurringList) {
+    assert.equal(rec.amount, 0);
+    assert.equal(rec.active, false);
+    assert.equal(rec.paidByDefault, COMMON_ACCOUNT_ID);
+    assert.equal(rec.splitOverride, null);
+    assert.equal(isRecurringTemplatePending(rec), true);
+  }
+
+  // 2) Impacto financiero cero mientras estén inactivas / a 0 € (y también si alguna activa tuviera amount=0)
+  const sampleSettings: HouseholdSettings = {
+    splitMode: 'preset',
+    presetA: 50,
+    presetB: 50,
+    incomeA: 2200,
+    incomeB: 1800,
+    currency: 'EUR',
+  };
+  const recurringPlusActiveZero: RecurringExpense[] = [
+    ...recurringList,
+    {
+      ...recurringList[0],
+      id: 'rec_active_zero_guard',
+      amount: 0,
+      active: true,
+    },
+  ];
+  assert.equal(findMissingRecurringForMonth(recurringPlusActiveZero, [], '2026-11').length, 0);
+  assert.equal(getUpcomingCharges(recurringPlusActiveZero, '2026-11-01', 10).length, 0);
+  assert.equal(getUpcomingChargesWithinDays(recurringPlusActiveZero, '2026-11-01', 31, []).length, 0);
+  assert.equal(computeEmergencyTarget(recurringPlusActiveZero, 3), 0);
+  const capEmpty = computeSavingsCapacity(sampleSettings, recurringPlusActiveZero);
+  assert.equal(capEmpty.activeFixedMonthly, 0);
+  assert.equal(capEmpty.capacity, 4000);
+
+  // 3) Configurar Alquiler (850 €, activo) y dejar Comunidad inactiva
+  const alquilerSeed = recurringList.find((r) => r.id === 'seed_rec_alquiler')!;
+  const comunidadSeed = recurringList.find((r) => r.id === 'seed_rec_comunidad')!;
+  await repo.upsertRecurring(
+    hid,
+    {
+      ...alquilerSeed,
+      amount: 850,
+      active: true,
+      dayOfMonth: 5,
+    },
+    actor
+  );
+
+  // Impacto financiero real tras activar Alquiler
+  assert.equal(findMissingRecurringForMonth(recurringList, [], '2026-11').length, 1);
+  assert.equal(getUpcomingCharges(recurringList, '2026-11-03', 3).length, 1);
+  assert.equal(getUpcomingChargesWithinDays(recurringList, '2026-11-03', 3, []).length, 1);
+  assert.equal(computeEmergencyTarget(recurringList, 3), 2550);
+  const capWithRent = computeSavingsCapacity(sampleSettings, recurringList);
+  assert.equal(capWithRent.activeFixedMonthly, 850);
+  assert.equal(capWithRent.capacity, 3150);
+
+  // 4) Reintentar seedDefaultLists NO duplica ni sobrescribe Alquiler ni reactiva inactivas
+  const addedOnRetry = await repo.seedDefaultLists(hid, actor);
+  assert.equal(addedOnRetry, 0);
+  assert.equal(recurringList.length, 12);
+  const alquilerAfterRetry = recurringList.find((r) => r.id === 'seed_rec_alquiler')!;
+  assert.equal(alquilerAfterRetry.amount, 850);
+  assert.equal(alquilerAfterRetry.active, true);
+
+  // 5) Eliminar voluntariamente Comunidad y reintentar seedDefaultLists NO la recrea
+  await repo.deleteRecurring(hid, comunidadSeed.id, comunidadSeed.concept, actor);
+  assert.equal(recurringList.length, 11);
+  await repo.seedDefaultLists(hid, actor);
+  assert.equal(recurringList.length, 11);
+  assert.ok(!recurringList.some((r) => r.id === 'seed_rec_comunidad'));
+
+  // 6) En un hogar ya existente, addHabitualRecurringTemplates conserva las configuradas y solo añade las que faltan
+  const existingRepo = new DemoHouseholdRepository();
+  let existingRecs: RecurringExpense[] = [];
+  const uER = existingRepo.subscribeRecurring('demo_hogar_santsadurni', (r) => {
+    existingRecs = r;
+  });
+  // En Sant Sadurní ya existe "Alquiler piso" (alias de alquiler) y "Electricidad" (luz)
+  const rentPreset = RECURRING_CATALOG_PRESETS.find((p) => p.id === 'seed_rec_alquiler')!;
+  const lightPreset = RECURRING_CATALOG_PRESETS.find((p) => p.id === 'seed_rec_electricidad')!;
+  const waterPreset = RECURRING_CATALOG_PRESETS.find((p) => p.id === 'seed_rec_agua')!;
+  const musicPreset = RECURRING_CATALOG_PRESETS.find((p) => p.id === 'seed_rec_musica')!;
+  const cloudPreset = RECURRING_CATALOG_PRESETS.find((p) => p.id === 'seed_rec_nube')!;
+
+  assert.ok(findMatchingRecurringForPreset(rentPreset, existingRecs));
+  assert.ok(findMatchingRecurringForPreset(lightPreset, existingRecs));
+  assert.ok(findMatchingRecurringForPreset(waterPreset, existingRecs));
+  assert.equal(findMatchingRecurringForPreset(musicPreset, existingRecs), undefined);
+
+  const countBefore = existingRecs.length;
+  const addedHabitual = await existingRepo.addHabitualRecurringTemplates(
+    'demo_hogar_santsadurni',
+    [rentPreset, lightPreset, musicPreset, cloudPreset],
+    actor
+  );
+  assert.equal(addedHabitual, 2);
+  assert.equal(existingRecs.length, countBefore + 2);
+  const existingRent = existingRecs.find((r) => r.id === 'rec_rent')!;
+  assert.equal(existingRent.amount, 850);
+  assert.equal(existingRent.active, true);
+  const addedMusic = existingRecs.find((r) => r.id === 'seed_rec_musica')!;
+  assert.equal(addedMusic.amount, 0);
+  assert.equal(addedMusic.active, false);
+
+  // 7) Partidas variables son orientativas: ninguna pertenece al catálogo periódico y los items de "otros" comparten categoría
+  const otrosVar = VARIABLE_BUDGET_SUGGESTIONS.filter((v) => v.category === 'otros');
+  assert.equal(otrosVar.length, 5);
+  assert.ok(
+    VARIABLE_BUDGET_SUGGESTIONS.every(
+      (v) => !RECURRING_CATALOG_PRESETS.some((p) => p.id === v.id)
+    )
+  );
+  // El cálculo de saldo con lista de gastos vacía y 12 plantillas a 0 € sigue en paz (0 €)
+  const emptyBal = calculateCoupleBalance([], memberA, memberB);
+  assert.equal(emptyBal.totalSpent, 0);
+  assert.equal(emptyBal.owesDirection, 'peace');
+
+  uER();
+  uH();
+  uR();
+  uT();
+});
+
 
 

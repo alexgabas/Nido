@@ -929,5 +929,109 @@ test('11. Cualquier miembro puede actualizar settings (ingresos) y csvKeywords s
   );
 });
 
+test('12. seedPending / recurringSeedVersion en households y semillas inactivas de recurring', async () => {
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Fase A creando hogar con seedPending=true y recurringSeedVersion=0
+  const batchA = dbAlex.batch();
+  batchA.set(dbAlex.doc('invites/SEED01'), {
+    householdId: 'h_seed',
+    householdName: 'Nido Semilla',
+    createdBy: 'uid_alex',
+    memberCount: 1,
+    createdAt: ts,
+  });
+  batchA.set(dbAlex.doc('households/h_seed'), {
+    name: 'Nido Semilla',
+    memberUids: ['uid_alex'],
+    inviteCode: 'SEED01',
+    settings: {
+      splitMode: 'income',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 0,
+      incomeB: 0,
+      currency: 'EUR',
+    },
+    seedPending: true,
+    recurringSeedVersion: 0,
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  batchA.set(dbAlex.doc('households/h_seed/members/uid_alex'), {
+    displayName: 'Alex',
+    photoURL: '',
+    role: 'member_a',
+    uiMode: 'avanzado',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  batchA.set(dbAlex.doc('users/uid_alex'), { householdId: 'h_seed', updatedAt: ts });
+  await assertSucceeds(batchA.commit());
+
+  // Fase B creando plantilla habitual inactiva a 0 € y cerrando seedPending=false, recurringSeedVersion=1
+  const batchB = dbAlex.batch();
+  batchB.set(dbAlex.doc('households/h_seed/recurring/seed_rec_alquiler'), {
+    concept: 'Alquiler',
+    category: 'alquiler',
+    amount: 0,
+    frequency: 'mensual',
+    dayOfMonth: 1,
+    splitOverride: null,
+    paidByDefault: 'cuenta_comun',
+    active: false,
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  batchB.update(dbAlex.doc('households/h_seed'), {
+    seedPending: false,
+    recurringSeedVersion: 1,
+    updatedAt: ts,
+  });
+  await assertSucceeds(batchB.commit());
+
+  // Rechazar recurringSeedVersion negativo o float
+  await assertFails(
+    dbAlex.doc('households/h_seed').update({
+      recurringSeedVersion: -1,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h_seed').update({
+      recurringSeedVersion: 1.5,
+      updatedAt: ts,
+    })
+  );
+
+  // Rechazar seedPending no booleano
+  await assertFails(
+    dbAlex.doc('households/h_seed').update({
+      seedPending: 'false',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechazar mezclar seedPending con name/memberUids
+  await assertFails(
+    dbAlex.doc('households/h_seed').update({
+      seedPending: true,
+      name: 'Hack',
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso no puede modificar seedPending
+  await assertFails(
+    dbIntruder.doc('households/h_seed').update({
+      seedPending: true,
+      recurringSeedVersion: 0,
+      updatedAt: ts,
+    })
+  );
+});
+
 
 

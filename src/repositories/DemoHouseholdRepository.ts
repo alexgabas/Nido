@@ -11,6 +11,10 @@ import {
   DEFAULT_FURNITURE_ITEMS,
   DEFAULT_GOALS,
   DEFAULT_INITIAL_COSTS,
+  findMatchingRecurringForPreset,
+  RECURRING_CATALOG_PRESETS,
+  RECURRING_CATALOG_SEED_VERSION,
+  type RecurringCatalogPreset,
 } from '../domain/presets';
 import { COMMON_ACCOUNT_ID } from '../types/nido';
 import type {
@@ -187,6 +191,8 @@ function buildInitialDemoState(): DemoState {
         incomeB: 1800,
         currency: 'EUR',
       },
+      seedPending: false,
+      recurringSeedVersion: RECURRING_CATALOG_SEED_VERSION,
       createdAt: ts,
       updatedAt: ts,
     },
@@ -309,10 +315,69 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     return this.state.household.id;
   }
 
-  async createHousehold(_user: UserProfileInput, name: string): Promise<string> {
-    this.state.household.name = name.trim() || 'Mi hogar';
+  async createHousehold(user: UserProfileInput, name: string): Promise<string> {
+    const now = new Date().toISOString();
+    const hid = `demo_hogar_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const cleanName = name.trim() || 'Mi hogar';
+
+    this.state = {
+      household: {
+        id: hid,
+        name: cleanName,
+        memberUids: [user.uid],
+        inviteCode: code,
+        settings: {
+          splitMode: 'preset',
+          presetA: 50,
+          presetB: 50,
+          incomeA: 0,
+          incomeB: 0,
+          currency: 'EUR',
+        },
+        seedPending: true,
+        recurringSeedVersion: 0,
+        createdAt: now,
+        updatedAt: now,
+      },
+      members: [
+        {
+          uid: user.uid,
+          displayName: user.displayName || 'Usuario',
+          photoURL: user.photoURL || '',
+          role: 'member_a',
+          uiMode: 'sencillo',
+          joinedAt: now,
+          updatedAt: now,
+        },
+      ],
+      activity: [
+        {
+          id: `act_${Date.now()}`,
+          uid: user.uid,
+          actorName: user.displayName || 'Usuario',
+          action: 'create',
+          entity: 'hogar',
+          entityId: hid,
+          summary: `Creó el hogar "${cleanName}"`,
+          timestamp: now,
+        },
+      ],
+      initialCosts: [],
+      checklist: [],
+      items: [],
+      recurring: [],
+      transactions: [],
+      budgets: {},
+      monthClosures: [],
+      goals: [],
+      goalMovements: [],
+      shopping: [],
+    };
     this.emit();
-    return this.state.household.id;
+
+    await this.seedDefaultLists(hid, user, false);
+    return hid;
   }
 
   async joinHouseholdByCode(): Promise<string> {
@@ -320,10 +385,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   }
 
   hasPendingDefaultSeed(): boolean {
-    return false;
+    return Boolean(this.state.household.seedPending);
   }
 
-  async seedDefaultLists(_hid: string, actor: UserProfileInput): Promise<number> {
+  async seedDefaultLists(
+    _hid: string,
+    actor: UserProfileInput,
+    logActivityEntry = true
+  ): Promise<number> {
     const now = new Date().toISOString();
     let count = 0;
 
@@ -409,8 +478,43 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       }
     });
 
-    if (count > 0) {
+    const currentRecSeedVersion = this.state.household.recurringSeedVersion ?? 0;
+    if (currentRecSeedVersion < RECURRING_CATALOG_SEED_VERSION) {
+      for (const preset of RECURRING_CATALOG_PRESETS) {
+        if (findMatchingRecurringForPreset(preset, this.state.recurring)) continue;
+        this.state.recurring.push({
+          id: preset.id,
+          concept: preset.concept,
+          category: preset.category,
+          amount: 0,
+          frequency: preset.frequency,
+          dayOfMonth: 1,
+          splitOverride: null,
+          paidByDefault: COMMON_ACCOUNT_ID,
+          active: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        count++;
+      }
+    }
+
+    const needsFinalize =
+      Boolean(this.state.household.seedPending) ||
+      currentRecSeedVersion < RECURRING_CATALOG_SEED_VERSION;
+
+    if (count > 0 && logActivityEntry) {
       this.logActivity(actor, 'create', 'hogar', this.state.household.id, 'Cargó las listas iniciales por defecto');
+    }
+    if (needsFinalize) {
+      this.state.household = {
+        ...this.state.household,
+        seedPending: false,
+        recurringSeedVersion: Math.max(currentRecSeedVersion, RECURRING_CATALOG_SEED_VERSION),
+        updatedAt: now,
+      };
+    }
+    if (count > 0 || needsFinalize) {
       this.emit();
     }
     return count;
@@ -721,6 +825,49 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     }
     this.emit();
     return id;
+  }
+
+  async addHabitualRecurringTemplates(
+    _hid: string,
+    presets: readonly RecurringCatalogPreset[],
+    actor: UserProfileInput
+  ): Promise<number> {
+    if (presets.length === 0) return 0;
+    const now = new Date().toISOString();
+    let addedCount = 0;
+    const seenIds = new Set<string>();
+
+    for (const preset of presets) {
+      if (seenIds.has(preset.id)) continue;
+      seenIds.add(preset.id);
+      if (findMatchingRecurringForPreset(preset, this.state.recurring)) continue;
+      this.state.recurring.push({
+        id: preset.id,
+        concept: preset.concept,
+        category: preset.category,
+        amount: 0,
+        frequency: preset.frequency,
+        dayOfMonth: 1,
+        splitOverride: null,
+        paidByDefault: COMMON_ACCOUNT_ID,
+        active: false,
+        createdAt: now,
+        updatedAt: now,
+      });
+      addedCount++;
+    }
+
+    if (addedCount > 0) {
+      this.logActivity(
+        actor,
+        'create',
+        'recurrente',
+        presets[0].id,
+        `Añadió ${addedCount} ${addedCount === 1 ? 'plantilla habitual' : 'plantillas habituales'}`
+      );
+      this.emit();
+    }
+    return addedCount;
   }
 
   async deleteRecurring(_hid: string, id: string, concept: string, actor: UserProfileInput): Promise<void> {

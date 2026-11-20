@@ -38,6 +38,8 @@ export interface Household {
   inviteCode: string;
   settings: HouseholdSettings;
   csvKeywords?: CsvCategoryKeywords;
+  seedPending?: boolean;
+  recurringSeedVersion?: number;
   createdAt: string;
   updatedAt: string;
 }

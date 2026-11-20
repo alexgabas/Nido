@@ -93,6 +93,15 @@
           },
           "additionalProperties": false
         },
+        "seedPending": {
+          "type": "boolean",
+          "description": "True while Phase B default seeds (including inactive recurring catalog) are pending completion."
+        },
+        "recurringSeedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Version of the default recurring expense catalog already seeded for this household."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"

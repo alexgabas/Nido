@@ -35,6 +35,7 @@ import {
   getTodayLocalISO,
   getUpcomingCharges,
   getUpcomingChargesWithinDays,
+  isRecurringTemplatePending,
   localDaysBetween,
   roundCents,
   shiftMonthKey,
@@ -73,6 +74,7 @@ export const InicioView: React.FC = () => {
     setActiveTab,
     selectedMonthKey,
     setSelectedMonthKey,
+    openHabitualSetupInAvanzado,
     currentMonthBudget,
     recurring,
     currentMonthTransactions,
@@ -660,6 +662,42 @@ export const InicioView: React.FC = () => {
             </button>
           </section>
         )}
+
+        {(() => {
+          const hasPendingHabitual =
+            recurring.length === 0 || recurring.some((r) => isRecurringTemplatePending(r));
+          if (!hasPendingHabitual) return null;
+          return (
+            <section
+              aria-label="Revisar gastos habituales"
+              className="rounded-3xl bg-[#0E5A64]/6 dark:bg-[#2AA1AE]/10 border border-[#0E5A64]/20 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+            >
+              <div className="flex items-start gap-3 min-w-0">
+                <span className="w-10 h-10 rounded-xl bg-[#0E5A64]/15 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+                  <CalendarClock className="w-5 h-5" />
+                </span>
+                <div className="min-w-0 space-y-0.5">
+                  <p className="text-sm font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+                    Revisad vuestros gastos habituales para no olvidar nada
+                  </p>
+                  <p className="text-xs text-slate-600 dark:text-slate-300">
+                    {recurring.length === 0
+                      ? 'Añadid alquiler, luz o internet en un par de toques.'
+                      : 'Completad su importe cuando podáis; mientras sigan inactivos no cuentan en el saldo ni en el ahorro.'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void openHabitualSetupInAvanzado()}
+                className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 shrink-0"
+              >
+                <span>Revisar en modo Avanzado</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </section>
+          );
+        })()}
 
         {/* Large Navigation Cards for Shopping, Mudanza and Mensual */}
         <section aria-label="Accesos rápidos" className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">

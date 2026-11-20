@@ -130,7 +130,7 @@ service cloud.firestore {
 
     function isValidHousehold(data) {
       return data.keys().hasAll(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'seedPending', 'recurringSeedVersion', 'createdAt', 'updatedAt'])
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
         && data.memberUids is list
         && data.memberUids.size() >= 1 && data.memberUids.size() <= 2
@@ -139,6 +139,8 @@ service cloud.firestore {
         && isValidInviteCode(data.inviteCode)
         && isValidSettings(data.settings)
         && (!('csvKeywords' in data) || isValidCsvKeywords(data.csvKeywords))
+        && (!('seedPending' in data) || data.seedPending is bool)
+        && (!('recurringSeedVersion' in data) || (data.recurringSeedVersion is int && data.recurringSeedVersion >= 0 && data.recurringSeedVersion <= 1000))
         && data.createdAt is timestamp
         && data.updatedAt == request.time;
     }
@@ -406,6 +408,12 @@ service cloud.firestore {
           (
             (request.auth.uid in existing().memberUids)
             && incoming().diff(existing()).affectedKeys().hasOnly(['csvKeywords', 'updatedAt'])
+          )
+          ||
+          // Action 5: Update seedPending / recurringSeedVersion after Phase B seed completion
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['seedPending', 'recurringSeedVersion', 'updatedAt'])
           )
         );
 

@@ -327,6 +327,10 @@ export function monthlyEquivalent(amount: number, frequency: RecurrenceFrequency
   }
 }
 
+export function isRecurringTemplatePending(rec: RecurringExpense): boolean {
+  return !rec.active && (Number(rec.amount) || 0) <= 0;
+}
+
 export function findMissingRecurringForMonth(
   recurringList: RecurringExpense[],
   existingMonthTransactions: Transaction[],
@@ -337,7 +341,7 @@ export function findMissingRecurringForMonth(
   );
   const monthNum = Number(monthKey.split('-')[1]);
   return recurringList.filter((rec) => {
-    if (!rec.active) return false;
+    if (!rec.active || (Number(rec.amount) || 0) <= 0) return false;
     if (existingIds.has(rec.id)) return false;
     // Generate monthly items every month, and periodic items in matching cadence or always if user explicitly triggers?
     // Checking cadence: mensual = always, bimestral = odd months (or every 2), trimestral = 1,4,7,10, anual = 1.
@@ -373,7 +377,7 @@ export function getUpcomingCharges(
 
   const upcoming: UpcomingCharge[] = [];
   for (const rec of recurringList) {
-    if (!rec.active) continue;
+    if (!rec.active || (Number(rec.amount) || 0) <= 0) continue;
     const targetMonth = rec.dayOfMonth >= todayDay ? currentMonth : nextMonth;
     const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
     upcoming.push({
@@ -422,7 +426,7 @@ export function getUpcomingChargesWithinDays(
 
   const alerts: UpcomingAlertCharge[] = [];
   for (const rec of recurringList) {
-    if (!rec.active) continue;
+    if (!rec.active || (Number(rec.amount) || 0) <= 0) continue;
     const candidates = [currentMonth, nextMonth];
     for (const targetMonth of candidates) {
       const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
@@ -865,7 +869,7 @@ export function computeEmergencyTarget(
   months: 3 | 6
 ): number {
   const fixedMonthly = recurringList
-    .filter((r) => r.active)
+    .filter((r) => r.active && (Number(r.amount) || 0) > 0)
     .reduce((acc, r) => acc + monthlyEquivalent(r.amount, r.frequency), 0);
   return roundCents(fixedMonthly * months);
 }
@@ -910,7 +914,7 @@ export function computeSavingsCapacity(
   const totalIncome = roundCents(incomeA + incomeB);
   const activeFixedMonthly = roundCents(
     recurringList
-      .filter((r) => r.active)
+      .filter((r) => r.active && (Number(r.amount) || 0) > 0)
       .reduce((acc, r) => acc + monthlyEquivalent(r.amount, r.frequency), 0)
   );
 
