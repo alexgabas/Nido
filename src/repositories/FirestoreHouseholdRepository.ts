@@ -29,6 +29,7 @@ import {
   DEFAULT_FURNITURE_ITEMS,
   DEFAULT_GOALS,
   DEFAULT_INITIAL_COSTS,
+  EXPENSE_CATEGORY_LABELS,
 } from '../domain/presets';
 import { db, handleFirestoreError, OperationType } from '../services/firebase';
 import {
@@ -37,6 +38,8 @@ import {
   type ActivityAction,
   type ActivityEntry,
   type ChecklistItem,
+  type CsvCategoryKeywords,
+  type ExpenseCategory,
   type FurnitureItem,
   type FurnitureStatus,
   type GoalMovement,
@@ -49,11 +52,13 @@ import {
   type NidoBackupV1,
   type RecurringExpense,
   type SavingsGoal,
+  type ShoppingItem,
   type Transaction,
   type UiMode,
 } from '../types/nido';
 import {
   HouseholdSwitchConfirmationRequiredError,
+  type BankCsvImportItem,
   type HouseholdRepository,
   type JoinHouseholdOptions,
   type Unsubscribe,
@@ -95,8 +100,33 @@ function tsToIso(val: unknown): string {
   return new Date().toISOString();
 }
 
+function isoToFirestoreTimestamp(iso: unknown) {
+  if (typeof iso === 'string' && iso.trim()) {
+    const dt = new Date(iso);
+    if (Number.isFinite(dt.getTime())) {
+      const safeDate = dt.getTime() > Date.now() ? new Date() : dt;
+      return Timestamp.fromDate(safeDate);
+    }
+  }
+  return serverTimestamp();
+}
+
 function clampStr(v: string, max: number): string {
   return v.trim().slice(0, max);
+}
+
+function sanitizeCsvKeywords(kw: unknown): CsvCategoryKeywords | undefined {
+  if (!kw || typeof kw !== 'object' || Array.isArray(kw)) return undefined;
+  const clean: CsvCategoryKeywords = {};
+  let hasAny = false;
+  for (const cat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
+    const rawVal = (kw as Record<string, unknown>)[cat];
+    if (typeof rawVal === 'string') {
+      clean[cat] = rawVal.slice(0, MAX_LENGTHS.csvKeywordString);
+      hasAny = true;
+    }
+  }
+  return hasAny ? clean : undefined;
 }
 
 function generateInviteCode(): string {
@@ -110,6 +140,7 @@ function generateInviteCode(): string {
 
 function mapHousehold(id: string, d: DocumentData): Household {
   const { presetA, presetB } = normalizeSplitPair(d.settings?.presetA);
+  const csvKeywords = sanitizeCsvKeywords(d.csvKeywords);
   return {
     id,
     name: String(d.name ?? 'Mi hogar'),
@@ -123,6 +154,7 @@ function mapHousehold(id: string, d: DocumentData): Household {
       incomeB: Number(d.settings?.incomeB ?? 0),
       currency: 'EUR',
     },
+    ...(csvKeywords ? { csvKeywords } : {}),
     createdAt: tsToIso(d.createdAt),
     updatedAt: tsToIso(d.updatedAt),
   };
@@ -251,6 +283,18 @@ function mapGoalMovement(id: string, d: DocumentData): GoalMovement {
     date: String(d.date ?? ''),
     note: String(d.note ?? ''),
     createdAt: tsToIso(d.createdAt),
+  };
+}
+
+function mapShoppingItem(id: string, d: DocumentData): ShoppingItem {
+  return {
+    id,
+    text: String(d.text ?? ''),
+    qty: Math.max(1, Math.min(999, Math.round(Number(d.qty ?? 1)))),
+    done: Boolean(d.done),
+    addedBy: String(d.addedBy ?? ''),
+    createdAt: tsToIso(d.createdAt),
+    updatedAt: tsToIso(d.updatedAt),
   };
 }
 
@@ -949,19 +993,17 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
-  subscribeAllTransactions(
-    householdId: string,
-    viewerUid: string,
-    onData: (items: Transaction[]) => void,
-    onError: (e: Error) => void
-  ): Unsubscribe {
-    return this.subscribeVisibleTransactions(
-      householdId,
-      viewerUid,
-      () => true,
-      onData,
-      onError
-    );
+  async fetchAllTransactions(householdId: string, viewerUid: string): Promise<Transaction[]> {
+    const path = `households/${householdId}/transactions`;
+    try {
+      const txMap = await this.fetchVisibleTransactionsMap(householdId, viewerUid);
+      return Array.from(txMap.entries())
+        .map(([id, data]) => mapTransaction(id, data))
+        .filter((t) => !t.isPrivate || t.createdBy === viewerUid)
+        .sort((a, b) => b.date.localeCompare(a.date));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
   }
 
   subscribeBudget(
@@ -1075,6 +1117,32 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeShopping(
+    householdId: string,
+    onData: (items: ShoppingItem[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/shopping`;
+    return onSnapshot(
+      collection(db, 'households', householdId, 'shopping'),
+      (snap) =>
+        onData(
+          snap.docs
+            .map((d) => mapShoppingItem(d.id, d.data()))
+            .sort(
+              (a, b) => Number(a.done) - Number(b.done) || a.createdAt.localeCompare(b.createdAt)
+            )
+        ),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
   // ─── Mutations ─────────────────────────────────────────────────────────────
 
   async updateSettings(
@@ -1120,6 +1188,19 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       });
       this.addActivityToBatch(batch, householdId, actor, 'update', 'hogar', householdId, `Renombró el hogar a "${clean}"`);
       await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
+  async updateCsvKeywords(householdId: string, keywords: CsvCategoryKeywords): Promise<void> {
+    const path = `households/${householdId}`;
+    const clean = sanitizeCsvKeywords(keywords) ?? {};
+    try {
+      await updateDoc(doc(db, 'households', householdId), {
+        csvKeywords: clean,
+        updatedAt: serverTimestamp(),
+      });
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, path);
     }
@@ -1188,7 +1269,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         status: cost.status,
         dueDate: cost.dueDate,
         notes: clampStr(cost.notes, MAX_LENGTHS.notes),
-        createdAt: serverTimestamp(),
+        createdAt: isoToFirestoreTimestamp(cost.createdAt),
         updatedAt: serverTimestamp(),
       });
       this.addActivityToBatch(batch, householdId, actor, 'create', 'gasto_inicial', cost.id, `Restauró "${cost.concept}"`);
@@ -1611,7 +1692,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
   ): Promise<void> {
     const path = `households/${householdId}/transactions/${tx.id}`;
     const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
-    const safePaidBy = isPrivate ? actor.uid : normalizePayerValue(tx.paidBy);
+    const originalCreatedBy = tx.createdBy || actor.uid;
+    const safePaidBy = isPrivate ? originalCreatedBy : normalizePayerValue(tx.paidBy);
     try {
       const batch = writeBatch(db);
       batch.set(doc(db, 'households', householdId, 'transactions', tx.id), {
@@ -1626,9 +1708,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         isSettlement: isPrivate ? false : tx.isSettlement,
         settlementTo: isPrivate ? '' : tx.settlementTo,
         isPrivate,
-        createdBy: actor.uid,
+        createdBy: originalCreatedBy,
         notes: clampStr(tx.notes, MAX_LENGTHS.notes),
-        createdAt: serverTimestamp(),
+        createdAt: isoToFirestoreTimestamp(tx.createdAt),
         updatedAt: serverTimestamp(),
       });
       if (!isPrivate) {
@@ -1694,6 +1776,68 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       `households/${householdId}/transactions`,
       'No se pudieron eliminar los movimientos seleccionados.'
     );
+  }
+
+  async importBankTransactions(
+    householdId: string,
+    items: BankCsvImportItem[],
+    actor: UserProfileInput
+  ): Promise<number> {
+    if (items.length === 0) return 0;
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+    let sharedCount = 0;
+
+    for (const item of items) {
+      const ref = doc(collection(db, 'households', householdId, 'transactions'));
+      const isPrivate = Boolean(item.isPrivate);
+      if (!isPrivate) sharedCount += 1;
+      const safePaidBy = isPrivate ? actor.uid : normalizePayerValue(item.paidBy);
+      ops.push({
+        path: `households/${householdId}/transactions/${ref.id}`,
+        apply: (batch) =>
+          batch.set(ref, {
+            monthKey: item.monthKey,
+            concept: clampStr(item.concept, MAX_LENGTHS.concept) || 'Movimiento',
+            category: item.category,
+            amount: Math.max(0, Number(item.amount) || 0),
+            date: item.date,
+            paidBy: safePaidBy,
+            recurringId: null,
+            splitPctA: clampSplitPct(item.splitPctA, 50),
+            isSettlement: false,
+            settlementTo: '',
+            isPrivate,
+            createdBy: actor.uid,
+            notes: clampStr(item.notes || '', MAX_LENGTHS.notes),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    }
+
+    if (sharedCount > 0) {
+      ops.push({
+        path: `households/${householdId}/activity`,
+        apply: (batch) =>
+          this.addActivityToBatch(
+            batch,
+            householdId,
+            actor,
+            'import',
+            'gasto',
+            householdId,
+            `Importó ${sharedCount} movimientos desde CSV bancario`
+          ),
+      });
+    }
+
+    await this.commitBatchOps(
+      ops,
+      OperationType.CREATE,
+      `households/${householdId}/transactions`,
+      'No se pudieron importar los movimientos CSV.'
+    );
+    return items.length;
   }
 
   async saveBudget(
@@ -1821,6 +1965,55 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async deleteGoalWithMovements(
+    householdId: string,
+    id: string,
+    name: string,
+    actor: UserProfileInput
+  ): Promise<void> {
+    let movDocs;
+    try {
+      const q = query(
+        collection(db, 'households', householdId, 'goalMovements'),
+        where('goalId', '==', id)
+      );
+      movDocs = (await getDocs(q)).docs;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, `households/${householdId}/goalMovements`);
+    }
+
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> =
+      movDocs.map((mDoc) => ({
+        path: `households/${householdId}/goalMovements/${mDoc.id}`,
+        apply: (batch) => batch.delete(mDoc.ref),
+      }));
+
+    ops.push({
+      path: `households/${householdId}/goals/${id}`,
+      apply: (batch) => batch.delete(doc(db, 'households', householdId, 'goals', id)),
+    });
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (batch) =>
+        this.addActivityToBatch(
+          batch,
+          householdId,
+          actor,
+          'delete',
+          'meta',
+          id,
+          `Eliminó meta "${name}" y sus ${movDocs.length} movimientos`
+        ),
+    });
+
+    await this.commitBatchOps(
+      ops,
+      OperationType.DELETE,
+      `households/${householdId}/goals/${id}`,
+      'No se pudo eliminar la meta y sus movimientos.'
+    );
+  }
+
   async addGoalMovement(
     householdId: string,
     movement: Omit<GoalMovement, 'id' | 'createdAt'>,
@@ -1874,6 +2067,64 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async upsertShoppingItem(
+    householdId: string,
+    item: { id?: string; text: string; qty: number; done: boolean },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const id = item.id || doc(collection(db, 'households', householdId, 'shopping')).id;
+    const path = `households/${householdId}/shopping/${id}`;
+    const cleanText = clampStr(item.text, MAX_LENGTHS.shoppingText);
+    const cleanQty = Math.max(1, Math.min(999, Math.round(Number(item.qty) || 1)));
+    try {
+      const ref = doc(db, 'households', householdId, 'shopping', id);
+      if (item.id) {
+        await updateDoc(ref, {
+          text: cleanText,
+          qty: cleanQty,
+          done: Boolean(item.done),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(ref, {
+          text: cleanText,
+          qty: cleanQty,
+          done: Boolean(item.done),
+          addedBy: actor.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      return id;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async deleteShoppingItem(householdId: string, id: string): Promise<void> {
+    const path = `households/${householdId}/shopping/${id}`;
+    try {
+      await deleteDoc(doc(db, 'households', householdId, 'shopping', id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
+  async deleteShoppingItemsBulk(householdId: string, ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const ops = ids.map((id) => ({
+      path: `households/${householdId}/shopping/${id}`,
+      apply: (batch: ReturnType<typeof writeBatch>) =>
+        batch.delete(doc(db, 'households', householdId, 'shopping', id)),
+    }));
+    await this.commitBatchOps(
+      ops,
+      OperationType.DELETE,
+      `households/${householdId}/shopping`,
+      'No se pudieron limpiar los productos marcados de la lista.'
+    );
+  }
+
   private async fetchVisibleTransactionsMap(
     householdId: string,
     viewerUid: string
@@ -1891,7 +2142,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
   async exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1> {
     try {
-      const [hSnap, icSnap, clSnap, itSnap, recSnap, txMap, budSnap, mcSnap, gSnap, gmSnap] =
+      const [hSnap, icSnap, clSnap, itSnap, recSnap, txMap, budSnap, mcSnap, gSnap, gmSnap, shopSnap] =
         await Promise.all([
           getDoc(doc(db, 'households', householdId)),
           getDocs(collection(db, 'households', householdId, 'initialCosts')),
@@ -1903,6 +2154,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           getDocs(collection(db, 'households', householdId, 'monthClosures')),
           getDocs(collection(db, 'households', householdId, 'goals')),
           getDocs(collection(db, 'households', householdId, 'goalMovements')),
+          getDocs(collection(db, 'households', householdId, 'shopping')),
         ]);
 
       const hData = hSnap.exists() ? mapHousehold(hSnap.id, hSnap.data()) : null;
@@ -1919,6 +2171,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           incomeB: 0,
           currency: 'EUR',
         },
+        ...(hData?.csvKeywords ? { csvKeywords: hData.csvKeywords } : {}),
         initialCosts: icSnap.docs.map((d) => {
           const { createdAt: _c, updatedAt: _u, ...rest } = mapInitialCost(d.id, d.data());
           return rest;
@@ -1965,6 +2218,10 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           const { createdAt: _c, ...rest } = mapGoalMovement(d.id, d.data());
           return rest;
         }),
+        shopping: shopSnap.docs.map((d) => {
+          const { createdAt: _c, updatedAt: _u, ...rest } = mapShoppingItem(d.id, d.data());
+          return rest;
+        }),
       };
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
@@ -1978,9 +2235,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
   ): Promise<void> {
     const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
 
-    let hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx;
+    let hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx;
     try {
-      [hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx] = await Promise.all([
+      [hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx] = await Promise.all([
         getDoc(doc(db, 'households', householdId)),
         getDocs(collection(db, 'households', householdId, 'initialCosts')),
         getDocs(collection(db, 'households', householdId, 'checklist')),
@@ -1991,6 +2248,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         getDocs(collection(db, 'households', householdId, 'monthClosures')),
         getDocs(collection(db, 'households', householdId, 'goals')),
         getDocs(collection(db, 'households', householdId, 'goalMovements')),
+        getDocs(collection(db, 'households', householdId, 'shopping')),
       ]);
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
@@ -2021,6 +2279,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const mcSet = existsSet(mcEx);
     const gSet = existsSet(gEx);
     const gmSet = existsSet(gmEx);
+    const shopSet = existsSet(shopEx);
 
     const { presetA, presetB } = normalizeSplitPair(backup.settings.presetA);
     ops.push({
@@ -2037,6 +2296,17 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           updatedAt: serverTimestamp(),
         }),
     });
+    if (backup.csvKeywords) {
+      const cleanKw = sanitizeCsvKeywords(backup.csvKeywords) ?? {};
+      ops.push({
+        path: `households/${householdId}`,
+        apply: (b) =>
+          b.update(doc(db, 'households', householdId), {
+            csvKeywords: cleanKw,
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    }
 
     for (const item of backup.initialCosts) {
       const { id, ...fields } = item;
@@ -2193,6 +2463,34 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         ops.push({
           path: `households/${householdId}/goalMovements/${id}`,
           apply: (b) => b.set(ref, { ...fields, by: safeBy, createdAt: serverTimestamp() }),
+        });
+      }
+    }
+
+    if (Array.isArray(backup.shopping)) {
+      for (const item of backup.shopping) {
+        const { id, text, qty, done, addedBy } = item;
+        const safeAddedBy = resolveMemberUid(addedBy);
+        const cleanQty = Math.max(1, Math.min(999, Math.round(Number(qty) || 1)));
+        const ref = doc(db, 'households', householdId, 'shopping', id);
+        ops.push({
+          path: `households/${householdId}/shopping/${id}`,
+          apply: (b) =>
+            shopSet.has(id)
+              ? b.update(ref, {
+                  text: clampStr(text, MAX_LENGTHS.shoppingText) || 'Producto',
+                  qty: cleanQty,
+                  done: Boolean(done),
+                  updatedAt: serverTimestamp(),
+                })
+              : b.set(ref, {
+                  text: clampStr(text, MAX_LENGTHS.shoppingText) || 'Producto',
+                  qty: cleanQty,
+                  done: Boolean(done),
+                  addedBy: safeAddedBy,
+                  createdAt: serverTimestamp(),
+                  updatedAt: serverTimestamp(),
+                }),
         });
       }
     }

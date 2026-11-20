@@ -58,9 +58,6 @@ export const MudanzaView: React.FC = () => {
     initialCosts,
     checklist,
     furnitureItems,
-    monthTransactions,
-    goals,
-    goalMovements,
     repo,
     showToast,
     scheduleUndo,
@@ -346,11 +343,11 @@ export const MudanzaView: React.FC = () => {
       members,
       fromDate: today.slice(0, 7) + '-01',
       toDate: today,
-      transactions: monthTransactions,
+      transactions: [],
       initialCosts,
       items: furnitureItems,
-      goals,
-      goalMovements,
+      goals: [],
+      goalMovements: [],
     });
     showToast('PDF de mudanza descargado');
   };
@@ -439,7 +436,7 @@ export const MudanzaView: React.FC = () => {
                         type="button"
                         aria-label={`Eliminar ${item.name}`}
                         onClick={() => setDeleteTarget({ kind: 'furniture', item })}
-                        className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                        className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
@@ -531,52 +528,61 @@ export const MudanzaView: React.FC = () => {
               </button>
             </form>
 
-            {groupedChecklist.map(([groupName, groupItems]) => (
-              <div
-                key={groupName}
-                className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3"
-              >
-                <h3 className="font-display text-sm font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                  {groupName}
-                </h3>
-                <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {groupItems.map((task) => (
-                    <li key={task.id} className="py-3 first:pt-0 last:pb-0 flex items-start justify-between gap-2">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          householdId &&
-                          currentUserProfile &&
-                          void repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile)
-                        }
-                        className="flex items-start gap-3 text-left flex-1 min-h-[46px] py-1"
-                      >
-                        {task.done ? (
-                          <CheckSquare className="w-5 h-5 text-[#15803D] dark:text-[#4ADE80] shrink-0 mt-0.5" />
-                        ) : (
-                          <Square className="w-5 h-5 text-slate-400 shrink-0 mt-0.5" />
-                        )}
-                        <span
-                          className={`text-sm leading-snug block ${
-                            task.done ? 'line-through text-slate-400' : ''
-                          }`}
-                        >
-                          {task.text}
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Eliminar tarea ${task.text}`}
-                        onClick={() => setDeleteTarget({ kind: 'checklist', id: task.id, text: task.text })}
-                        className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+            {groupedChecklist.length === 0 ? (
+              <div className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
+                <p className="text-base font-bold">Sin tareas en el checklist</p>
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  Apunta aquí arriba los trámites, llaves o compras que os queden pendientes.
+                </p>
               </div>
-            ))}
+            ) : (
+              groupedChecklist.map(([groupName, groupItems]) => (
+                <div
+                  key={groupName}
+                  className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3"
+                >
+                  <h3 className="font-display text-sm font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
+                    {groupName}
+                  </h3>
+                  <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {groupItems.map((task) => (
+                      <li key={task.id} className="py-3 first:pt-0 last:pb-0 flex items-start justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            householdId &&
+                            currentUserProfile &&
+                            void repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile)
+                          }
+                          className="flex items-start gap-3 text-left flex-1 min-h-[46px] py-1"
+                        >
+                          {task.done ? (
+                            <CheckSquare className="w-5 h-5 text-[#15803D] dark:text-[#4ADE80] shrink-0 mt-0.5" />
+                          ) : (
+                            <Square className="w-5 h-5 text-slate-500 dark:text-slate-400 shrink-0 mt-0.5" />
+                          )}
+                          <span
+                            className={`text-sm leading-snug block ${
+                              task.done ? 'line-through text-slate-500 dark:text-slate-400' : ''
+                            }`}
+                          >
+                            {task.text}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Eliminar tarea ${task.text}`}
+                          onClick={() => setDeleteTarget({ kind: 'checklist', id: task.id, text: task.text })}
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))
+            )}
           </div>
         )}
 
@@ -727,7 +733,7 @@ export const MudanzaView: React.FC = () => {
             </div>
             <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-4">
               <p className="text-xs text-slate-500 dark:text-slate-400">Pendiente</p>
-              <p className="font-display text-xl font-bold tabular-nums mt-1 text-[#DC4C3E]">
+              <p className="font-display text-xl font-bold tabular-nums mt-1 text-[#B42318] dark:text-[#FCA5A5]">
                 {formatEUR(costSummary.totalPending)}
               </p>
             </div>
@@ -805,7 +811,7 @@ export const MudanzaView: React.FC = () => {
                           currentUserProfile
                         )
                       }
-                      className={`min-h-[40px] px-3 rounded-xl text-xs font-semibold transition-colors ${
+                      className={`min-h-[44px] px-3 rounded-xl text-xs font-semibold transition-colors ${
                         c.status === 'pagado'
                           ? 'bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80]'
                           : 'bg-amber-500/15 text-amber-800 dark:text-amber-300'
@@ -817,7 +823,7 @@ export const MudanzaView: React.FC = () => {
                       type="button"
                       aria-label={`Editar ${c.concept}`}
                       onClick={() => openCostModal(c)}
-                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                     >
                       <Pencil className="w-4 h-4" />
                     </button>
@@ -825,7 +831,7 @@ export const MudanzaView: React.FC = () => {
                       type="button"
                       aria-label={`Eliminar ${c.concept}`}
                       onClick={() => setDeleteTarget({ kind: 'cost', item: c })}
-                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E] hover:bg-slate-100 dark:hover:bg-slate-800"
+                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5] hover:bg-slate-100 dark:hover:bg-slate-800"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
@@ -900,59 +906,78 @@ export const MudanzaView: React.FC = () => {
             </button>
           </form>
 
-          {groupedChecklist.map(([groupName, groupItems]) => (
-            <div
-              key={groupName}
-              className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3"
-            >
-              <h3 className="font-display text-sm font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                {groupName}
-              </h3>
-              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-                {groupItems.map((task) => (
-                  <li key={task.id} className="py-3 first:pt-0 last:pb-0 flex items-start justify-between gap-2">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        householdId &&
-                        currentUserProfile &&
-                        void repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile)
-                      }
-                      className="flex items-start gap-3 text-left flex-1 min-h-[44px] py-1"
-                    >
-                      {task.done ? (
-                        <CheckSquare className="w-5 h-5 text-[#15803D] dark:text-[#4ADE80] shrink-0 mt-0.5" />
-                      ) : (
-                        <Square className="w-5 h-5 text-slate-400 shrink-0 mt-0.5" />
-                      )}
-                      <div className="space-y-0.5">
-                        <span
-                          className={`text-sm leading-snug block ${
-                            task.done ? 'line-through text-slate-400' : ''
-                          }`}
-                        >
-                          {task.text}
-                        </span>
-                        {task.done && (
-                          <span className="text-xs text-slate-500 dark:text-slate-400 block">
-                            Hecho por {memberLabel(task.doneBy)} · {formatDateES(task.doneAt)}
-                          </span>
-                        )}
-                      </div>
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Eliminar tarea ${task.text}`}
-                      onClick={() => setDeleteTarget({ kind: 'checklist', id: task.id, text: task.text })}
-                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </li>
-                ))}
-              </ul>
+          {groupedChecklist.length === 0 ? (
+            <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-3">
+              <p className="text-sm font-semibold">No hay tareas en el checklist</p>
+              <p className="text-xs text-slate-600 dark:text-slate-300">
+                Añade tareas arriba o vuelve a cargar el checklist legal por defecto.
+              </p>
+              <div className="pt-1">
+                <button
+                  type="button"
+                  disabled={seedingDefaults}
+                  onClick={() => void retryDefaultSeed()}
+                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-60"
+                >
+                  {seedingDefaults ? 'Cargando listas...' : 'Cargar listas por defecto'}
+                </button>
+              </div>
             </div>
-          ))}
+          ) : (
+            groupedChecklist.map(([groupName, groupItems]) => (
+              <div
+                key={groupName}
+                className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3"
+              >
+                <h3 className="font-display text-sm font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
+                  {groupName}
+                </h3>
+                <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {groupItems.map((task) => (
+                    <li key={task.id} className="py-3 first:pt-0 last:pb-0 flex items-start justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          householdId &&
+                          currentUserProfile &&
+                          void repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile)
+                        }
+                        className="flex items-start gap-3 text-left flex-1 min-h-[44px] py-1"
+                      >
+                        {task.done ? (
+                          <CheckSquare className="w-5 h-5 text-[#15803D] dark:text-[#4ADE80] shrink-0 mt-0.5" />
+                        ) : (
+                          <Square className="w-5 h-5 text-slate-500 dark:text-slate-400 shrink-0 mt-0.5" />
+                        )}
+                        <div className="space-y-0.5">
+                          <span
+                            className={`text-sm leading-snug block ${
+                              task.done ? 'line-through text-slate-500 dark:text-slate-400' : ''
+                            }`}
+                          >
+                            {task.text}
+                          </span>
+                          {task.done && (
+                            <span className="text-xs text-slate-500 dark:text-slate-400 block">
+                              Hecho por {memberLabel(task.doneBy)} · {formatDateES(task.doneAt)}
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Eliminar tarea ${task.text}`}
+                        onClick={() => setDeleteTarget({ kind: 'checklist', id: task.id, text: task.text })}
+                        className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))
+          )}
         </div>
       )}
 
@@ -962,7 +987,7 @@ export const MudanzaView: React.FC = () => {
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-4">
               <p className="text-xs text-slate-500 dark:text-slate-400">Presupuesto pendiente</p>
-              <p className="font-display text-xl font-bold tabular-nums mt-1 text-[#DC4C3E]">
+              <p className="font-display text-xl font-bold tabular-nums mt-1 text-[#B42318] dark:text-[#FCA5A5]">
                 {formatEUR(furnitureSummary.totalPending)}
               </p>
             </div>
@@ -989,7 +1014,7 @@ export const MudanzaView: React.FC = () => {
           <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-4 space-y-3">
             <div className="flex flex-col md:flex-row gap-2.5">
               <div className="relative flex-1">
-                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <Search className="w-4 h-4 text-slate-500 dark:text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
                   type="search"
                   aria-label="Buscar muebles"
@@ -1015,7 +1040,7 @@ export const MudanzaView: React.FC = () => {
                 aria-label="Filtrar por estancia"
                 value={roomFilter}
                 onChange={(e) => setRoomFilter(e.target.value as FurnitureRoom | 'todas')}
-                className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
               >
                 <option value="todas">Todas las estancias</option>
                 {(Object.keys(ROOM_LABELS) as FurnitureRoom[]).map((r) => (
@@ -1029,7 +1054,7 @@ export const MudanzaView: React.FC = () => {
                 aria-label="Filtrar por prioridad"
                 value={priorityFilter}
                 onChange={(e) => setPriorityFilter(e.target.value as FurniturePriority | 'todas')}
-                className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
               >
                 <option value="todas">Todas las prioridades</option>
                 {(Object.keys(PRIORITY_LABELS) as FurniturePriority[]).map((p) => (
@@ -1043,7 +1068,7 @@ export const MudanzaView: React.FC = () => {
                 aria-label="Filtrar por estado"
                 value={statusFilter}
                 onChange={(e) => setStatusFilter(e.target.value as FurnitureStatus | 'todos')}
-                className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
               >
                 <option value="todos">Todos los estados</option>
                 {(Object.keys(FURNITURE_STATUS_LABELS) as FurnitureStatus[]).map((s) => (
@@ -1058,7 +1083,7 @@ export const MudanzaView: React.FC = () => {
                   aria-label="Ordenar mobiliario"
                   value={sortField}
                   onChange={(e) => setSortField(e.target.value as FurnitureSortField)}
-                  className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                  className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
                 >
                   <option value="room">Ordenar: Estancia</option>
                   <option value="name">Ordenar: Nombre</option>
@@ -1069,7 +1094,7 @@ export const MudanzaView: React.FC = () => {
                   type="button"
                   aria-label="Invertir orden"
                   onClick={() => setSortAsc((prev) => !prev)}
-                  className="min-h-[40px] min-w-[40px] rounded-xl border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300"
+                  className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300"
                 >
                   <ArrowUpDown className="w-4 h-4" />
                 </button>
@@ -1079,7 +1104,7 @@ export const MudanzaView: React.FC = () => {
             {/* Bulk toolbar */}
             {filteredFurniture.length > 0 && (
               <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs">
-                <label className="flex items-center gap-2 cursor-pointer font-medium">
+                <label className="flex items-center gap-2 cursor-pointer font-medium min-h-[44px]">
                   <input
                     type="checkbox"
                     checked={allVisibleSelected}
@@ -1099,7 +1124,7 @@ export const MudanzaView: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => setBulkDeleteConfirmOpen(true)}
-                    className="min-h-[36px] px-3 rounded-xl bg-[#DC4C3E] text-white font-semibold flex items-center gap-1.5"
+                    className="min-h-[44px] px-3.5 rounded-xl bg-[#B42318] hover:bg-[#912018] text-white font-semibold flex items-center gap-1.5"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Eliminar seleccionados ({selectedFurnitureIds.size})</span>
@@ -1171,7 +1196,7 @@ export const MudanzaView: React.FC = () => {
                               setInlineFurQty(String(item.qty));
                             }
                           }}
-                          className="font-mono-num text-sm font-bold px-2 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
+                          className="min-h-[44px] font-mono-num text-sm font-bold px-2.5 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
                         >
                           {item.unitPrice > 0 ? formatEUR(lineTotal) : 'Sin precio'}
                         </button>
@@ -1179,7 +1204,7 @@ export const MudanzaView: React.FC = () => {
                           type="button"
                           aria-label={`Editar ${item.name}`}
                           onClick={() => openFurnitureModal(item)}
-                          className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                         >
                           <Pencil className="w-4 h-4" />
                         </button>
@@ -1187,7 +1212,7 @@ export const MudanzaView: React.FC = () => {
                           type="button"
                           aria-label={`Eliminar ${item.name}`}
                           onClick={() => setDeleteTarget({ kind: 'furniture', item })}
-                          className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -1203,7 +1228,7 @@ export const MudanzaView: React.FC = () => {
                             inputMode="decimal"
                             value={inlineFurPrice}
                             onChange={(e) => setInlineFurPrice(e.target.value)}
-                            className="w-24 min-h-[38px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] font-mono-num text-xs"
+                            className="w-24 min-h-[44px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] font-mono-num text-xs"
                           />
                         </div>
                         <div>
@@ -1214,20 +1239,20 @@ export const MudanzaView: React.FC = () => {
                             max={999}
                             value={inlineFurQty}
                             onChange={(e) => setInlineFurQty(e.target.value)}
-                            className="w-16 min-h-[38px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs"
+                            className="w-16 min-h-[44px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs"
                           />
                         </div>
                         <button
                           type="button"
                           onClick={() => void handleSaveInlineFurniture(item)}
-                          className="min-h-[38px] px-3 rounded-lg bg-[#0E5A64] text-white text-xs font-semibold"
+                          className="min-h-[44px] px-3.5 rounded-lg bg-[#0E5A64] text-white text-xs font-semibold"
                         >
                           Guardar
                         </button>
                         <button
                           type="button"
                           onClick={() => setInlineFurId(null)}
-                          className="min-h-[38px] px-3 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium"
+                          className="min-h-[44px] px-3.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium"
                         >
                           Cancelar
                         </button>
@@ -1247,7 +1272,7 @@ export const MudanzaView: React.FC = () => {
                               currentUserProfile &&
                               void repo.updateFurnitureStatus(householdId, item, st, currentUserProfile)
                             }
-                            className={`min-h-[40px] px-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-1 whitespace-nowrap ${
+                            className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-1 whitespace-nowrap ${
                               active
                                 ? st === 'comprado' || st === 'ya_lo_tenemos'
                                   ? 'bg-[#15803D] text-white'
@@ -1270,7 +1295,7 @@ export const MudanzaView: React.FC = () => {
                         href={buildIkeaSearchUrl(item.name)}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
+                        className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
                       >
                         <ExternalLink className="w-3.5 h-3.5" />
                         <span>Buscar en IKEA</span>
@@ -1280,7 +1305,7 @@ export const MudanzaView: React.FC = () => {
                           href={item.productUrl}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700 inline-flex items-center gap-1.5"
+                          className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700 inline-flex items-center gap-1.5"
                         >
                           <ExternalLink className="w-3.5 h-3.5" />
                           <span>Ver ficha guardada</span>

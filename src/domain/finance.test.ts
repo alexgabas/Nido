@@ -9,6 +9,7 @@ import {
   computeEmergencyTarget,
   computeFurnitureSummary,
   computeGoalProgress,
+  computeSavingsCapacity,
   filterGlobalTransactions,
   findMissingRecurringForMonth,
   formatCoupleBalanceSecondPerson,
@@ -21,6 +22,15 @@ import {
   monthlyEquivalent,
   resolveSplitPctForChoice,
 } from './finance';
+import {
+  buildParsedBankRows,
+  detectCsvDelimiter,
+  guessCsvColumns,
+  matchCategoryFromKeywords,
+  parseBankAmount,
+  parseBankDateToISO,
+  parseCsvMatrix,
+} from './csvImport';
 import { generateSpanishCSV, validateAndMigrateBackup } from './backup';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import type {
@@ -489,33 +499,63 @@ test('computeCategoryComparison compara mes actual vs anterior y media de 6 mese
   assert.equal(ocioRow.vsAvg6Dir, 'flat');
 });
 
-test('avisos en Inicio: umbral >80% de presupuesto y cargos recurrentes en próximos 3 días (incluyendo cambio de mes)', () => {
+test('avisos en Inicio: presupuesto (excluye solo recurrentes salvo >100% y distingue 80-99, =100, >100) y cargos en 3 días', () => {
   const txs: Transaction[] = [
-    // 80 exactos sobre 100 => NO debe saltar (>80% estricto)
-    makeTx({ id: 'b1', category: 'luz', amount: 80 }),
-    // 85 sobre 100 => SÍ salta (85%, no superado)
-    makeTx({ id: 'b2', category: 'supermercado', amount: 85 }),
-    // 110 sobre 100 => SÍ salta (110%, superado)
-    makeTx({ id: 'b3', category: 'ocio', amount: 110 }),
+    // 79 sobre 100 (no recurrente) => NO salta
+    makeTx({ id: 'b_79', category: 'transporte', amount: 79 }),
+    // 80 exactos sobre 100 (no recurrente) => SÍ salta (tramo 80-99 %)
+    makeTx({ id: 'b_80', category: 'otros', amount: 80 }),
+    // 100 exactos sobre 100 (no recurrente) => SÍ salta (=100 %)
+    makeTx({ id: 'b_100', category: 'supermercado', amount: 100 }),
+    // 110 sobre 100 (no recurrente) => SÍ salta (>100 %, overAmount = 10)
+    makeTx({ id: 'b_110', category: 'ocio', amount: 110 }),
+    // 850 sobre 850 SOLO plantilla recurrente => NO salta
+    makeTx({ id: 'b_rent', category: 'alquiler', amount: 850, recurringId: 'rec_rent' }),
+    // 48 sobre 50 (96%) SOLO plantilla recurrente => NO salta
+    makeTx({ id: 'b_net', category: 'internet', amount: 48, recurringId: 'rec_net' }),
+    // 105 sobre 100 (105%) SOLO plantilla recurrente => SÍ salta (>100 %)
+    makeTx({ id: 'b_ins', category: 'seguros', amount: 105, recurringId: 'rec_ins' }),
+    // Mixto (60 recurrente + 25 manual = 85%) => SÍ salta (no es solo de plantillas)
+    makeTx({ id: 'b_luz_rec', category: 'luz', amount: 60, recurringId: 'rec_luz' }),
+    makeTx({ id: 'b_luz_man', category: 'luz', amount: 25, recurringId: null }),
     // 50 privados en agua + 50 compartidos sobre 100 => 50% (NO salta)
-    makeTx({ id: 'b4', category: 'agua', amount: 50 }),
-    makeTx({ id: 'b5', category: 'agua', amount: 50, isPrivate: true }),
+    makeTx({ id: 'b_w1', category: 'agua', amount: 50 }),
+    makeTx({ id: 'b_w2', category: 'agua', amount: 50, isPrivate: true }),
   ];
 
   const budgetAlerts = getBudgetThresholdAlerts(
     txs,
     {
       monthKey: '2026-11',
-      limits: { luz: 100, supermercado: 100, ocio: 100, agua: 100 },
+      limits: {
+        transporte: 100,
+        otros: 100,
+        supermercado: 100,
+        ocio: 100,
+        alquiler: 850,
+        internet: 50,
+        seguros: 100,
+        luz: 100,
+        agua: 100,
+      },
       updatedAt: '',
     },
     80
   );
   assert.deepEqual(
-    budgetAlerts.map((a) => ({ category: a.category, pct: a.pct, exceeded: a.exceeded })),
+    budgetAlerts.map((a) => ({
+      category: a.category,
+      pct: a.pct,
+      atLimit: a.atLimit,
+      exceeded: a.exceeded,
+      overAmount: a.overAmount,
+    })),
     [
-      { category: 'ocio', pct: 110, exceeded: true },
-      { category: 'supermercado', pct: 85, exceeded: false },
+      { category: 'ocio', pct: 110, atLimit: false, exceeded: true, overAmount: 10 },
+      { category: 'seguros', pct: 105, atLimit: false, exceeded: true, overAmount: 5 },
+      { category: 'supermercado', pct: 100, atLimit: true, exceeded: false, overAmount: 0 },
+      { category: 'luz', pct: 85, atLimit: false, exceeded: false, overAmount: 0 },
+      { category: 'otros', pct: 80, atLimit: false, exceeded: false, overAmount: 0 },
     ]
   );
 
@@ -578,17 +618,12 @@ test('avisos en Inicio: umbral >80% de presupuesto y cargos recurrentes en próx
     makeTx({ id: 'tx_dec_rent', monthKey: '2026-12', recurringId: 'r_day1', date: '2026-12-01' }),
   ];
 
+  // A4: r_day1 ya tiene transacción en diciembre (existingDecTx), así que NO debe aparecer en los avisos
   const upcoming = getUpcomingChargesWithinDays(recs, '2026-11-29', 3, existingDecTx);
-  assert.equal(upcoming.length, 2);
+  assert.equal(upcoming.length, 1);
   assert.equal(upcoming[0].recurringId, 'r_day31');
   assert.equal(upcoming[0].dueDate, '2026-11-30');
   assert.equal(upcoming[0].daysUntil, 1);
-  assert.equal(upcoming[0].alreadyGenerated, false);
-
-  assert.equal(upcoming[1].recurringId, 'r_day1');
-  assert.equal(upcoming[1].dueDate, '2026-12-01');
-  assert.equal(upcoming[1].daysUntil, 2);
-  assert.equal(upcoming[1].alreadyGenerated, true);
 });
 
 test('backup JSON round-trip conserva isPrivate y createdBy y migra copias antiguas', () => {
@@ -801,8 +836,6 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
   const actorMarta = { uid: 'demo_marta', displayName: 'Marta', photoURL: '' };
   let latestAlexMonthIds: string[] = [];
   let latestMartaMonthIds: string[] = [];
-  let latestAlexAllIds: string[] = [];
-  let latestMartaAllIds: string[] = [];
   let latestFurnitureIds: string[] = [];
   let latestActivityCount = 0;
   let latestZeroTxSplit: number | undefined;
@@ -823,20 +856,6 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
     '2026-11',
     (txs) => {
       latestMartaMonthIds = txs.map((t) => t.id);
-    }
-  );
-  const unsubAllAlex = repo.subscribeAllTransactions(
-    'demo_hogar_santsadurni',
-    'demo_alex',
-    (txs) => {
-      latestAlexAllIds = txs.map((t) => t.id);
-    }
-  );
-  const unsubAllMarta = repo.subscribeAllTransactions(
-    'demo_hogar_santsadurni',
-    'demo_marta',
-    (txs) => {
-      latestMartaAllIds = txs.map((t) => t.id);
     }
   );
   const unsubActivity = repo.subscribeActivity('demo_hogar_santsadurni', 50, (acts) => {
@@ -912,8 +931,10 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
   assert.equal(latestActivityCount, activityBeforePriv);
   assert.ok(latestAlexMonthIds.includes(privAlexId));
   assert.ok(!latestMartaMonthIds.includes(privAlexId));
-  assert.ok(latestAlexAllIds.includes(privAlexId));
-  assert.ok(!latestMartaAllIds.includes(privAlexId));
+  let allAlex = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_alex');
+  let allMarta = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_marta');
+  assert.ok(allAlex.some((t) => t.id === privAlexId));
+  assert.ok(!allMarta.some((t) => t.id === privAlexId));
 
   // Gasto personal de Marta: visible para Marta, invisible para Alex
   const privMartaId = await repo.upsertTransaction(
@@ -935,8 +956,10 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
     },
     actorMarta
   );
-  assert.ok(latestMartaAllIds.includes(privMartaId));
-  assert.ok(!latestAlexAllIds.includes(privMartaId));
+  allAlex = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_alex');
+  allMarta = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_marta');
+  assert.ok(allMarta.some((t) => t.id === privMartaId));
+  assert.ok(!allAlex.some((t) => t.id === privMartaId));
 
   // Exportación excluye gastos privados del otro miembro
   const exportAlex = await repo.exportBackup('demo_hogar_santsadurni', 'demo_alex');
@@ -949,8 +972,10 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
 
   // Importación de Alex NO borra el gasto personal de Marta
   await repo.importBackup('demo_hogar_santsadurni', exportAlex, actorAlex);
-  assert.ok(latestMartaAllIds.includes(privMartaId));
-  assert.ok(!latestAlexAllIds.includes(privMartaId));
+  allAlex = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_alex');
+  allMarta = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_marta');
+  assert.ok(allMarta.some((t) => t.id === privMartaId));
+  assert.ok(!allAlex.some((t) => t.id === privMartaId));
 
   // Borrado privado de Alex no genera actividad compartida
   const activityBeforePrivDelete = latestActivityCount;
@@ -958,7 +983,8 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
     isPrivate: true,
   });
   assert.equal(latestActivityCount, activityBeforePrivDelete);
-  assert.ok(!latestAlexAllIds.includes(privAlexId));
+  allAlex = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_alex');
+  assert.ok(!allAlex.some((t) => t.id === privAlexId));
 
   await repo.deleteTransactionsBulk(
     'demo_hogar_santsadurni',
@@ -1016,9 +1042,428 @@ test('DemoHouseholdRepository borrado masivo, conservación de splitPctA=0 y ais
 
   unsubTxAlex();
   unsubTxMarta();
-  unsubAllAlex();
-  unsubAllMarta();
   unsubActivity();
   unsubFur();
 });
+
+test('A1. Deshacer exacto (restoreTransaction y restoreInitialCost) conserva createdBy, createdAt, isPrivate y splitPctA', async () => {
+  const repo = new DemoHouseholdRepository();
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  const actorMarta = { uid: 'demo_marta', displayName: 'Marta', photoURL: '' };
+
+  let monthTxs: Transaction[] = [];
+  let initialCostsCount = 0;
+  let activityCount = 0;
+  const unsubTx = repo.subscribeTransactionsByMonth('demo_hogar_santsadurni', 'demo_alex', '2026-11', (txs) => {
+    monthTxs = txs;
+  });
+  const unsubIc = repo.subscribeInitialCosts('demo_hogar_santsadurni', (ics) => {
+    initialCostsCount = ics.length;
+  });
+  const unsubAct = repo.subscribeActivity('demo_hogar_santsadurni', 50, (acts) => {
+    activityCount = acts.length;
+  });
+
+  // 1) Gasto compartido creado por Alex con splitPctA=0, borrado por Marta y restaurado por Marta
+  const originalTx: Transaction = {
+    id: 'tx_restore_shared',
+    monthKey: '2026-11',
+    concept: 'Cena cumpleaños pareja',
+    category: 'ocio',
+    amount: 72,
+    date: '2026-11-10',
+    paidBy: 'demo_alex',
+    recurringId: null,
+    splitPctA: 0,
+    isSettlement: false,
+    settlementTo: '',
+    isPrivate: false,
+    createdBy: 'demo_alex',
+    notes: 'Original note',
+    createdAt: '2026-11-10T18:00:00.000Z',
+    updatedAt: '2026-11-10T18:00:00.000Z',
+  };
+  await repo.restoreTransaction('demo_hogar_santsadurni', originalTx, actorAlex);
+  await repo.deleteTransaction('demo_hogar_santsadurni', originalTx.id, originalTx.concept, actorMarta, {
+    isPrivate: false,
+  });
+  assert.ok(!monthTxs.some((t) => t.id === originalTx.id));
+
+  await repo.restoreTransaction('demo_hogar_santsadurni', originalTx, actorMarta);
+  const restoredShared = monthTxs.find((t) => t.id === originalTx.id);
+  assert.ok(restoredShared);
+  assert.equal(restoredShared.createdBy, 'demo_alex');
+  assert.equal(restoredShared.createdAt, '2026-11-10T18:00:00.000Z');
+  assert.equal(restoredShared.splitPctA, 0);
+  assert.equal(restoredShared.isPrivate, false);
+  assert.equal(restoredShared.paidBy, 'demo_alex');
+
+  // 2) Gasto privado restaurado por su autor NO registra actividad compartida y conserva fecha original
+  const privTx: Transaction = {
+    ...originalTx,
+    id: 'tx_restore_priv',
+    concept: 'Capricho privado',
+    isPrivate: true,
+    splitPctA: 100,
+    createdAt: '2026-11-02T09:15:00.000Z',
+  };
+  const actBeforePriv = activityCount;
+  await repo.restoreTransaction('demo_hogar_santsadurni', privTx, actorAlex);
+  assert.equal(activityCount, actBeforePriv);
+  const restoredPriv = monthTxs.find((t) => t.id === privTx.id);
+  assert.ok(restoredPriv);
+  assert.equal(restoredPriv.isPrivate, true);
+  assert.equal(restoredPriv.createdBy, 'demo_alex');
+  assert.equal(restoredPriv.createdAt, '2026-11-02T09:15:00.000Z');
+
+  // 3) Gasto inicial restaurado conserva createdAt original
+  const icBefore = initialCostsCount;
+  await repo.restoreInitialCost(
+    'demo_hogar_santsadurni',
+    {
+      id: 'ic_restore_1',
+      concept: 'Copia llaves',
+      category: 'cerrajeria',
+      amount: 24,
+      paidBy: 'demo_marta',
+      status: 'pagado',
+      dueDate: '2026-11-05',
+      notes: '2 juegos',
+      createdAt: '2026-11-05T11:00:00.000Z',
+      updatedAt: '2026-11-05T11:00:00.000Z',
+    },
+    actorMarta
+  );
+  assert.equal(initialCostsCount, icBefore + 1);
+
+  unsubTx();
+  unsubIc();
+  unsubAct();
+});
+
+test('7 y 8. computeSavingsCapacity realista (3 meses históricos / fallback presupuestos variables) y sugerencias frente a capacidad', () => {
+  const settings: HouseholdSettings = {
+    splitMode: 'income',
+    presetA: 60,
+    presetB: 40,
+    incomeA: 2100,
+    incomeB: 1500,
+    currency: 'EUR',
+  };
+  const recs: RecurringExpense[] = [
+    {
+      id: 'r1',
+      concept: 'Alquiler',
+      category: 'alquiler',
+      amount: 900,
+      frequency: 'mensual',
+      dayOfMonth: 1,
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: '',
+      updatedAt: '',
+    },
+    {
+      id: 'r2',
+      concept: 'Seguro anual',
+      category: 'seguros',
+      amount: 360,
+      frequency: 'anual',
+      dayOfMonth: 15,
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: '',
+      updatedAt: '',
+    },
+    {
+      id: 'r3_off',
+      concept: 'Gimnasio pausado',
+      category: 'suscripciones',
+      amount: 50,
+      frequency: 'mensual',
+      dayOfMonth: 5,
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: false,
+      createdAt: '',
+      updatedAt: '',
+    },
+  ];
+
+  // 1) Sin histórico ni presupuestos: fijos = 900 + 30 = 930; capacidad = 3600 - 930 = 2670
+  const capNoHist = computeSavingsCapacity(settings, recs, {
+    currentMonthKey: '2026-11',
+    transactions: [],
+    monthClosures: [],
+    budget: null,
+  });
+  assert.equal(capNoHist.totalIncome, 3600);
+  assert.equal(capNoHist.activeFixedMonthly, 930);
+  assert.equal(capNoHist.hasHistory, false);
+  assert.equal(capNoHist.habitualSpend, 930);
+  assert.equal(capNoHist.variableMonthly, 0);
+  assert.equal(capNoHist.capacity, 2670);
+
+  // 2) Sin histórico, CON presupuestos de categorías variables (supermercado, ocio, transporte, otros)
+  // Fijos = 930 + variables (350 + 120 + 80 + 50 = 600) = 1530 => capacidad = 3600 - 1530 = 2070
+  const capBudgetFallback = computeSavingsCapacity(settings, recs, {
+    currentMonthKey: '2026-11',
+    transactions: [makeTx({ id: 'cur_1', monthKey: '2026-11', amount: 300 })],
+    monthClosures: [],
+    budget: {
+      monthKey: '2026-11',
+      limits: { alquiler: 900, luz: 70, supermercado: 350, ocio: 120, transporte: 80, otros: 50 },
+      updatedAt: '',
+    },
+  });
+  assert.equal(capBudgetFallback.hasHistory, false);
+  assert.equal(capBudgetFallback.fixedMonthly, 930);
+  assert.equal(capBudgetFallback.variableMonthly, 600);
+  assert.equal(capBudgetFallback.habitualSpend, 1530);
+  assert.equal(capBudgetFallback.capacity, 2070);
+
+  // 3) Con histórico de 3 últimos meses (excluye mes en curso 2026-11, privados, liquidaciones y meses más antiguos)
+  const histTxs: Transaction[] = [
+    makeTx({ id: 'm_cur', monthKey: '2026-11', amount: 400 }),
+    makeTx({ id: 'm10_1', monthKey: '2026-10', amount: 1300 }),
+    makeTx({ id: 'm10_priv', monthKey: '2026-10', amount: 500, isPrivate: true }),
+    makeTx({ id: 'm10_set', monthKey: '2026-10', amount: 200, isSettlement: true, category: 'liquidacion' }),
+    makeTx({ id: 'm09_1', monthKey: '2026-09', amount: 1100 }),
+    makeTx({ id: 'm08_1', monthKey: '2026-08', amount: 1200 }),
+    makeTx({ id: 'm07_old', monthKey: '2026-07', amount: 4000 }), // 4º mes anterior: ignorado
+  ];
+  // Media últimos 3 meses = (1300 + 1100 + 1200) / 3 = 1200; habitual = max(930, 1200) = 1200 (fijos 930 + variables 270)
+  const capWithHist = computeSavingsCapacity(settings, recs, {
+    currentMonthKey: '2026-11',
+    transactions: histTxs,
+    monthClosures: [],
+    budget: { monthKey: '2026-11', limits: { supermercado: 350 }, updatedAt: '' },
+  });
+  assert.equal(capWithHist.hasHistory, true);
+  assert.equal(capWithHist.historyMonthsUsed, 3);
+  assert.equal(capWithHist.historyAvg3Months, 1200);
+  assert.equal(capWithHist.habitualSpend, 1200);
+  assert.equal(capWithHist.fixedMonthly, 930);
+  assert.equal(capWithHist.variableMonthly, 270);
+  assert.equal(capWithHist.capacity, 2400);
+
+  // 4) Si fijos activos > media histórica, prevalecen los fijos activos (variables = 0)
+  const capFixedDominates = computeSavingsCapacity(settings, recs, {
+    currentMonthKey: '2026-11',
+    transactions: [makeTx({ id: 'm10_low', monthKey: '2026-10', amount: 700 })],
+  });
+  assert.equal(capFixedDominates.habitualSpend, 930);
+  assert.equal(capFixedDominates.variableMonthly, 0);
+  assert.equal(capFixedDominates.capacity, 2670);
+
+  // 5) Metas cuyas sugerencias superan la nueva capacidad realista
+  const lowCap = computeSavingsCapacity({ ...settings, incomeA: 1450, incomeB: 0 }, recs, {
+    currentMonthKey: '2026-11',
+    transactions: histTxs, // gasto habitual 1200 => capacidad realista = 250 € (vs 520 € con solo fijos)
+  });
+  assert.equal(lowCap.capacity, 250);
+
+  const g1: SavingsGoal = {
+    id: 'g_viaje',
+    name: 'Viaje Japón',
+    icon: 'plane',
+    color: '#0284C7',
+    targetAmount: 1200,
+    targetDate: '2027-05-18',
+    type: 'viajes',
+    archived: false,
+    createdAt: '',
+    updatedAt: '',
+  };
+  const g2: SavingsGoal = {
+    id: 'g_colchon',
+    name: 'Colchón',
+    icon: 'shield',
+    color: '#0E5A64',
+    targetAmount: 600,
+    targetDate: '2027-02-18',
+    type: 'emergencia',
+    archived: false,
+    createdAt: '',
+    updatedAt: '',
+  };
+  const p1 = computeGoalProgress(g1, [], '2026-11-18'); // 6 meses => 200 €/mes
+  const p2 = computeGoalProgress(g2, [], '2026-11-18'); // 3 meses => 200 €/mes
+  const sumSuggested = (p1.monthlyNeeded ?? 0) + (p2.monthlyNeeded ?? 0);
+  assert.equal(sumSuggested, 400);
+  assert.ok(sumSuggested > lowCap.capacity);
+});
+
+test('9 y 10. deleteGoalWithMovements sin huérfanos, archivado y lista de la compra sin log de actividad', async () => {
+  const repo = new DemoHouseholdRepository();
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+  let goals: SavingsGoal[] = [];
+  let movements: GoalMovement[] = [];
+  let shoppingIds: string[] = [];
+  let activityCount = 0;
+
+  const uG = repo.subscribeGoals('demo_hogar_santsadurni', (g) => {
+    goals = g;
+  });
+  const uM = repo.subscribeGoalMovements('demo_hogar_santsadurni', (m) => {
+    movements = m;
+  });
+  const uS = repo.subscribeShopping('demo_hogar_santsadurni', (s) => {
+    shoppingIds = s.map((item) => item.id);
+  });
+  const uA = repo.subscribeActivity('demo_hogar_santsadurni', 50, (a) => {
+    activityCount = a.length;
+  });
+
+  // Crear meta + 2 movimientos asociados y borrar todo junto (0 huérfanos)
+  const gId = await repo.upsertGoal(
+    'demo_hogar_santsadurni',
+    {
+      name: 'Meta temporal',
+      icon: 'piggy-bank',
+      color: '#0E5A64',
+      targetAmount: 500,
+      targetDate: '',
+      type: 'custom',
+      archived: false,
+    },
+    actorAlex
+  );
+  await repo.addGoalMovement(
+    'demo_hogar_santsadurni',
+    { goalId: gId, amount: 120, by: 'demo_alex', date: '2026-11-18', note: 'Aporte 1' },
+    'Meta temporal',
+    actorAlex
+  );
+  await repo.addGoalMovement(
+    'demo_hogar_santsadurni',
+    { goalId: gId, amount: 80, by: 'demo_marta', date: '2026-11-18', note: 'Aporte 2' },
+    'Meta temporal',
+    actorAlex
+  );
+  assert.equal(movements.filter((m) => m.goalId === gId).length, 2);
+
+  await repo.deleteGoalWithMovements('demo_hogar_santsadurni', gId, 'Meta temporal', actorAlex);
+  assert.ok(!goals.some((g) => g.id === gId));
+  assert.equal(movements.filter((m) => m.goalId === gId).length, 0);
+
+  // Shopping list: CRUD y borrado masivo SIN escribir entradas en activity
+  const actBeforeShop = activityCount;
+  const s1 = await repo.upsertShoppingItem(
+    'demo_hogar_santsadurni',
+    { text: 'Leche entera', qty: 2, done: false },
+    actorAlex
+  );
+  const s2 = await repo.upsertShoppingItem(
+    'demo_hogar_santsadurni',
+    { text: 'Pan integral', qty: 1, done: true },
+    actorAlex
+  );
+  assert.ok(shoppingIds.includes(s1) && shoppingIds.includes(s2));
+  assert.equal(activityCount, actBeforeShop);
+
+  await repo.deleteShoppingItemsBulk('demo_hogar_santsadurni', [s1, s2]);
+  assert.ok(!shoppingIds.includes(s1) && !shoppingIds.includes(s2));
+  assert.equal(activityCount, actBeforeShop);
+
+  uG();
+  uM();
+  uS();
+  uA();
+});
+
+test('11. Importación bancaria CSV: separador, decimales españoles, duplicados, palabras clave e importación privada', async () => {
+  const csvSample = [
+    'Fecha operación;Concepto;Importe',
+    '15/11/2026;COMPRA MERCADONA SANT SADURNI;-64,35 €',
+    '16/11/2026;NOMINA EMPRESA;2.100,00',
+    '17/11/2026;FACTURA ENDESA LUZ;(78,90)',
+    '15/11/2026;COMPRA MERCADONA SANT SADURNI;-64,35',
+  ].join('\n');
+
+  const delimiter = detectCsvDelimiter(csvSample);
+  assert.equal(delimiter, ';');
+
+  const matrix = parseCsvMatrix(csvSample, delimiter);
+  assert.equal(matrix.length, 5);
+
+  const mapping = guessCsvColumns(matrix[0]);
+  assert.deepEqual(mapping, { dateIndex: 0, conceptIndex: 1, amountIndex: 2 });
+
+  assert.equal(parseBankDateToISO('15/11/2026'), '2026-11-15');
+  assert.equal(parseBankDateToISO('2026-11-17'), '2026-11-17');
+  assert.equal(parseBankAmount('-64,35 €'), -64.35);
+  assert.equal(parseBankAmount('2.100,00'), 2100);
+  assert.equal(parseBankAmount('(78,90)'), -78.9);
+
+  const existing: Transaction[] = [
+    makeTx({
+      id: 'existing_1',
+      date: '2026-11-17',
+      amount: 78.9,
+      concept: 'FACTURA ENDESA LUZ',
+    }),
+  ];
+  const rows = buildParsedBankRows(matrix.slice(1), mapping, existing, {
+    supermercado: 'mercadona, bonpreu',
+    luz: 'endesa',
+  });
+
+  assert.equal(rows[0].dateISO, '2026-11-15');
+  assert.equal(rows[0].absAmount, 64.35);
+  assert.equal(rows[0].isIncome, false);
+  assert.equal(rows[0].isDuplicate, false);
+  assert.equal(rows[0].suggestedCategory, 'supermercado');
+
+  // Ingreso positivo detectado
+  assert.equal(rows[1].isIncome, true);
+  assert.equal(rows[1].absAmount, 2100);
+
+  // Duplicado contra existente en el hogar
+  assert.equal(rows[2].isDuplicate, true);
+  assert.equal(rows[2].suggestedCategory, 'luz');
+
+  // Duplicado dentro del propio CSV (fila 3 repite fila 0)
+  assert.equal(rows[3].isDuplicate, true);
+
+  // Palabra clave personalizada
+  assert.equal(matchCategoryFromKeywords('Tienda especial Nido', { ocio: 'especial nido' }), 'ocio');
+
+  // Repositorio demo: actualizar palabras clave + importar fila privada sin activity
+  const repo = new DemoHouseholdRepository();
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  let actCount = 0;
+  const uA = repo.subscribeActivity('demo_hogar_santsadurni', 50, (a) => {
+    actCount = a.length;
+  });
+
+  await repo.updateCsvKeywords('demo_hogar_santsadurni', { supermercado: 'mercadona, caprabo' });
+  const beforePrivImport = actCount;
+  const importedPrivCount = await repo.importBankTransactions(
+    'demo_hogar_santsadurni',
+    [
+      {
+        monthKey: '2026-11',
+        concept: 'Movimiento privado CSV',
+        category: 'ocio',
+        amount: 22.5,
+        date: '2026-11-18',
+        paidBy: 'demo_alex',
+        splitPctA: 100,
+        isPrivate: true,
+        notes: 'Importado CSV',
+      },
+    ],
+    actorAlex
+  );
+  assert.equal(importedPrivCount, 1);
+  assert.equal(actCount, beforePrivImport);
+  const allAlex = await repo.fetchAllTransactions('demo_hogar_santsadurni', 'demo_alex');
+  assert.ok(allAlex.some((t) => t.concept === 'Movimiento privado CSV' && t.isPrivate));
+  uA();
+});
+
 

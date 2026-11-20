@@ -4,9 +4,11 @@ import {
   Copy,
   Download,
   FileSpreadsheet,
+  HelpCircle,
   LogOut,
   Moon,
   RefreshCw,
+  Share2,
   Sun,
   Upload,
 } from 'lucide-react';
@@ -20,7 +22,10 @@ import {
 } from '../domain/backup';
 import {
   computeEffectiveSplitPctA,
+  computeSavingsCapacity,
   formatDateES,
+  formatEUR,
+  getCurrentMonthKeyLocal,
   getTodayLocalISO,
   shiftMonthKey,
 } from '../domain/finance';
@@ -42,11 +47,11 @@ export const AjustesView: React.FC = () => {
     toggleUiMode,
     theme,
     toggleTheme,
+    setActiveTab,
+    recurring,
     recentTransactions,
-    initialCosts,
-    furnitureItems,
-    goals,
-    goalMovements,
+    monthClosures,
+    currentMonthBudget,
     repo,
     logout,
     joinHousehold,
@@ -96,8 +101,15 @@ export const AjustesView: React.FC = () => {
     currency: 'EUR',
   };
 
+  const currentMonthKey = getCurrentMonthKeyLocal();
   const previewPctA = computeEffectiveSplitPctA(draftSettings);
   const previewPctB = Math.round((100 - previewPctA) * 10) / 10;
+  const capacityPreview = computeSavingsCapacity(draftSettings, recurring, {
+    transactions: recentTransactions,
+    monthClosures,
+    currentMonthKey,
+    budget: currentMonthBudget,
+  });
 
   const nameA = memberA?.displayName?.split(' ')[0] || 'Tú';
   const nameB = memberB?.displayName?.split(' ')[0] || 'tu pareja';
@@ -167,6 +179,25 @@ export const AjustesView: React.FC = () => {
     }
   };
 
+  const handleShareInvite = async () => {
+    if (!household?.inviteCode) return;
+    const text = `Únete a "${household.name}" en Nido con el código: ${household.inviteCode}`;
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        await navigator.share({
+          title: `Invitación a ${household.name} en Nido`,
+          text,
+          url: window.location.origin,
+        });
+        showToast('Invitación compartida');
+        return;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+      }
+    }
+    await handleCopyInvite();
+  };
+
   const handleExportJSON = async () => {
     if (!householdId || !currentUserProfile) return;
     const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
@@ -209,42 +240,53 @@ export const AjustesView: React.FC = () => {
     }
   };
 
-  const handleFullReportCSV = () => {
-    const filtered = recentTransactions.filter((t) => t.date >= reportFrom && t.date <= reportTo);
-    const csv = generateSpanishCSV(
-      ['Fecha', 'Mes', 'Concepto', 'Categoría', 'Pagó', 'Reparto A (%)', 'Tipo', 'Importe (€)'],
-      filtered.map((t) => [
-        formatDateES(t.date),
-        t.monthKey,
-        t.concept,
-        TRANSACTION_CATEGORY_LABELS[t.category],
-        t.paidBy === 'cuenta_comun'
-          ? 'Cuenta común'
-          : members.find((m) => m.uid === t.paidBy)?.displayName?.split(' ')[0] || t.paidBy,
-        t.isPrivate ? 'Personal' : t.splitPctA,
-        t.isPrivate ? 'Personal' : t.isSettlement ? 'Liquidación' : 'Compartido',
-        t.amount,
-      ])
-    );
-    downloadTextFile(`nido-informe-${reportFrom}_${reportTo}.csv`, csv, 'text/csv;charset=utf-8;');
-    showToast('Informe CSV descargado');
+  const handleFullReportCSV = async () => {
+    if (!householdId || !currentUserProfile) return;
+    try {
+      const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
+      const filtered = backup.transactions.filter((t) => t.date >= reportFrom && t.date <= reportTo);
+      const csv = generateSpanishCSV(
+        ['Fecha', 'Mes', 'Concepto', 'Categoría', 'Pagó', 'Reparto A (%)', 'Tipo', 'Importe (€)'],
+        filtered.map((t) => [
+          formatDateES(t.date),
+          t.monthKey,
+          t.concept,
+          TRANSACTION_CATEGORY_LABELS[t.category],
+          t.paidBy === 'cuenta_comun'
+            ? 'Cuenta común'
+            : members.find((m) => m.uid === t.paidBy)?.displayName?.split(' ')[0] || t.paidBy,
+          t.isPrivate ? 'Personal' : t.splitPctA,
+          t.isPrivate ? 'Personal' : t.isSettlement ? 'Liquidación' : 'Compartido',
+          t.amount,
+        ])
+      );
+      downloadTextFile(`nido-informe-${reportFrom}_${reportTo}.csv`, csv, 'text/csv;charset=utf-8;');
+      showToast('Informe CSV descargado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo generar el informe CSV.'));
+    }
   };
 
-  const handleFullReportPDF = () => {
-    if (!household) return;
-    exportNidoPDF({
-      scope: 'completo',
-      household,
-      members,
-      fromDate: reportFrom,
-      toDate: reportTo,
-      transactions: recentTransactions,
-      initialCosts,
-      items: furnitureItems,
-      goals,
-      goalMovements,
-    });
-    showToast('Informe completo PDF descargado');
+  const handleFullReportPDF = async () => {
+    if (!household || !householdId || !currentUserProfile) return;
+    try {
+      const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
+      exportNidoPDF({
+        scope: 'completo',
+        household,
+        members,
+        fromDate: reportFrom,
+        toDate: reportTo,
+        transactions: backup.transactions.map((t) => ({ ...t, createdAt: '', updatedAt: '' })),
+        initialCosts: backup.initialCosts.map((c) => ({ ...c, createdAt: '', updatedAt: '' })),
+        items: backup.items.map((it) => ({ ...it, createdAt: '', updatedAt: '' })),
+        goals: backup.goals.map((g) => ({ ...g, createdAt: '', updatedAt: '' })),
+        goalMovements: backup.goalMovements.map((m) => ({ ...m, createdAt: '' })),
+      });
+      showToast('Informe completo PDF descargado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo generar el informe PDF.'));
+    }
   };
 
   return (
@@ -314,7 +356,39 @@ export const AjustesView: React.FC = () => {
             </div>
           )}
 
-          {splitMode === 'income' && (
+          {splitMode === 'custom' && (
+            <div className="space-y-3">
+              <div className="flex justify-between text-sm font-semibold tabular-nums">
+                <span>
+                  {nameA}: {presetA}%
+                </span>
+                <span>
+                  {nameB}: {Math.round((100 - presetA) * 10) / 10}%
+                </span>
+              </div>
+              <input
+                aria-label="Porcentaje de reparto"
+                type="range"
+                min={0}
+                max={100}
+                step={0.5}
+                value={presetA}
+                onChange={(e) => setPresetA(Number(e.target.value))}
+                className="w-full accent-[#0E5A64]"
+              />
+            </div>
+          )}
+
+          {/* Ingresos netos mensuales (siempre editables para capacidad de ahorro) */}
+          <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-3">
+            <div>
+              <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Ingresos netos mensuales
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Se usan para calcular la capacidad de ahorro mensual y el reparto proporcional por salario.
+              </p>
+            </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label htmlFor="income-a" className="block text-xs font-medium mb-1">
@@ -343,30 +417,23 @@ export const AjustesView: React.FC = () => {
                 />
               </div>
             </div>
-          )}
-
-          {splitMode === 'custom' && (
-            <div className="space-y-3">
-              <div className="flex justify-between text-sm font-semibold tabular-nums">
-                <span>
-                  {nameA}: {presetA}%
-                </span>
-                <span>
-                  {nameB}: {Math.round((100 - presetA) * 10) / 10}%
-                </span>
-              </div>
-              <input
-                aria-label="Porcentaje de reparto"
-                type="range"
-                min={0}
-                max={100}
-                step={0.5}
-                value={presetA}
-                onChange={(e) => setPresetA(Number(e.target.value))}
-                className="w-full accent-[#0E5A64]"
-              />
-            </div>
-          )}
+            <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
+              Capacidad de ahorro estimada:{' '}
+              <strong
+                className={
+                  capacityPreview.capacity >= 0
+                    ? 'text-[#15803D] dark:text-[#4ADE80]'
+                    : 'text-[#B42318] dark:text-[#FCA5A5]'
+                }
+              >
+                {formatEUR(capacityPreview.capacity)}/mes
+              </strong>{' '}
+              (Ingresos {formatEUR(capacityPreview.totalIncome)} − gasto habitual{' '}
+              {formatEUR(capacityPreview.habitualSpend)} (fijos{' '}
+              {formatEUR(capacityPreview.fixedMonthly)} + variables{' '}
+              {formatEUR(capacityPreview.variableMonthly)}))
+            </p>
+          </div>
 
           {/* Live Preview */}
           <div className="rounded-xl bg-[#F6F8F8] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-1">
@@ -421,8 +488,16 @@ export const AjustesView: React.FC = () => {
               </button>
             </div>
 
-            <div className="pt-2">
+            <div className="pt-2 space-y-2">
               <PWAInstallButton variant="full" />
+              <button
+                type="button"
+                onClick={() => setActiveTab('ayuda')}
+                className="w-full min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-semibold flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+              >
+                <HelpCircle className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                <span>Ayuda e instalación en móvil</span>
+              </button>
             </div>
           </section>
 
@@ -448,12 +523,20 @@ export const AjustesView: React.FC = () => {
 
             <div className="rounded-xl bg-[#F6F8F8] dark:bg-slate-900 p-3.5 flex items-center justify-between gap-2">
               <div>
-                <p className="text-xs text-slate-500 dark:text-slate-400">Código de invitación</p>
+                <p className="text-xs text-slate-600 dark:text-slate-400">Código de invitación</p>
                 <p className="font-mono text-lg font-bold tracking-widest">
                   {household?.inviteCode || '—'}
                 </p>
               </div>
               <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-label="Compartir código de invitación"
+                  onClick={() => void handleShareInvite()}
+                  className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] flex items-center justify-center"
+                >
+                  <Share2 className="w-4 h-4" />
+                </button>
                 <button
                   type="button"
                   aria-label="Copiar código de invitación"
@@ -581,7 +664,7 @@ export const AjustesView: React.FC = () => {
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
-              onClick={handleFullReportCSV}
+              onClick={() => void handleFullReportCSV()}
               className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center gap-1.5"
             >
               <FileSpreadsheet className="w-4 h-4" />
@@ -589,7 +672,7 @@ export const AjustesView: React.FC = () => {
             </button>
             <button
               type="button"
-              onClick={handleFullReportPDF}
+              onClick={() => void handleFullReportPDF()}
               className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5"
             >
               <Download className="w-4 h-4" />
@@ -601,13 +684,13 @@ export const AjustesView: React.FC = () => {
         <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
           <div className="space-y-1">
             <h2 className="font-display text-base font-bold">Copia de seguridad (JSON)</h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
+            <p className="text-xs text-slate-600 dark:text-slate-400">
               Exporta todo vuestro historial o restaura una copia validada contra esquema.
             </p>
           </div>
 
           {importError && (
-            <div role="alert" className="rounded-xl bg-[#DC4C3E]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs">
+            <div role="alert" className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs">
               {importError}
             </div>
           )}
@@ -641,7 +724,7 @@ export const AjustesView: React.FC = () => {
             <button
               type="button"
               onClick={() => void logout()}
-              className="min-h-[44px] px-4 rounded-xl border border-[#DC4C3E]/40 text-[#DC4C3E] text-xs sm:text-sm font-semibold flex items-center gap-1.5 ml-auto"
+              className="min-h-[44px] px-4 rounded-xl border border-[#B42318]/40 text-[#B42318] dark:text-[#FCA5A5] text-xs sm:text-sm font-semibold flex items-center gap-1.5 ml-auto"
             >
               <LogOut className="w-4 h-4" />
               <span>Cerrar sesión</span>

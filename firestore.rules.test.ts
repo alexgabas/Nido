@@ -583,3 +583,351 @@ test('7. Gastos personales (isPrivate + createdBy): aislamiento entre pareja, fi
   await assertSucceeds(dbAlex.doc('households/h1/transactions/tx_priv_alex').delete());
 });
 
+test('8. A1 Deshacer exacto: restaurar gastos compartidos e iniciales con createdAt pasado y protección de privados', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const pastTs = firebase.firestore.Timestamp.fromMillis(Date.now() - 120_000);
+  const futureTs = firebase.firestore.Timestamp.fromMillis(Date.now() + 86_400_000);
+
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+
+  // Unir a Marta
+  const joinBatch = dbMarta.batch();
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: firebase.firestore.FieldValue.arrayUnion('uid_marta'),
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('invites/SNT26A'), { memberCount: 2 });
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.set(dbMarta.doc('users/uid_marta'), { householdId: 'h1', updatedAt: ts });
+  await assertSucceeds(joinBatch.commit());
+
+  // 1) Marta restaura un gasto compartido originalmente creado por Alex conservando createdBy y createdAt original
+  await assertSucceeds(
+    dbMarta.doc('households/h1/transactions/tx_undo_shared').set({
+      monthKey: '2026-11',
+      concept: 'Supermercado restaurado',
+      category: 'supermercado',
+      amount: 55,
+      date: '2026-11-10',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: 'Original',
+      createdAt: pastTs,
+      updatedAt: ts,
+    })
+  );
+
+  // 2) createdAt futuro es rechazado
+  await assertFails(
+    dbMarta.doc('households/h1/transactions/tx_undo_future').set({
+      monthKey: '2026-11',
+      concept: 'Fecha futura',
+      category: 'supermercado',
+      amount: 55,
+      date: '2026-11-10',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: futureTs,
+      updatedAt: ts,
+    })
+  );
+
+  // 3) Marta NO puede restaurar un gasto privado cuyo createdBy sea Alex
+  await assertFails(
+    dbMarta.doc('households/h1/transactions/tx_undo_priv_spoof').set({
+      monthKey: '2026-11',
+      concept: 'Privado ajeno',
+      category: 'ocio',
+      amount: 30,
+      date: '2026-11-10',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 100,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: pastTs,
+      updatedAt: ts,
+    })
+  );
+
+  // 4) Alex sí puede restaurar su propio gasto privado conservando su createdAt pasado
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_undo_priv_alex').set({
+      monthKey: '2026-11',
+      concept: 'Privado propio',
+      category: 'ocio',
+      amount: 30,
+      date: '2026-11-10',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 100,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: pastTs,
+      updatedAt: ts,
+    })
+  );
+
+  // 5) Restaurar gasto inicial con createdAt pasado permitido; futuro rechazado
+  await assertSucceeds(
+    dbMarta.doc('households/h1/initialCosts/ic_undo_ok').set({
+      concept: 'Copia llaves',
+      category: 'cerrajeria',
+      amount: 24,
+      paidBy: 'uid_alex',
+      status: 'pagado',
+      dueDate: '',
+      notes: '',
+      createdAt: pastTs,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h1/initialCosts/ic_undo_future').set({
+      concept: 'Copia llaves futuro',
+      category: 'cerrajeria',
+      amount: 24,
+      paidBy: 'uid_alex',
+      status: 'pagado',
+      dueDate: '',
+      notes: '',
+      createdAt: futureTs,
+      updatedAt: ts,
+    })
+  );
+});
+
+test('9. Lista de la compra compartida (households/{hid}/shopping): CRUD por miembros, bloqueo de inmutables y aislamiento externo', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Miembro crea elemento válido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shopping/shop_1').set({
+      text: 'Aceite de oliva virgen',
+      qty: 2,
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // qty <= 0 rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/shopping/shop_bad_qty').set({
+      text: 'Pan',
+      qty: 0,
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Miembro actualiza done y qty
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shopping/shop_1').update({
+      done: true,
+      qty: 3,
+      updatedAt: ts,
+    })
+  );
+
+  // Cambiar addedBy en update rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/shopping/shop_1').update({
+      addedBy: 'uid_intruder',
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso no puede leer ni escribir en shopping
+  await assertFails(dbIntruder.doc('households/h1/shopping/shop_1').get());
+  await assertFails(dbIntruder.collection('households/h1/shopping').get());
+  await assertFails(dbIntruder.doc('households/h1/shopping/shop_1').delete());
+
+  // Miembro puede eliminar elemento
+  await assertSucceeds(dbAlex.doc('households/h1/shopping/shop_1').delete());
+});
+
+test('10. Actualización de csvKeywords en households/{hid}: validación estricta de claves y bloqueo de otros campos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Actualización válida de csvKeywords por miembro
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      csvKeywords: {
+        supermercado: 'mercadona, bonpreu, caprabo',
+        luz: 'endesa, iberdrola',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Clave desconocida dentro de csvKeywords rechazada
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      csvKeywords: {
+        categoria_falsa: 'foo',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Intentar colar memberUids en el mismo update rechazado
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      csvKeywords: { supermercado: 'mercadona' },
+      memberUids: ['uid_alex', 'uid_intruder'],
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso rechazado
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      csvKeywords: { supermercado: 'hack' },
+      updatedAt: ts,
+    })
+  );
+});
+
+test('11. Cualquier miembro puede actualizar settings (ingresos) y csvKeywords sin tocar otros campos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Unir a Marta como member_b
+  const joinBatch = dbMarta.batch();
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: firebase.firestore.FieldValue.arrayUnion('uid_marta'),
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('invites/SNT26A'), { memberCount: 2 });
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.set(dbMarta.doc('users/uid_marta'), { householdId: 'h1', updatedAt: ts });
+  await assertSucceeds(joinBatch.commit());
+
+  // 1) Marta actualiza solo settings (ingresos) sin tocar otros campos
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      settings: {
+        splitMode: 'income',
+        presetA: 55,
+        presetB: 45,
+        incomeA: 2400,
+        incomeB: 1950,
+        currency: 'EUR',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // 2) Marta actualiza solo csvKeywords sin tocar settings ni name
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      csvKeywords: {
+        supermercado: 'mercadona, bonpreu',
+        transporte: 'renfe, tmb',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // 3) Alex también actualiza solo settings después de existir csvKeywords
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      settings: {
+        splitMode: 'preset',
+        presetA: 50,
+        presetB: 50,
+        incomeA: 2500,
+        incomeB: 2000,
+        currency: 'EUR',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // 4) No se permite mezclar csvKeywords con name en el mismo update
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      csvKeywords: { supermercado: 'mercadona' },
+      name: 'Nombre cambiado',
+      updatedAt: ts,
+    })
+  );
+
+  // 5) No se permite inyectar inviteCode junto a settings ni acceder si no eres miembro
+  await assertFails(
+    dbMarta.doc('households/h1').update({
+      settings: {
+        splitMode: 'preset',
+        presetA: 50,
+        presetB: 50,
+        incomeA: 1000,
+        incomeB: 1000,
+        currency: 'EUR',
+      },
+      inviteCode: 'HACK99',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      settings: {
+        splitMode: 'preset',
+        presetA: 50,
+        presetB: 50,
+        incomeA: 1000,
+        incomeB: 1000,
+        currency: 'EUR',
+      },
+      updatedAt: ts,
+    })
+  );
+});
+
+
+

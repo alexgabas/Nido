@@ -2,7 +2,7 @@ export type SplitMode = 'income' | 'preset' | 'custom';
 export type UiMode = 'sencillo' | 'avanzado';
 export type MemberRole = 'member_a' | 'member_b';
 export type ThemeMode = 'light' | 'dark';
-export type NavTab = 'inicio' | 'mudanza' | 'mensual' | 'ahorros' | 'ajustes';
+export type NavTab = 'inicio' | 'mudanza' | 'mensual' | 'ahorros' | 'ajustes' | 'ayuda';
 
 export const MAX_LENGTHS = {
   householdName: 80,
@@ -16,6 +16,8 @@ export const MAX_LENGTHS = {
   goalName: 80,
   movementNote: 240,
   activitySummary: 240,
+  shoppingText: 120,
+  csvKeywordString: 300,
 } as const;
 
 export interface HouseholdSettings {
@@ -27,12 +29,15 @@ export interface HouseholdSettings {
   currency: 'EUR';
 }
 
+export type CsvCategoryKeywords = Partial<Record<ExpenseCategory, string>>;
+
 export interface Household {
   id: string;
   name: string;
   memberUids: string[];
   inviteCode: string;
   settings: HouseholdSettings;
+  csvKeywords?: CsvCategoryKeywords;
   createdAt: string;
   updatedAt: string;
 }
@@ -243,12 +248,30 @@ export interface GoalMovement {
   createdAt: string;
 }
 
+export interface ShoppingItem {
+  id: string;
+  text: string;
+  qty: number;
+  done: boolean;
+  addedBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExpensePrefill {
+  amount?: string;
+  concept?: string;
+  category?: ExpenseCategory;
+  notes?: string;
+}
+
 export interface NidoBackupV1 {
   schemaVersion: 1;
   app: 'nido';
   exportedAt: string;
   householdName: string;
   settings: HouseholdSettings;
+  csvKeywords?: CsvCategoryKeywords;
   initialCosts: Omit<InitialCost, 'createdAt' | 'updatedAt'>[];
   checklist: Omit<ChecklistItem, 'createdAt' | 'updatedAt'>[];
   items: Omit<FurnitureItem, 'createdAt' | 'updatedAt'>[];
@@ -258,4 +281,5 @@ export interface NidoBackupV1 {
   monthClosures: Omit<MonthClosure, 'closedAt'>[];
   goals: Omit<SavingsGoal, 'createdAt' | 'updatedAt'>[];
   goalMovements: Omit<GoalMovement, 'createdAt'>[];
+  shopping?: Omit<ShoppingItem, 'createdAt' | 'updatedAt'>[];
 }

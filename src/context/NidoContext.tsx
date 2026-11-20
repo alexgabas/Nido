@@ -16,6 +16,7 @@ import { auth, googleProvider, toUserFriendlyErrorMessage } from '../services/fi
 import type {
   ActivityEntry,
   ChecklistItem,
+  ExpensePrefill,
   FurnitureItem,
   GoalMovement,
   Household,
@@ -26,6 +27,7 @@ import type {
   NavTab,
   RecurringExpense,
   SavingsGoal,
+  ShoppingItem,
   ThemeMode,
   Transaction,
   UiMode,
@@ -74,9 +76,16 @@ interface NidoContextValue {
   theme: ThemeMode;
   toggleTheme: () => void;
 
-  // Quick add modal
+  // Quick add modal & prefill (e.g. from Shopping List)
   quickExpenseOpen: boolean;
   setQuickExpenseOpen: (open: boolean) => void;
+  quickExpensePrefill: ExpensePrefill | null;
+  quickExpenseOnSaved: (() => Promise<void> | void) | null;
+  openQuickExpenseWithPrefill: (
+    prefill: ExpensePrefill,
+    onSaved?: () => Promise<void> | void
+  ) => void;
+  clearQuickExpensePrefill: () => void;
 
   // Real-time Collections
   activity: ActivityEntry[];
@@ -84,14 +93,15 @@ interface NidoContextValue {
   checklist: ChecklistItem[];
   furnitureItems: FurnitureItem[];
   recurring: RecurringExpense[];
+  currentMonthTransactions: Transaction[];
   monthTransactions: Transaction[];
   recentTransactions: Transaction[];
-  allTransactions: Transaction[];
   budget: MonthlyBudget | null;
   currentMonthBudget: MonthlyBudget | null;
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
+  shoppingItems: ShoppingItem[];
 
   // Repository & Feedback
   repo: HouseholdRepository;
@@ -138,20 +148,36 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [checklist, setChecklist] = useState<ChecklistItem[]>([]);
   const [furnitureItems, setFurnitureItems] = useState<FurnitureItem[]>([]);
   const [recurring, setRecurring] = useState<RecurringExpense[]>([]);
-  const [monthTransactions, setMonthTransactions] = useState<Transaction[]>([]);
+  const [rawMonthTransactions, setRawMonthTransactions] = useState<Transaction[]>([]);
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
-  const [allTransactions, setAllTransactions] = useState<Transaction[]>([]);
   const [budget, setBudget] = useState<MonthlyBudget | null>(null);
   const [currentMonthBudget, setCurrentMonthBudget] = useState<MonthlyBudget | null>(null);
   const [monthClosures, setMonthClosures] = useState<MonthClosure[]>([]);
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
   const [goalMovements, setGoalMovements] = useState<GoalMovement[]>([]);
+  const [shoppingItems, setShoppingItems] = useState<ShoppingItem[]>([]);
   const [seedPending, setSeedPending] = useState(false);
   const [seedingDefaults, setSeedingDefaults] = useState(false);
 
   const [activeTab, setActiveTab] = useState<NavTab>('inicio');
   const [selectedMonthKey, setSelectedMonthKey] = useState<string>(() => getCurrentMonthKeyLocal());
   const [quickExpenseOpen, setQuickExpenseOpen] = useState(false);
+  const [quickExpensePrefill, setQuickExpensePrefill] = useState<ExpensePrefill | null>(null);
+  const quickExpenseOnSavedRef = useRef<(() => Promise<void> | void) | null>(null);
+
+  const openQuickExpenseWithPrefill = useCallback(
+    (prefill: ExpensePrefill, onSaved?: () => Promise<void> | void) => {
+      setQuickExpensePrefill(prefill);
+      quickExpenseOnSavedRef.current = onSaved ?? null;
+      setQuickExpenseOpen(true);
+    },
+    []
+  );
+
+  const clearQuickExpensePrefill = useCallback(() => {
+    setQuickExpensePrefill(null);
+    quickExpenseOnSavedRef.current = null;
+  }, []);
 
   const [theme, setTheme] = useState<ThemeMode>(() => {
     try {
@@ -269,60 +295,6 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const viewerUid = isDemoMode ? 'demo_alex' : authUser?.uid || '';
 
-  // Real-time household & collections subscriptions
-  useEffect(() => {
-    if (!householdId || !viewerUid) return;
-
-    const currentMonthKey = getCurrentMonthKeyLocal();
-    const minRecentMonth = shiftMonthKey(currentMonthKey, -11);
-    const onErr = (e: Error) => {
-      setHouseholdError(
-        toUserFriendlyErrorMessage(e, 'No se pudieron sincronizar los datos del hogar.')
-      );
-    };
-
-    const unsubs = [
-      repo.subscribeHousehold(householdId, setHousehold, onErr),
-      repo.subscribeMembers(householdId, setMembers, onErr),
-      repo.subscribeActivity(householdId, 20, setActivity, onErr),
-      repo.subscribeInitialCosts(householdId, setInitialCosts, onErr),
-      repo.subscribeChecklist(householdId, setChecklist, onErr),
-      repo.subscribeFurniture(householdId, setFurnitureItems, onErr),
-      repo.subscribeRecurring(householdId, setRecurring, onErr),
-      repo.subscribeTransactionsRecentMonths(householdId, viewerUid, minRecentMonth, setRecentTransactions, onErr),
-      repo.subscribeBudget(householdId, currentMonthKey, setCurrentMonthBudget, onErr),
-      repo.subscribeMonthClosures(householdId, setMonthClosures, onErr),
-      repo.subscribeGoals(householdId, setGoals, onErr),
-      repo.subscribeGoalMovements(householdId, setGoalMovements, onErr),
-    ];
-
-    return () => {
-      for (const u of unsubs) u();
-    };
-  }, [householdId, viewerUid, repo]);
-
-  // Month-scoped subscriptions (optimized reads by monthKey)
-  useEffect(() => {
-    if (!householdId || !viewerUid) return;
-
-    const onErr = (e: Error) =>
-      setHouseholdError(
-        toUserFriendlyErrorMessage(e, 'No se pudieron cargar los movimientos del mes.')
-      );
-    const unsubTx = repo.subscribeTransactionsByMonth(
-      householdId,
-      viewerUid,
-      selectedMonthKey,
-      setMonthTransactions,
-      onErr
-    );
-    const unsubBudget = repo.subscribeBudget(householdId, selectedMonthKey, setBudget, onErr);
-    return () => {
-      unsubTx();
-      unsubBudget();
-    };
-  }, [householdId, viewerUid, selectedMonthKey, repo]);
-
   const currentUserProfile: UserProfileInput | null = useMemo(() => {
     if (isDemoMode) {
       return { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
@@ -349,18 +321,207 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [members, currentUserProfile]);
 
   const uiMode: UiMode = currentMember?.uiMode ?? 'sencillo';
+  const effectiveTab: NavTab = uiMode === 'sencillo' && activeTab === 'ajustes' ? 'inicio' : activeTab;
 
+  // 1) Base subscriptions always active once inside a household
   useEffect(() => {
-    if (!householdId || !viewerUid || uiMode !== 'avanzado') {
-      setAllTransactions([]);
+    if (!householdId || !viewerUid) return;
+    const onErr = (e: Error) => {
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudieron sincronizar los datos del hogar.')
+      );
+    };
+    const unsubH = repo.subscribeHousehold(householdId, setHousehold, onErr);
+    const unsubM = repo.subscribeMembers(householdId, setMembers, onErr);
+    return () => {
+      unsubH();
+      unsubM();
+    };
+  }, [householdId, viewerUid, repo]);
+
+  // 2) Activity (Avanzado · Inicio only)
+  useEffect(() => {
+    if (!householdId || !viewerUid || uiMode !== 'avanzado' || effectiveTab !== 'inicio') {
+      setActivity([]);
       return;
     }
     const onErr = (e: Error) =>
-      setHouseholdError(
-        toUserFriendlyErrorMessage(e, 'No se pudo cargar el historial de movimientos.')
-      );
-    return repo.subscribeAllTransactions(householdId, viewerUid, setAllTransactions, onErr);
-  }, [householdId, viewerUid, uiMode, repo]);
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar la actividad reciente.'));
+    return repo.subscribeActivity(householdId, 20, setActivity, onErr);
+  }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
+
+  // 3) Initial costs (Avanzado · Mudanza only)
+  useEffect(() => {
+    if (!householdId || !viewerUid || uiMode !== 'avanzado' || effectiveTab !== 'mudanza') {
+      setInitialCosts([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron cargar los gastos iniciales.'));
+    return repo.subscribeInitialCosts(householdId, setInitialCosts, onErr);
+  }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
+
+  // 4) Checklist & Furniture (Inicio or Mudanza in both modes)
+  useEffect(() => {
+    if (!householdId || !viewerUid || (effectiveTab !== 'inicio' && effectiveTab !== 'mudanza')) {
+      setChecklist([]);
+      setFurnitureItems([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar la lista de mudanza.'));
+    const unsubCl = repo.subscribeChecklist(householdId, setChecklist, onErr);
+    const unsubFur = repo.subscribeFurniture(householdId, setFurnitureItems, onErr);
+    return () => {
+      unsubCl();
+      unsubFur();
+    };
+  }, [householdId, viewerUid, effectiveTab, repo]);
+
+  // 5) Recurring templates (Inicio, Ahorros, or Avanzado Mensual/Ajustes)
+  useEffect(() => {
+    const needed =
+      effectiveTab === 'inicio' ||
+      effectiveTab === 'ahorros' ||
+      (uiMode === 'avanzado' && (effectiveTab === 'mensual' || effectiveTab === 'ajustes'));
+    if (!householdId || !viewerUid || !needed) {
+      setRecurring([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron cargar los gastos fijos.'));
+    return repo.subscribeRecurring(householdId, setRecurring, onErr);
+  }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
+
+  // 6) Recent 12 months transactions (Inicio, Ahorros, or Avanzado Mensual/Ajustes)
+  useEffect(() => {
+    const needed =
+      effectiveTab === 'inicio' ||
+      effectiveTab === 'ahorros' ||
+      (uiMode === 'avanzado' && (effectiveTab === 'mensual' || effectiveTab === 'ajustes'));
+    if (!householdId || !viewerUid || !needed) {
+      setRecentTransactions([]);
+      return;
+    }
+    const minRecentMonth = shiftMonthKey(getCurrentMonthKeyLocal(), -11);
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar el historial reciente.'));
+    return repo.subscribeTransactionsRecentMonths(
+      householdId,
+      viewerUid,
+      minRecentMonth,
+      setRecentTransactions,
+      onErr
+    );
+  }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
+
+  const currentMonthTransactions = useMemo(() => {
+    const currentMonthKey = getCurrentMonthKeyLocal();
+    return recentTransactions.filter((t) => t.monthKey === currentMonthKey);
+  }, [recentTransactions]);
+
+  // 7) Selected month transactions (Sencillo · Mensual, or Avanzado · Mensual when outside 12m window)
+  const minRecentMonthKey = shiftMonthKey(getCurrentMonthKeyLocal(), -11);
+  const selectedMonthInsideRecentWindow =
+    uiMode === 'avanzado' && effectiveTab === 'mensual' && selectedMonthKey >= minRecentMonthKey;
+
+  useEffect(() => {
+    const needDirectMonthSub =
+      effectiveTab === 'mensual' && !selectedMonthInsideRecentWindow;
+    if (!householdId || !viewerUid || !needDirectMonthSub) {
+      setRawMonthTransactions([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron cargar los movimientos del mes.'));
+    return repo.subscribeTransactionsByMonth(
+      householdId,
+      viewerUid,
+      selectedMonthKey,
+      setRawMonthTransactions,
+      onErr
+    );
+  }, [householdId, viewerUid, effectiveTab, selectedMonthInsideRecentWindow, selectedMonthKey, repo]);
+
+  const monthTransactions = useMemo(
+    () =>
+      selectedMonthInsideRecentWindow
+        ? recentTransactions.filter((t) => t.monthKey === selectedMonthKey)
+        : rawMonthTransactions,
+    [selectedMonthInsideRecentWindow, recentTransactions, selectedMonthKey, rawMonthTransactions]
+  );
+
+  // 8) Current month budget (Inicio, Ahorros, or Avanzado Ajustes for savings capacity fallback)
+  useEffect(() => {
+    const needed =
+      effectiveTab === 'inicio' ||
+      effectiveTab === 'ahorros' ||
+      (uiMode === 'avanzado' && effectiveTab === 'ajustes');
+    if (!householdId || !viewerUid || !needed) {
+      setCurrentMonthBudget(null);
+      return;
+    }
+    const currentMonthKey = getCurrentMonthKeyLocal();
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar el presupuesto del mes.'));
+    return repo.subscribeBudget(householdId, currentMonthKey, setCurrentMonthBudget, onErr);
+  }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
+
+  // 9) Selected month budget (Avanzado · Mensual only)
+  useEffect(() => {
+    if (!householdId || !viewerUid || uiMode !== 'avanzado' || effectiveTab !== 'mensual') {
+      setBudget(null);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar el presupuesto del mes.'));
+    return repo.subscribeBudget(householdId, selectedMonthKey, setBudget, onErr);
+  }, [householdId, viewerUid, uiMode, effectiveTab, selectedMonthKey, repo]);
+
+  // 10) Month closures (Inicio, Mensual, Ahorros, Avanzado Ajustes, or while quick-add expense modal is open)
+  useEffect(() => {
+    const needed =
+      effectiveTab === 'inicio' ||
+      effectiveTab === 'mensual' ||
+      effectiveTab === 'ahorros' ||
+      (uiMode === 'avanzado' && effectiveTab === 'ajustes') ||
+      quickExpenseOpen;
+    if (!householdId || !viewerUid || !needed) {
+      setMonthClosures([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron comprobar los meses cerrados.'));
+    return repo.subscribeMonthClosures(householdId, setMonthClosures, onErr);
+  }, [householdId, viewerUid, uiMode, effectiveTab, quickExpenseOpen, repo]);
+
+  // 12) Goals & Goal movements (Inicio or Ahorros)
+  useEffect(() => {
+    if (!householdId || !viewerUid || (effectiveTab !== 'inicio' && effectiveTab !== 'ahorros')) {
+      setGoals([]);
+      setGoalMovements([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron cargar las metas de ahorro.'));
+    const unsubG = repo.subscribeGoals(householdId, setGoals, onErr);
+    const unsubGm = repo.subscribeGoalMovements(householdId, setGoalMovements, onErr);
+    return () => {
+      unsubG();
+      unsubGm();
+    };
+  }, [householdId, viewerUid, effectiveTab, repo]);
+
+  // 13) Shopping list (Inicio only)
+  useEffect(() => {
+    if (!householdId || !viewerUid || effectiveTab !== 'inicio') {
+      setShoppingItems([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo sincronizar la lista de la compra.'));
+    return repo.subscribeShopping(householdId, setShoppingItems, onErr);
+  }, [householdId, viewerUid, effectiveTab, repo]);
 
   const effectiveSplitPctA = useMemo(() => {
     if (!household) return 50;
@@ -480,19 +641,24 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     toggleTheme,
     quickExpenseOpen,
     setQuickExpenseOpen,
+    quickExpensePrefill,
+    quickExpenseOnSaved: quickExpenseOnSavedRef.current,
+    openQuickExpenseWithPrefill,
+    clearQuickExpensePrefill,
     activity,
     initialCosts,
     checklist,
     furnitureItems,
     recurring,
     monthTransactions,
+    currentMonthTransactions,
     recentTransactions,
-    allTransactions,
     budget,
     currentMonthBudget,
     monthClosures,
     goals,
     goalMovements,
+    shoppingItems,
     repo,
     toastMessage,
     showToast,

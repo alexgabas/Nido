@@ -6,6 +6,7 @@ import type {
   HouseholdMember,
   HouseholdSettings,
   InitialCost,
+  MonthClosure,
   MonthlyBudget,
   RecurrenceFrequency,
   RecurringExpense,
@@ -427,6 +428,9 @@ export function getUpcomingChargesWithinDays(
       const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
       const diff = localDaysBetween(todayISO, dueDate);
       if (Number.isFinite(diff) && diff >= 0 && diff <= maxDays) {
+        if (existingKeys.has(`${targetMonth}::${rec.id}`)) {
+          break;
+        }
         alerts.push({
           recurringId: rec.id,
           concept: rec.concept,
@@ -436,7 +440,7 @@ export function getUpcomingChargesWithinDays(
           dueDate,
           frequency: rec.frequency,
           daysUntil: diff,
-          alreadyGenerated: existingKeys.has(`${targetMonth}::${rec.id}`),
+          alreadyGenerated: false,
         });
         break;
       }
@@ -496,7 +500,9 @@ export interface BudgetThresholdAlert {
   spent: number;
   limit: number;
   pct: number;
+  atLimit: boolean;
   exceeded: boolean;
+  overAmount: number;
 }
 
 export function getBudgetThresholdAlerts(
@@ -504,16 +510,46 @@ export function getBudgetThresholdAlerts(
   budget: MonthlyBudget | null,
   thresholdPct = 80
 ): BudgetThresholdAlert[] {
+  const hasRecurringByCat = new Set<ExpenseCategory>();
+  const hasNonRecurringByCat = new Set<ExpenseCategory>();
+
+  for (const tx of transactions) {
+    if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
+    if ((Number(tx.amount) || 0) <= 0) continue;
+    if (tx.recurringId && String(tx.recurringId).trim() !== '') {
+      hasRecurringByCat.add(tx.category);
+    } else {
+      hasNonRecurringByCat.add(tx.category);
+    }
+  }
+
   const progress = computeBudgetProgress(transactions, budget);
   return progress
-    .filter((bp) => bp.limit > 0 && (bp.spent / bp.limit) * 100 > thresholdPct)
-    .map((bp) => ({
-      category: bp.category,
-      spent: bp.spent,
-      limit: bp.limit,
-      pct: Math.round((bp.spent / bp.limit) * 100),
-      exceeded: bp.spent > bp.limit,
-    }))
+    .filter((bp) => {
+      if (bp.limit <= 0) return false;
+      const ratioPct = (bp.spent / bp.limit) * 100;
+      if (ratioPct < thresholdPct) return false;
+      const isRecurringOnly =
+        hasRecurringByCat.has(bp.category) && !hasNonRecurringByCat.has(bp.category);
+      if (isRecurringOnly && bp.spent <= bp.limit) {
+        return false;
+      }
+      return true;
+    })
+    .map((bp) => {
+      const exceeded = bp.spent > bp.limit;
+      const atLimit = !exceeded && Math.abs(bp.spent - bp.limit) < 0.005;
+      const overAmount = exceeded ? roundCents(bp.spent - bp.limit) : 0;
+      return {
+        category: bp.category,
+        spent: bp.spent,
+        limit: bp.limit,
+        pct: Math.round((bp.spent / bp.limit) * 100),
+        atLimit,
+        exceeded,
+        overAmount,
+      };
+    })
     .sort((a, b) => b.spent / b.limit - a.spent / a.limit);
 }
 
@@ -832,6 +868,127 @@ export function computeEmergencyTarget(
     .filter((r) => r.active)
     .reduce((acc, r) => acc + monthlyEquivalent(r.amount, r.frequency), 0);
   return roundCents(fixedMonthly * months);
+}
+
+const VARIABLE_BUDGET_CATEGORIES: readonly ExpenseCategory[] = [
+  'supermercado',
+  'ocio',
+  'transporte',
+  'otros',
+];
+
+export interface SavingsCapacityOptions {
+  transactions?: Transaction[];
+  monthClosures?: MonthClosure[];
+  currentMonthKey?: string;
+  budget?: MonthlyBudget | null;
+}
+
+export interface SavingsCapacityResult {
+  incomeA: number;
+  incomeB: number;
+  totalIncome: number;
+  activeFixedMonthly: number;
+  historyAvg3Months: number;
+  historyMonthsUsed: number;
+  hasHistory: boolean;
+  variableBudgetsMonthly: number;
+  habitualSpend: number;
+  fixedMonthly: number;
+  variableMonthly: number;
+  capacity: number;
+  hasIncomeConfigured: boolean;
+}
+
+export function computeSavingsCapacity(
+  settings: HouseholdSettings,
+  recurringList: RecurringExpense[],
+  options?: SavingsCapacityOptions
+): SavingsCapacityResult {
+  const incomeA = roundCents(Math.max(0, Number(settings.incomeA) || 0));
+  const incomeB = roundCents(Math.max(0, Number(settings.incomeB) || 0));
+  const totalIncome = roundCents(incomeA + incomeB);
+  const activeFixedMonthly = roundCents(
+    recurringList
+      .filter((r) => r.active)
+      .reduce((acc, r) => acc + monthlyEquivalent(r.amount, r.frequency), 0)
+  );
+
+  const refMonthKey = options?.currentMonthKey || getCurrentMonthKeyLocal();
+  const closedTotals = new Map<string, number>();
+  for (const closure of options?.monthClosures ?? []) {
+    if (closure.monthKey) {
+      closedTotals.set(closure.monthKey, roundCents(Math.max(0, Number(closure.totalSpent) || 0)));
+    }
+  }
+
+  const spendByMonth = new Map<string, number>();
+  for (const tx of options?.transactions ?? []) {
+    if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
+    if (!tx.monthKey) continue;
+    const amt = Math.max(0, Number(tx.amount) || 0);
+    spendByMonth.set(tx.monthKey, (spendByMonth.get(tx.monthKey) ?? 0) + amt);
+  }
+
+  const eligibleMonths = new Set<string>();
+  for (const mk of closedTotals.keys()) {
+    eligibleMonths.add(mk);
+  }
+  for (const [mk, total] of spendByMonth.entries()) {
+    if (mk < refMonthKey && total > 0) {
+      eligibleMonths.add(mk);
+    }
+  }
+
+  const last3Months = Array.from(eligibleMonths)
+    .sort((a, b) => b.localeCompare(a))
+    .slice(0, 3);
+
+  const hasHistory = last3Months.length > 0;
+  let historyAvg3Months = 0;
+  if (hasHistory) {
+    const sum = last3Months.reduce((acc, mk) => {
+      if (spendByMonth.has(mk)) return acc + (spendByMonth.get(mk) ?? 0);
+      return acc + (closedTotals.get(mk) ?? 0);
+    }, 0);
+    historyAvg3Months = roundCents(sum / last3Months.length);
+  }
+
+  const limits = options?.budget?.limits ?? {};
+  const variableBudgetsMonthly = roundCents(
+    VARIABLE_BUDGET_CATEGORIES.reduce(
+      (acc, cat) => acc + Math.max(0, Number(limits[cat]) || 0),
+      0
+    )
+  );
+
+  let habitualSpend: number;
+  let variableMonthly: number;
+  if (hasHistory) {
+    habitualSpend = roundCents(Math.max(activeFixedMonthly, historyAvg3Months));
+    variableMonthly = roundCents(Math.max(0, habitualSpend - activeFixedMonthly));
+  } else {
+    variableMonthly = variableBudgetsMonthly;
+    habitualSpend = roundCents(activeFixedMonthly + variableBudgetsMonthly);
+  }
+
+  const capacity = roundCents(totalIncome - habitualSpend);
+
+  return {
+    incomeA,
+    incomeB,
+    totalIncome,
+    activeFixedMonthly,
+    historyAvg3Months,
+    historyMonthsUsed: last3Months.length,
+    hasHistory,
+    variableBudgetsMonthly,
+    habitualSpend,
+    fixedMonthly: activeFixedMonthly,
+    variableMonthly,
+    capacity,
+    hasIncomeConfigured: totalIncome > 0,
+  };
 }
 
 export interface SavingsMemberShare {

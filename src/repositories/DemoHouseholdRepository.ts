@@ -17,6 +17,7 @@ import type {
   ActivityAction,
   ActivityEntry,
   ChecklistItem,
+  CsvCategoryKeywords,
   FurnitureItem,
   FurnitureStatus,
   GoalMovement,
@@ -29,10 +30,16 @@ import type {
   NidoBackupV1,
   RecurringExpense,
   SavingsGoal,
+  ShoppingItem,
   Transaction,
   UiMode,
 } from '../types/nido';
-import type { HouseholdRepository, Unsubscribe, UserProfileInput } from './HouseholdRepository';
+import type {
+  BankCsvImportItem,
+  HouseholdRepository,
+  Unsubscribe,
+  UserProfileInput,
+} from './HouseholdRepository';
 
 interface DemoState {
   household: Household;
@@ -47,6 +54,7 @@ interface DemoState {
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
+  shopping: ShoppingItem[];
 }
 
 const STORAGE_KEY = 'nido_demo_state_v1';
@@ -211,6 +219,11 @@ function buildInitialDemoState(): DemoState {
     monthClosures: [],
     goals,
     goalMovements,
+    shopping: [
+      { id: 'shop_1', text: 'Leche semidesnatada', qty: 6, done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
+      { id: 'shop_2', text: 'Aceite de oliva virgen extra', qty: 1, done: true, addedBy: uidB, createdAt: ts, updatedAt: ts },
+      { id: 'shop_3', text: 'Papel higiénico', qty: 2, done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
+    ],
   };
 }
 
@@ -242,6 +255,9 @@ export class DemoHouseholdRepository implements HouseholdRepository {
                   ? 'demo_marta'
                   : 'demo_alex',
           }));
+        }
+        if (loaded && !Array.isArray(loaded.shopping)) {
+          loaded.shopping = [];
         }
       }
     } catch {
@@ -468,18 +484,10 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     );
   }
 
-  subscribeAllTransactions(
-    _hid: string,
-    viewerUid: string,
-    onData: (items: Transaction[]) => void
-  ): Unsubscribe {
-    return this.subscribe(() =>
-      onData(
-        this.state.transactions
-          .filter((t) => !t.isPrivate || t.createdBy === viewerUid)
-          .sort((a, b) => b.date.localeCompare(a.date))
-      )
-    );
+  async fetchAllTransactions(_hid: string, viewerUid: string): Promise<Transaction[]> {
+    return this.state.transactions
+      .filter((t) => !t.isPrivate || t.createdBy === viewerUid)
+      .sort((a, b) => b.date.localeCompare(a.date));
   }
 
   subscribeBudget(_hid: string, monthKey: string, onData: (b: MonthlyBudget | null) => void): Unsubscribe {
@@ -500,6 +508,16 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeShopping(_hid: string, onData: (items: ShoppingItem[]) => void): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        [...this.state.shopping].sort(
+          (a, b) => Number(a.done) - Number(b.done) || a.createdAt.localeCompare(b.createdAt)
+        )
+      )
+    );
+  }
+
   async updateSettings(
     hid: string,
     settings: HouseholdSettings,
@@ -516,6 +534,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   async updateHouseholdName(hid: string, name: string, actor: UserProfileInput): Promise<void> {
     this.state.household.name = name.trim() || 'Nuestro hogar';
     this.logActivity(actor, 'update', 'hogar', hid, `Renombró el hogar a "${this.state.household.name}"`);
+    this.emit();
+  }
+
+  async updateCsvKeywords(_hid: string, keywords: CsvCategoryKeywords): Promise<void> {
+    this.state.household.csvKeywords = { ...keywords };
+    this.state.household.updatedAt = new Date().toISOString();
     this.emit();
   }
 
@@ -545,7 +569,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   }
 
   async restoreInitialCost(_hid: string, cost: InitialCost, actor: UserProfileInput): Promise<void> {
-    this.state.initialCosts.push(cost);
+    const clean: InitialCost = {
+      ...cost,
+      updatedAt: new Date().toISOString(),
+    };
+    this.state.initialCosts = [
+      ...this.state.initialCosts.filter((c) => c.id !== cost.id),
+      clean,
+    ];
     this.logActivity(actor, 'create', 'gasto_inicial', cost.id, `Restauró "${cost.concept}"`);
     this.emit();
   }
@@ -787,13 +818,21 @@ export class DemoHouseholdRepository implements HouseholdRepository {
 
   async restoreTransaction(_hid: string, tx: Transaction, actor: UserProfileInput): Promise<void> {
     const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
+    const originalCreator = tx.createdBy || actor.uid;
     const restored: Transaction = {
       ...tx,
+      splitPctA: clampSplitPct(tx.splitPctA, 50),
       isPrivate,
-      createdBy: tx.createdBy || actor.uid,
-      paidBy: isPrivate ? (tx.createdBy || actor.uid) : tx.paidBy,
+      isSettlement: isPrivate ? false : Boolean(tx.isSettlement),
+      settlementTo: isPrivate ? '' : tx.settlementTo,
+      createdBy: originalCreator,
+      paidBy: isPrivate ? originalCreator : tx.paidBy,
+      updatedAt: new Date().toISOString(),
     };
-    this.state.transactions.push(restored);
+    this.state.transactions = [
+      ...this.state.transactions.filter((t) => t.id !== tx.id),
+      restored,
+    ];
     if (!isPrivate) {
       this.logActivity(actor, 'create', 'gasto', tx.id, `Restauró "${tx.concept}"`);
     }
@@ -838,6 +877,49 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       );
     }
     this.emit();
+  }
+
+  async importBankTransactions(
+    _hid: string,
+    items: BankCsvImportItem[],
+    actor: UserProfileInput
+  ): Promise<number> {
+    if (items.length === 0) return 0;
+    const now = new Date().toISOString();
+    let sharedCount = 0;
+    for (const item of items) {
+      const isPrivate = Boolean(item.isPrivate);
+      if (!isPrivate) sharedCount += 1;
+      this.state.transactions.push({
+        id: `tx_csv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        monthKey: item.monthKey,
+        concept: item.concept,
+        category: item.category,
+        amount: Math.max(0, Number(item.amount) || 0),
+        date: item.date,
+        paidBy: isPrivate ? actor.uid : item.paidBy || COMMON_ACCOUNT_ID,
+        recurringId: null,
+        splitPctA: clampSplitPct(item.splitPctA, 50),
+        isSettlement: false,
+        settlementTo: '',
+        isPrivate,
+        createdBy: actor.uid,
+        notes: item.notes || '',
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    if (sharedCount > 0) {
+      this.logActivity(
+        actor,
+        'import',
+        'gasto',
+        `csv_${Date.now()}`,
+        `Importó ${sharedCount} movimientos desde CSV bancario`
+      );
+    }
+    this.emit();
+    return items.length;
   }
 
   async saveBudget(
@@ -906,6 +988,25 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async deleteGoalWithMovements(
+    _hid: string,
+    id: string,
+    name: string,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const removedMovements = this.state.goalMovements.filter((m) => m.goalId === id).length;
+    this.state.goals = this.state.goals.filter((g) => g.id !== id);
+    this.state.goalMovements = this.state.goalMovements.filter((m) => m.goalId !== id);
+    this.logActivity(
+      actor,
+      'delete',
+      'meta',
+      id,
+      `Eliminó meta "${name}" y sus ${removedMovements} movimientos`
+    );
+    this.emit();
+  }
+
   async addGoalMovement(
     _hid: string,
     movement: Omit<GoalMovement, 'id' | 'createdAt'>,
@@ -930,6 +1031,46 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async upsertShoppingItem(
+    _hid: string,
+    item: { id?: string; text: string; qty: number; done: boolean },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const now = new Date().toISOString();
+    const id = item.id || `shop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const cleanText = item.text.trim().slice(0, 120);
+    const cleanQty = Math.max(1, Math.min(999, Math.round(Number(item.qty) || 1)));
+    if (item.id && this.state.shopping.some((s) => s.id === item.id)) {
+      this.state.shopping = this.state.shopping.map((s) =>
+        s.id === id ? { ...s, text: cleanText, qty: cleanQty, done: Boolean(item.done), updatedAt: now } : s
+      );
+    } else {
+      this.state.shopping.push({
+        id,
+        text: cleanText,
+        qty: cleanQty,
+        done: Boolean(item.done),
+        addedBy: actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    this.emit();
+    return id;
+  }
+
+  async deleteShoppingItem(_hid: string, id: string): Promise<void> {
+    this.state.shopping = this.state.shopping.filter((s) => s.id !== id);
+    this.emit();
+  }
+
+  async deleteShoppingItemsBulk(_hid: string, ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const remove = new Set(ids);
+    this.state.shopping = this.state.shopping.filter((s) => !remove.has(s.id));
+    this.emit();
+  }
+
   async exportBackup(_hid: string, viewerUid: string): Promise<NidoBackupV1> {
     return {
       schemaVersion: 1,
@@ -937,6 +1078,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       exportedAt: new Date().toISOString(),
       householdName: this.state.household.name,
       settings: this.state.household.settings,
+      ...(this.state.household.csvKeywords ? { csvKeywords: this.state.household.csvKeywords } : {}),
       initialCosts: this.state.initialCosts.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       checklist: this.state.checklist.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       items: this.state.items.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
@@ -948,6 +1090,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       monthClosures: this.state.monthClosures.map(({ closedAt: _c, ...r }) => r),
       goals: this.state.goals.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       goalMovements: this.state.goalMovements.map(({ createdAt: _c, ...r }) => r),
+      shopping: this.state.shopping.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
     };
   }
 
@@ -955,6 +1098,9 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     const now = new Date().toISOString();
     this.state.household.name = backup.householdName;
     this.state.household.settings = backup.settings;
+    if (backup.csvKeywords) {
+      this.state.household.csvKeywords = { ...backup.csvKeywords };
+    }
     this.state.initialCosts = backup.initialCosts.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.checklist = backup.checklist.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.items = backup.items.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
@@ -980,6 +1126,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.state.monthClosures = backup.monthClosures.map((c) => ({ ...c, closedAt: now }));
     this.state.goals = backup.goals.map((g) => ({ ...g, createdAt: now, updatedAt: now }));
     this.state.goalMovements = backup.goalMovements.map((m) => ({ ...m, createdAt: now }));
+    if (Array.isArray(backup.shopping)) {
+      this.state.shopping = backup.shopping.map((s) => ({
+        ...s,
+        addedBy: s.addedBy || actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      }));
+    }
     this.logActivity(actor, 'import', 'copia_json', this.state.household.id, 'Importó copia de seguridad JSON');
     this.emit();
   }

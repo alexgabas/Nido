@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   CalendarDays,
   ChevronDown,
+  HelpCircle,
   Home,
   LogOut,
   Moon,
@@ -36,6 +37,7 @@ const SENCILLO_DESKTOP_NAV_ITEMS: Array<{
 }> = [
   { id: 'inicio', label: 'Inicio' },
   { id: 'ahorros', label: 'Ahorros' },
+  { id: 'ayuda', label: 'Ayuda' },
 ];
 
 function getInitials(name: string | undefined): string {
@@ -61,6 +63,9 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
     toggleTheme,
     quickExpenseOpen,
     setQuickExpenseOpen,
+    quickExpensePrefill,
+    quickExpenseOnSaved,
+    clearQuickExpensePrefill,
     toastMessage,
     undoToast,
     dismissUndo,
@@ -123,7 +128,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
             <span>Nido</span>
             {household?.name && (
               <span
-                className={`font-sans font-normal text-xs sm:text-sm text-slate-500 dark:text-slate-400 truncate max-w-[135px] sm:max-w-[220px] ${
+                className={`font-sans font-normal text-xs sm:text-sm text-slate-600 dark:text-slate-400 truncate max-w-[135px] sm:max-w-[220px] ${
                   uiMode === 'avanzado' ? 'hidden sm:inline' : ''
                 }`}
               >
@@ -144,7 +149,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                   className={`min-h-[44px] px-1 text-sm font-medium whitespace-nowrap shrink-0 border-b-2 transition-colors ${
                     active
                       ? 'border-[#0E5A64] dark:border-[#5EEAD4] text-[#0F1F24] dark:text-[#F0F5F6]'
-                      : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-[#0F1F24] dark:hover:text-[#F0F5F6]'
+                      : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-[#0F1F24] dark:hover:text-[#F0F5F6]'
                   }`}
                 >
                   {item.label}
@@ -161,7 +166,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
               onClick={() => setQuickExpenseOpen(true)}
               className={`${
                 uiMode === 'sencillo' ? 'hidden md:flex' : 'flex'
-              } min-h-[40px] sm:min-h-[44px] px-3 sm:px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold items-center gap-1.5 transition-colors whitespace-nowrap shrink-0`}
+              } min-h-[44px] px-3 sm:px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold items-center gap-1.5 transition-colors whitespace-nowrap shrink-0`}
             >
               <Plus className="w-4 h-4 shrink-0" />
               <span className="sm:hidden">Gasto</span>
@@ -192,7 +197,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                   {uiMode === 'sencillo' ? 'Sencillo' : 'Avanzado'}
                 </span>
                 <ChevronDown
-                  className={`w-3.5 h-3.5 text-slate-400 transition-transform ${
+                  className={`w-3.5 h-3.5 text-slate-600 dark:text-slate-300 transition-transform ${
                     menuOpen ? 'rotate-180' : ''
                   }`}
                 />
@@ -218,7 +223,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                     )}
                     <div className="min-w-0">
                       <p className="text-sm font-bold truncate">{displayName}</p>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                      <p className="text-xs text-slate-600 dark:text-slate-400 truncate">
                         {household?.name || 'Hogar'}
                       </p>
                     </div>
@@ -231,7 +236,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         <p className="text-xs font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
                           Modo de la app
                         </p>
-                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                        <p className="text-[11px] text-slate-600 dark:text-slate-400">
                           {uiMode === 'sencillo'
                             ? 'Simple, directo y sin menús técnicos'
                             : 'Tablas, filtros, gráficos y control total'}
@@ -247,7 +252,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         className={`relative inline-flex h-8 w-14 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus:outline-2 focus:outline-[#0E5A64] ${
                           uiMode === 'avanzado'
                             ? 'bg-[#0E5A64]'
-                            : 'bg-slate-300 dark:bg-slate-700'
+                            : 'bg-slate-400 dark:bg-slate-700'
                         }`}
                       >
                         <span
@@ -257,15 +262,15 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         />
                       </button>
                     </div>
-                    <div className="grid grid-cols-2 text-[11px] font-semibold text-center rounded-lg bg-white dark:bg-[#132025] p-1 border border-slate-200 dark:border-slate-800">
+                    <div className="grid grid-cols-2 gap-1 text-xs font-semibold text-center rounded-lg bg-white dark:bg-[#132025] p-1 border border-slate-200 dark:border-slate-800">
                       <button
                         type="button"
                         disabled={switchingMode || uiMode === 'sencillo'}
                         onClick={() => void handleToggleMode()}
-                        className={`min-h-[32px] rounded-md transition-colors ${
+                        className={`min-h-[44px] rounded-md transition-colors ${
                           uiMode === 'sencillo'
                             ? 'bg-[#0E5A64] text-white'
-                            : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
                         }`}
                       >
                         Sencillo
@@ -274,10 +279,10 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         type="button"
                         disabled={switchingMode || uiMode === 'avanzado'}
                         onClick={() => void handleToggleMode()}
-                        className={`min-h-[32px] rounded-md transition-colors ${
+                        className={`min-h-[44px] rounded-md transition-colors ${
                           uiMode === 'avanzado'
                             ? 'bg-[#0E5A64] text-white'
-                            : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
                         }`}
                       >
                         Avanzado
@@ -296,10 +301,22 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         }}
                         className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
-                        <Settings className="w-4 h-4 text-slate-500" />
+                        <Settings className="w-4 h-4 text-slate-600 dark:text-slate-400" />
                         <span>Ajustes del hogar</span>
                       </button>
                     )}
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveTab('ayuda');
+                        setMenuOpen(false);
+                      }}
+                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <HelpCircle className="w-4 h-4 text-slate-600 dark:text-slate-400" />
+                      <span>Ayuda e instalación</span>
+                    </button>
 
                     <button
                       type="button"
@@ -308,9 +325,9 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                     >
                       <span className="flex items-center gap-2.5">
                         {theme === 'dark' ? (
-                          <Sun className="w-4 h-4 text-slate-500" />
+                          <Sun className="w-4 h-4 text-slate-600 dark:text-slate-400" />
                         ) : (
-                          <Moon className="w-4 h-4 text-slate-500" />
+                          <Moon className="w-4 h-4 text-slate-600 dark:text-slate-400" />
                         )}
                         <span>{theme === 'dark' ? 'Cambiar a tema claro' : 'Cambiar a tema oscuro'}</span>
                       </span>
@@ -323,7 +340,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         if (isDemoMode) exitDemoMode();
                         else void logout();
                       }}
-                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5] flex items-center gap-2.5 hover:bg-[#DC4C3E]/10"
+                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5] flex items-center gap-2.5 hover:bg-[#B42318]/10"
                     >
                       <LogOut className="w-4 h-4" />
                       <span>{isDemoMode ? 'Salir de la vista de prueba' : 'Cerrar sesión'}</span>
@@ -366,7 +383,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
               type="button"
               disabled={seedingDefaults}
               onClick={() => void retryDefaultSeed()}
-              className="min-h-[36px] px-3 rounded-lg bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-60 text-white font-semibold transition-colors"
+              className="min-h-[44px] px-3.5 rounded-lg bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-60 text-white font-semibold transition-colors"
             >
               {seedingDefaults ? 'Cargando listas...' : 'Cargar listas por defecto'}
             </button>
@@ -391,7 +408,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
             className={`min-h-[50px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
               activeTab === 'inicio'
                 ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
-                : 'text-slate-500 dark:text-slate-400'
+                : 'text-slate-600 dark:text-slate-400'
             }`}
           >
             <Home className="w-5 h-5" />
@@ -415,7 +432,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
             className={`min-h-[50px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
               activeTab === 'ahorros'
                 ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
-                : 'text-slate-500 dark:text-slate-400'
+                : 'text-slate-600 dark:text-slate-400'
             }`}
           >
             <PiggyBank className="w-5 h-5" />
@@ -438,7 +455,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 className={`min-h-[48px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
                   active
                     ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
-                    : 'text-slate-500 dark:text-slate-400'
+                    : 'text-slate-600 dark:text-slate-400'
                 }`}
               >
                 <Icon className="w-5 h-5" />
@@ -453,7 +470,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       {!isOnline && (
         <div
           role="status"
-          className="fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2 rounded-xl bg-amber-600 px-3.5 py-2 text-xs font-semibold text-white shadow-lg"
+          className="fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2 rounded-xl bg-amber-900 px-3.5 py-2 text-xs font-semibold text-white shadow-lg"
         >
           <WifiOff className="w-4 h-4 shrink-0" />
           <span>Sin conexión · Trabajando con caché local</span>
@@ -474,7 +491,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
               dismissUndo();
               await fn();
             }}
-            className="min-h-[36px] px-2.5 rounded-lg bg-[#2AA1AE] text-[#0F1F24] text-xs font-bold flex items-center gap-1"
+            className="min-h-[44px] px-3 rounded-lg bg-[#5EEAD4] text-[#0F1F24] text-xs font-bold flex items-center gap-1"
           >
             <RotateCcw className="w-3.5 h-3.5" />
             Deshacer
@@ -492,7 +509,15 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         </div>
       )}
 
-      <QuickExpenseModal open={quickExpenseOpen} onClose={() => setQuickExpenseOpen(false)} />
+      <QuickExpenseModal
+        open={quickExpenseOpen}
+        onClose={() => {
+          setQuickExpenseOpen(false);
+          clearQuickExpensePrefill();
+        }}
+        prefill={quickExpensePrefill}
+        onSaved={quickExpenseOnSaved}
+      />
     </div>
   );
 };

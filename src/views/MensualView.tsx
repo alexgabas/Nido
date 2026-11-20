@@ -20,8 +20,10 @@ import {
   TrendingDown,
   TrendingUp,
   Unlock,
+  Upload,
   X,
 } from 'lucide-react';
+import { BankCsvImportModal } from '../components/BankCsvImportModal';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { QuickExpenseModal } from '../components/QuickExpenseModal';
 import { useNido } from '../context/NidoContext';
@@ -79,13 +81,9 @@ export const MensualView: React.FC = () => {
     uiMode,
     recurring,
     monthTransactions,
-    allTransactions,
+    recentTransactions,
     budget,
     monthClosures,
-    initialCosts,
-    furnitureItems,
-    goals,
-    goalMovements,
     repo,
     showToast,
     scheduleUndo,
@@ -93,6 +91,7 @@ export const MensualView: React.FC = () => {
 
   const [editingTx, setEditingTx] = useState<Transaction | null>(null);
   const [txModalOpen, setTxModalOpen] = useState(false);
+  const [csvImportOpen, setCsvImportOpen] = useState(false);
 
   // Avanzado: Search, filters, sorting, inline edit, multi-select bulk delete
   const [txSearch, setTxSearch] = useState('');
@@ -101,8 +100,11 @@ export const MensualView: React.FC = () => {
   const [sortField, setSortField] = useState<TxSortField>('date');
   const [sortAsc, setSortAsc] = useState(false);
 
-  // Avanzado: Global search across all history
+  // Avanzado: Global search on demand (no permanent listener; cached in session)
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [cachedHistory, setCachedHistory] = useState<Transaction[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [globalText, setGlobalText] = useState('');
   const [globalAmount, setGlobalAmount] = useState('');
   const [globalCategory, setGlobalCategory] = useState<TransactionCategory | 'todas'>('todas');
@@ -189,17 +191,40 @@ export const MensualView: React.FC = () => {
     [recurring, monthTransactions, selectedMonthKey]
   );
 
+  // Reset session history cache if household or user changes
+  useEffect(() => {
+    setCachedHistory(null);
+    setHistoryError(null);
+  }, [householdId, currentUserProfile?.uid]);
+
+  const loadHistoryOnDemand = async (force = false) => {
+    if (!householdId || !currentUserProfile) return;
+    if (cachedHistory !== null && !force) return;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const rows = await repo.fetchAllTransactions(householdId, currentUserProfile.uid);
+      setCachedHistory(rows);
+    } catch (err) {
+      setHistoryError(
+        toUserFriendlyErrorMessage(err, 'No se pudo cargar el historial de movimientos.')
+      );
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   const hasGlobalCriteria =
     globalText.trim() !== '' || globalAmount.trim() !== '' || globalCategory !== 'todas';
 
   const globalResults = useMemo(() => {
-    if (uiMode !== 'avanzado' || !globalSearchOpen) return [];
-    return filterGlobalTransactions(allTransactions, {
+    if (uiMode !== 'avanzado' || !globalSearchOpen || !cachedHistory) return [];
+    return filterGlobalTransactions(cachedHistory, {
       text: globalText,
       amountQuery: globalAmount,
       category: globalCategory,
     });
-  }, [uiMode, globalSearchOpen, allTransactions, globalText, globalAmount, globalCategory]);
+  }, [uiMode, globalSearchOpen, cachedHistory, globalText, globalAmount, globalCategory]);
 
   const globalTotalAmount = useMemo(
     () =>
@@ -211,10 +236,20 @@ export const MensualView: React.FC = () => {
     [globalResults]
   );
 
+  const comparisonSourceTransactions = useMemo(() => {
+    const map = new Map<string, Transaction>();
+    if (cachedHistory) {
+      for (const tx of cachedHistory) map.set(tx.id, tx);
+    }
+    for (const tx of recentTransactions) map.set(tx.id, tx);
+    for (const tx of monthTransactions) map.set(tx.id, tx);
+    return Array.from(map.values());
+  }, [cachedHistory, recentTransactions, monthTransactions]);
+
   const categoryComparison = useMemo(() => {
     if (uiMode !== 'avanzado') return { activePriorMonths: 0, rows: [] };
-    return computeCategoryComparison(allTransactions, selectedMonthKey);
-  }, [uiMode, allTransactions, selectedMonthKey]);
+    return computeCategoryComparison(comparisonSourceTransactions, selectedMonthKey);
+  }, [uiMode, comparisonSourceTransactions, selectedMonthKey]);
 
   const filteredAndSortedTransactions = useMemo(() => {
     if (uiMode === 'sencillo') return monthTransactions;
@@ -295,6 +330,8 @@ export const MensualView: React.FC = () => {
         currentUserProfile
       );
       setInlineEditId(null);
+      setCachedHistory(null);
+      if (globalSearchOpen) void loadHistoryOnDemand(true);
       showToast('Gasto actualizado');
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el gasto.'));
@@ -316,6 +353,8 @@ export const MensualView: React.FC = () => {
     try {
       await repo.deleteTransactionsBulk(householdId, deletable, currentUserProfile);
       setSelectedTxIds(new Set());
+      setCachedHistory(null);
+      if (globalSearchOpen) void loadHistoryOnDemand(true);
       showToast(`Eliminados ${deletable.length} movimientos`);
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudieron eliminar los movimientos.'));
@@ -467,12 +506,16 @@ export const MensualView: React.FC = () => {
       await repo.deleteTransaction(householdId, backup.id, backup.concept, currentUserProfile, {
         isPrivate: backup.isPrivate,
       });
+      setCachedHistory(null);
+      if (globalSearchOpen) void loadHistoryOnDemand(true);
       scheduleUndo(`Eliminado "${backup.concept}"`, async () => {
         if (closedMonthKeysRef.current.has(backup.monthKey)) {
           showToast('No se puede deshacer: el mes está cerrado.');
           return;
         }
         await repo.restoreTransaction(householdId, backup, currentUserProfile);
+        setCachedHistory(null);
+        if (globalSearchOpen) void loadHistoryOnDemand(true);
       });
     } else {
       await repo.deleteRecurring(householdId, target.item.id, target.item.concept, currentUserProfile);
@@ -508,10 +551,10 @@ export const MensualView: React.FC = () => {
       fromDate,
       toDate,
       transactions: monthTransactions,
-      initialCosts,
-      items: furnitureItems,
-      goals,
-      goalMovements,
+      initialCosts: [],
+      items: [],
+      goals: [],
+      goalMovements: [],
     });
     showToast('PDF mensual descargado');
   };
@@ -521,9 +564,9 @@ export const MensualView: React.FC = () => {
       case 'verde':
         return { bar: 'bg-[#15803D]', text: 'text-[#15803D] dark:text-[#4ADE80]', label: 'En presupuesto' };
       case 'ambar':
-        return { bar: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-300', label: 'Cerca del límite' };
+        return { bar: 'bg-amber-500', text: 'text-amber-800 dark:text-amber-300', label: 'Cerca del límite' };
       case 'rojo':
-        return { bar: 'bg-[#DC4C3E]', text: 'text-[#DC4C3E]', label: 'Superado' };
+        return { bar: 'bg-[#B42318]', text: 'text-[#B42318] dark:text-[#FCA5A5]', label: 'Superado' };
       default:
         return { bar: 'bg-slate-400', text: 'text-slate-500 dark:text-slate-400', label: 'Sin límite' };
     }
@@ -609,13 +652,13 @@ export const MensualView: React.FC = () => {
                       {tx.isPrivate && (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-600 dark:text-slate-300 shrink-0">
                           <Lock className="w-3 h-3" />
-                          <span>Personal</span>
+                          <span>Privado</span>
                         </span>
                       )}
                     </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400">
                       {EXPENSE_CATEGORY_LABELS[tx.category === 'liquidacion' ? 'otros' : tx.category]}
-                      {tx.isPrivate ? ' · Solo tú' : ` · Pagó ${memberLabel(tx.paidBy)}`}
+                      {tx.isPrivate ? ' · No lo ve tu pareja' : ` · Pagó ${memberLabel(tx.paidBy)}`}
                     </p>
                   </div>
                   <div className="flex items-center gap-0.5 shrink-0">
@@ -631,7 +674,7 @@ export const MensualView: React.FC = () => {
                             setEditingTx(tx);
                             setTxModalOpen(true);
                           }}
-                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                         >
                           <Pencil className="w-4 h-4" />
                         </button>
@@ -639,7 +682,7 @@ export const MensualView: React.FC = () => {
                           type="button"
                           aria-label={`Eliminar ${tx.concept}`}
                           onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
-                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -714,7 +757,11 @@ export const MensualView: React.FC = () => {
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => setGlobalSearchOpen((prev) => !prev)}
+            onClick={() => {
+              const next = !globalSearchOpen;
+              setGlobalSearchOpen(next);
+              if (next) void loadHistoryOnDemand(false);
+            }}
             className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors ${
               globalSearchOpen
                 ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
@@ -723,6 +770,14 @@ export const MensualView: React.FC = () => {
           >
             <Search className="w-4 h-4" />
             <span>Búsqueda global</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setCsvImportOpen(true)}
+            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+          >
+            <Upload className="w-4 h-4" />
+            <span>Importar CSV banco</span>
           </button>
           <button
             type="button"
@@ -766,7 +821,7 @@ export const MensualView: React.FC = () => {
         </div>
       </div>
 
-      {/* Global Search across all history (Modo Avanzado) */}
+      {/* Global Search across all history (Modo Avanzado, bajo demanda) */}
       {globalSearchOpen && (
         <section
           aria-label="Búsqueda global de gastos"
@@ -778,10 +833,23 @@ export const MensualView: React.FC = () => {
                 Búsqueda global en todo el historial
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Busca entre {allTransactions.length} movimientos por texto, importe exacto o parcial, y categoría.
+                {historyLoading
+                  ? 'Cargando historial completo...'
+                  : cachedHistory
+                    ? `${cachedHistory.length} movimientos en caché de esta sesión. Busca por texto, importe o categoría.`
+                    : 'Pulsa Actualizar para cargar todo el historial bajo demanda.'}
               </p>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={historyLoading}
+                onClick={() => void loadHistoryOnDemand(true)}
+                className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${historyLoading ? 'animate-spin' : ''}`} />
+                <span>Actualizar</span>
+              </button>
               {hasGlobalCriteria && (
                 <button
                   type="button"
@@ -790,7 +858,7 @@ export const MensualView: React.FC = () => {
                     setGlobalAmount('');
                     setGlobalCategory('todas');
                   }}
-                  className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                  className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
                 >
                   Limpiar
                 </button>
@@ -799,12 +867,18 @@ export const MensualView: React.FC = () => {
                 type="button"
                 aria-label="Cerrar búsqueda global"
                 onClick={() => setGlobalSearchOpen(false)}
-                className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
           </div>
+
+          {historyError && (
+            <div role="alert" className="rounded-xl bg-[#DC4C3E]/10 text-[#B42318] dark:text-[#FCA5A5] px-3.5 py-2.5 text-xs">
+              {historyError}
+            </div>
+          )}
 
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
             <div className="sm:col-span-5">
@@ -891,7 +965,7 @@ export const MensualView: React.FC = () => {
                           {tx.isPrivate && (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-600 dark:text-slate-300">
                               <Lock className="w-3 h-3" />
-                              <span>Personal</span>
+                              <span>Privado</span>
                             </span>
                           )}
                           {rowClosed && (
@@ -904,7 +978,7 @@ export const MensualView: React.FC = () => {
                         <p className="text-xs text-slate-500 dark:text-slate-400">
                           {formatDateES(tx.date)} ({formatMonthLabelES(tx.monthKey)}) ·{' '}
                           {TRANSACTION_CATEGORY_LABELS[tx.category]} ·{' '}
-                          {tx.isPrivate ? 'Solo tú' : memberLabel(tx.paidBy)}
+                          {tx.isPrivate ? 'Privado' : memberLabel(tx.paidBy)}
                         </p>
                       </div>
 
@@ -915,7 +989,7 @@ export const MensualView: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => setSelectedMonthKey(tx.monthKey)}
-                          className="min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800"
+                          className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800"
                         >
                           Ir al mes
                         </button>
@@ -927,7 +1001,7 @@ export const MensualView: React.FC = () => {
                               setEditingTx(tx);
                               setTxModalOpen(true);
                             }}
-                            className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                            className="min-h-[44px] min-w-[44px] rounded-xl inline-flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                           >
                             <Pencil className="w-4 h-4" />
                           </button>
@@ -937,7 +1011,7 @@ export const MensualView: React.FC = () => {
                             type="button"
                             aria-label={`Eliminar ${tx.concept}`}
                             onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
-                            className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                            className="min-h-[44px] min-w-[44px] rounded-xl inline-flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -951,7 +1025,7 @@ export const MensualView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setGlobalLimit((n) => n + 40)}
-                  className="min-h-[40px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
                 >
                   Mostrar más ({globalResults.length - globalLimit} restantes)
                 </button>
@@ -1058,7 +1132,7 @@ export const MensualView: React.FC = () => {
             <button
               type="button"
               onClick={() => setConfirmBulkDeleteTx(true)}
-              className="min-h-[40px] px-3.5 rounded-xl bg-[#DC4C3E] text-white text-xs font-semibold flex items-center gap-1.5 self-start md:self-auto"
+              className="min-h-[44px] px-3.5 rounded-xl bg-[#B42318] hover:bg-[#912018] text-white text-xs font-semibold flex items-center gap-1.5 self-start md:self-auto"
             >
               <Trash2 className="w-4 h-4" />
               <span>Eliminar seleccionados ({selectedTxIds.size})</span>
@@ -1069,14 +1143,14 @@ export const MensualView: React.FC = () => {
         {/* Search & Filters */}
         <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
           <div className="sm:col-span-6 relative">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <Search className="w-4 h-4 text-slate-500 dark:text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
             <input
               type="search"
               aria-label="Buscar movimientos"
               value={txSearch}
               onChange={(e) => setTxSearch(e.target.value)}
               placeholder="Buscar por concepto, categoría o nota..."
-              className="w-full min-h-[42px] pl-10 pr-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F6F8F8] dark:bg-slate-900 text-xs sm:text-sm"
+              className="w-full min-h-[44px] pl-10 pr-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F6F8F8] dark:bg-slate-900 text-xs sm:text-sm"
             />
           </div>
           <div className="sm:col-span-3">
@@ -1084,7 +1158,7 @@ export const MensualView: React.FC = () => {
               aria-label="Filtrar por categoría"
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value as TransactionCategory | 'todas')}
-              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
             >
               <option value="todas">Todas las categorías</option>
               {(Object.keys(TRANSACTION_CATEGORY_LABELS) as TransactionCategory[]).map((cat) => (
@@ -1099,7 +1173,7 @@ export const MensualView: React.FC = () => {
               aria-label="Filtrar por pagador"
               value={payerFilter}
               onChange={(e) => setPayerFilter(e.target.value)}
-              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
             >
               <option value="todos">Todos los pagadores</option>
               {memberA && <option value={memberA.uid}>{fullNameA}</option>}
@@ -1144,43 +1218,43 @@ export const MensualView: React.FC = () => {
                       />
                     </th>
                   )}
-                  <th className="py-2.5 pr-3">
+                  <th className="py-1.5 pr-3">
                     <button
                       type="button"
                       onClick={() => handleSortClick('date')}
-                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                      className="min-h-[44px] inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
                     >
                       <span>Fecha</span>
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
                   </th>
-                  <th className="py-2.5 pr-3">
+                  <th className="py-1.5 pr-3">
                     <button
                       type="button"
                       onClick={() => handleSortClick('concept')}
-                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                      className="min-h-[44px] inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
                     >
                       <span>Concepto</span>
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
                   </th>
-                  <th className="py-2.5 pr-3">
+                  <th className="py-1.5 pr-3">
                     <button
                       type="button"
                       onClick={() => handleSortClick('category')}
-                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                      className="min-h-[44px] inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
                     >
                       <span>Categoría</span>
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
                   </th>
-                  <th className="py-2.5 pr-3 font-semibold">Pagó</th>
-                  <th className="py-2.5 pr-3 font-semibold text-right">Reparto</th>
-                  <th className="py-2.5 pr-3 text-right">
+                  <th className="py-1.5 pr-3 font-semibold">Pagó</th>
+                  <th className="py-1.5 pr-3 font-semibold text-right">Reparto</th>
+                  <th className="py-1.5 pr-3 text-right">
                     <button
                       type="button"
                       onClick={() => handleSortClick('amount')}
-                      className="inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
+                      className="min-h-[44px] inline-flex items-center gap-1 font-semibold hover:text-[#0F1F24] dark:hover:text-white"
                     >
                       <span>Importe</span>
                       <ArrowUpDown className="w-3 h-3" />
@@ -1228,7 +1302,7 @@ export const MensualView: React.FC = () => {
                             aria-label="Editar concepto en línea"
                             value={inlineConcept}
                             onChange={(e) => setInlineConcept(e.target.value)}
-                            className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                            className="w-full min-h-[44px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
                           />
                         ) : (
                           <div>
@@ -1240,7 +1314,7 @@ export const MensualView: React.FC = () => {
                               {tx.isPrivate && (
                                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[10px] font-semibold text-slate-600 dark:text-slate-300">
                                   <Lock className="w-2.5 h-2.5" />
-                                  <span>Personal</span>
+                                  <span>Privado</span>
                                 </span>
                               )}
                             </div>
@@ -1259,7 +1333,7 @@ export const MensualView: React.FC = () => {
                             aria-label="Editar categoría en línea"
                             value={inlineCategory}
                             onChange={(e) => setInlineCategory(e.target.value as ExpenseCategory)}
-                            className="min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                            className="min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
                           >
                             {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
                               <option key={cat} value={cat}>
@@ -1280,7 +1354,7 @@ export const MensualView: React.FC = () => {
                             aria-label="Editar pagador en línea"
                             value={inlinePaidBy}
                             onChange={(e) => setInlinePaidBy(e.target.value)}
-                            className="min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                            className="min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
                           >
                             {memberA && <option value={memberA.uid}>{shortNameA}</option>}
                             {memberB && <option value={memberB.uid}>{shortNameB}</option>}
@@ -1301,10 +1375,10 @@ export const MensualView: React.FC = () => {
                             step={0.5}
                             value={inlineSplitPct}
                             onChange={(e) => setInlineSplitPct(e.target.value)}
-                            className="w-16 min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-right"
+                            className="w-16 min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-right"
                           />
                         ) : tx.isPrivate || tx.paidBy === COMMON_ACCOUNT_ID || tx.paidBy === 'comun' ? (
-                          <span className="text-slate-400">—</span>
+                          <span className="text-slate-500 dark:text-slate-400">—</span>
                         ) : (
                           <span className="text-slate-500 dark:text-slate-400">
                             {tx.splitPctA}/{Math.round((100 - tx.splitPctA) * 10) / 10}%
@@ -1320,7 +1394,7 @@ export const MensualView: React.FC = () => {
                             inputMode="decimal"
                             value={inlineAmount}
                             onChange={(e) => setInlineAmount(e.target.value)}
-                            className="w-24 min-h-[36px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-xs text-right font-bold"
+                            className="w-24 min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-xs text-right font-bold"
                           />
                         ) : (
                           <span
@@ -1341,7 +1415,7 @@ export const MensualView: React.FC = () => {
                                 type="button"
                                 aria-label="Guardar edición en línea"
                                 onClick={() => void handleSaveInlineEdit(tx)}
-                                className="min-h-[36px] min-w-[36px] rounded-lg bg-[#0E5A64] text-white inline-flex items-center justify-center"
+                                className="min-h-[44px] min-w-[44px] rounded-lg bg-[#0E5A64] text-white inline-flex items-center justify-center"
                               >
                                 <Check className="w-4 h-4" />
                               </button>
@@ -1349,7 +1423,7 @@ export const MensualView: React.FC = () => {
                                 type="button"
                                 aria-label="Cancelar edición en línea"
                                 onClick={() => setInlineEditId(null)}
-                                className="min-h-[36px] min-w-[36px] rounded-lg border border-slate-300 dark:border-slate-700 inline-flex items-center justify-center"
+                                className="min-h-[44px] min-w-[44px] rounded-lg border border-slate-300 dark:border-slate-700 inline-flex items-center justify-center"
                               >
                                 <X className="w-4 h-4" />
                               </button>
@@ -1367,7 +1441,7 @@ export const MensualView: React.FC = () => {
                                       setEditingTx(tx);
                                       setTxModalOpen(true);
                                     }}
-                                    className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                    className="min-h-[44px] min-w-[44px] rounded-lg inline-flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                                   >
                                     <Pencil className="w-4 h-4" />
                                   </button>
@@ -1376,7 +1450,7 @@ export const MensualView: React.FC = () => {
                                     aria-label={`Edición rápida en línea de ${tx.concept}`}
                                     title="Edición rápida en línea"
                                     onClick={() => startInlineEdit(tx)}
-                                    className="min-h-[36px] px-2 rounded-lg inline-flex items-center justify-center text-[11px] font-semibold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                    className="min-h-[44px] px-2.5 rounded-lg inline-flex items-center justify-center text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
                                   >
                                     Rápido
                                   </button>
@@ -1386,7 +1460,7 @@ export const MensualView: React.FC = () => {
                                 type="button"
                                 aria-label={`Eliminar ${tx.concept}`}
                                 onClick={() => setDeleteTarget({ kind: 'tx', item: tx })}
-                                className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                                className="min-h-[44px] min-w-[44px] rounded-lg inline-flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                               >
                                 <Trash2 className="w-4 h-4" />
                               </button>
@@ -1412,7 +1486,7 @@ export const MensualView: React.FC = () => {
               <button
                 type="button"
                 onClick={openBudgetEditor}
-                className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5"
+                className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5"
               >
                 <SlidersHorizontal className="w-3.5 h-3.5" />
                 <span>Editar límites</span>
@@ -1470,7 +1544,7 @@ export const MensualView: React.FC = () => {
             <button
               type="button"
               onClick={() => openRecModal(null)}
-              className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1"
+              className="min-h-[44px] px-3.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1"
             >
               <Plus className="w-3.5 h-3.5" />
               <span>Plantilla</span>
@@ -1502,7 +1576,7 @@ export const MensualView: React.FC = () => {
                         type="button"
                         aria-label={`Editar plantilla ${rec.concept}`}
                         onClick={() => openRecModal(rec)}
-                        className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                       >
                         <Pencil className="w-3.5 h-3.5" />
                       </button>
@@ -1510,7 +1584,7 @@ export const MensualView: React.FC = () => {
                         type="button"
                         aria-label={`Eliminar plantilla ${rec.concept}`}
                         onClick={() => setDeleteTarget({ kind: 'rec', item: rec })}
-                        className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                        className="min-h-[44px] min-w-[44px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -1556,11 +1630,11 @@ export const MensualView: React.FC = () => {
                   hasBaseline: boolean
                 ) => {
                   if (!hasBaseline) {
-                    return <span className="text-[11px] text-slate-400">Sin datos</span>;
+                    return <span className="text-[11px] text-slate-500 dark:text-slate-400">Sin datos</span>;
                   }
                   const color =
                     dir === 'up'
-                      ? 'text-[#DC4C3E]'
+                      ? 'text-[#B42318] dark:text-[#FCA5A5]'
                       : dir === 'down'
                         ? 'text-[#15803D] dark:text-[#4ADE80]'
                         : 'text-slate-500 dark:text-slate-400';
@@ -1636,11 +1710,11 @@ export const MensualView: React.FC = () => {
                       hasBaseline: boolean
                     ) => {
                       if (!hasBaseline) {
-                        return <span className="text-xs text-slate-400">Sin datos</span>;
+                        return <span className="text-xs text-slate-500 dark:text-slate-400">Sin datos</span>;
                       }
                       const color =
                         dir === 'up'
-                          ? 'text-[#DC4C3E]'
+                          ? 'text-[#B42318] dark:text-[#FCA5A5]'
                           : dir === 'down'
                             ? 'text-[#15803D] dark:text-[#4ADE80]'
                             : 'text-slate-500 dark:text-slate-400';
@@ -1705,6 +1779,19 @@ export const MensualView: React.FC = () => {
           setEditingTx(null);
         }}
         editingTx={editingTx}
+        onSaved={() => {
+          setCachedHistory(null);
+          if (globalSearchOpen) void loadHistoryOnDemand(true);
+        }}
+      />
+
+      <BankCsvImportModal
+        open={csvImportOpen}
+        onClose={() => setCsvImportOpen(false)}
+        onImported={() => {
+          setCachedHistory(null);
+          if (globalSearchOpen) void loadHistoryOnDemand(true);
+        }}
       />
 
       {recModalOpen && (
@@ -1851,7 +1938,7 @@ export const MensualView: React.FC = () => {
                     onChange={(e) =>
                       setDraftLimits((prev) => ({ ...prev, [cat]: e.target.value }))
                     }
-                    className="w-32 min-h-[40px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm text-right"
+                    className="w-32 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm text-right"
                   />
                 </div>
               ))}

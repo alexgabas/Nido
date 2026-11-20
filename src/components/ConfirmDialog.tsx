@@ -34,7 +34,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
       <div className="w-full max-w-md rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4">
         <div className="flex items-start gap-3">
           {destructive && (
-            <div className="w-10 h-10 rounded-xl bg-[#DC4C3E]/10 text-[#DC4C3E] flex items-center justify-center shrink-0">
+            <div className="w-10 h-10 rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] flex items-center justify-center shrink-0">
               <AlertTriangle className="w-5 h-5" />
             </div>
           )}
@@ -63,7 +63,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
             onClick={onConfirm}
             className={`min-h-[44px] px-5 rounded-xl text-sm font-semibold text-white transition-colors ${
               destructive
-                ? 'bg-[#DC4C3E] hover:bg-[#BE382B]'
+                ? 'bg-[#B42318] hover:bg-[#912018]'
                 : 'bg-[#0E5A64] hover:bg-[#0A464E]'
             }`}
           >

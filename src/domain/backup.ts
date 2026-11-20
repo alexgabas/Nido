@@ -159,6 +159,18 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     return val;
   };
 
+  let csvKeywords: NidoBackupV1['csvKeywords'] = undefined;
+  if (raw.csvKeywords !== undefined) {
+    if (!isObj(raw.csvKeywords)) throw new Error('csvKeywords inválido en la copia.');
+    const cleanKw: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw.csvKeywords)) {
+      if (VALID_TX_CATS.has(k) && k !== 'liquidacion') {
+        cleanKw[k] = assertStr(v, `csvKeywords.${k}`, 300);
+      }
+    }
+    csvKeywords = cleanKw as NidoBackupV1['csvKeywords'];
+  }
+
   const initialCosts = arr('initialCosts').map((item, idx) => {
     if (!isObj(item)) throw new Error(`initialCosts[${idx}] inválido.`);
     const cat = String(item.category);
@@ -348,6 +360,22 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     };
   });
 
+  const shopping = Array.isArray(raw.shopping)
+    ? raw.shopping.map((item, idx) => {
+        if (!isObj(item)) throw new Error(`shopping[${idx}] inválido.`);
+        if (typeof item.done !== 'boolean') throw new Error(`shopping[${idx}].done inválido.`);
+        const qty = assertFiniteNum(item.qty, `shopping[${idx}].qty`);
+        if (qty < 1 || qty > 999) throw new Error(`Cantidad fuera de rango en shopping[${idx}].`);
+        return {
+          id: assertStr(item.id, `shopping[${idx}].id`, 128, 1),
+          text: assertStr(item.text, `shopping[${idx}].text`, 120, 1),
+          qty,
+          done: item.done,
+          addedBy: assertStr(item.addedBy ?? '', `shopping[${idx}].addedBy`, 128),
+        };
+      })
+    : undefined;
+
   return {
     schemaVersion: 1,
     app: 'nido',
@@ -361,6 +389,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       incomeB,
       currency: 'EUR',
     },
+    ...(csvKeywords ? { csvKeywords } : {}),
     initialCosts,
     checklist,
     items,
@@ -370,5 +399,6 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     monthClosures,
     goals,
     goalMovements,
+    ...(shopping ? { shopping } : {}),
   };
 }

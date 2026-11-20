@@ -5,6 +5,7 @@ import { LoginOnboarding } from './components/LoginOnboarding';
 import { NidoProvider, useNido } from './context/NidoContext';
 import { AhorrosView } from './views/AhorrosView';
 import { AjustesView } from './views/AjustesView';
+import { AyudaView } from './views/AyudaView';
 import { InicioView } from './views/InicioView';
 import { MensualView } from './views/MensualView';
 import { MudanzaView } from './views/MudanzaView';
@@ -39,6 +40,7 @@ const NidoRouter: React.FC = () => {
       {effectiveTab === 'mensual' && <MensualView />}
       {effectiveTab === 'ahorros' && <AhorrosView />}
       {effectiveTab === 'ajustes' && <AjustesView />}
+      {effectiveTab === 'ayuda' && <AyudaView />}
     </AppShell>
   );
 };

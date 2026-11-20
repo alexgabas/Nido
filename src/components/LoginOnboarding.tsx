@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
-import { ArrowRight, Home, KeyRound, LogOut, ShieldCheck, Users } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { ArrowRight, HelpCircle, Home, KeyRound, LogOut, ShieldCheck, Users } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
 import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import { ConfirmDialog } from './ConfirmDialog';
+import { ONBOARDING_SEEN_KEY, OnboardingWalkthrough } from './OnboardingWalkthrough';
 import { PWAInstallButton } from './PWAInstallButton';
 
 export const LoginOnboarding: React.FC = () => {
@@ -27,6 +28,20 @@ export const LoginOnboarding: React.FC = () => {
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [switchConfirm, setSwitchConfirm] = useState<{ code: string; targetName: string } | null>(null);
+  const [walkthroughOpen, setWalkthroughOpen] = useState(false);
+
+  useEffect(() => {
+    if (!authReady || householdLoading || authUser) return;
+    try {
+      const seen = window.localStorage.getItem(ONBOARDING_SEEN_KEY);
+      const isAutostart = new URLSearchParams(window.location.search).get('autostart') === '1';
+      if (!seen && !isAutostart) {
+        setWalkthroughOpen(true);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, [authReady, householdLoading, authUser]);
 
   const handleGoogleLogin = async () => {
     setErrorMsg(null);
@@ -119,6 +134,14 @@ export const LoginOnboarding: React.FC = () => {
           <span className="font-display font-bold text-xl tracking-tight">Nido</span>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setWalkthroughOpen(true)}
+            className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 transition-colors"
+          >
+            <HelpCircle className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+            <span className="hidden sm:inline">Cómo funciona</span>
+          </button>
           <PWAInstallButton />
           <button
             type="button"
@@ -333,7 +356,7 @@ export const LoginOnboarding: React.FC = () => {
         title="Cambiar de hogar activo"
         description={
           switchConfirm
-            ? `Tu cuenta ya pertenece a otro hogar. Si continúas, pasarás a usar "${switchConfirm.targetName}" como hogar activo.`
+            ? `Ahora perteneces a "${switchConfirm.targetName}". Tu cuenta ya pertenece a otro hogar. Si continúas, pasarás a usar "${switchConfirm.targetName}" como hogar activo.`
             : ''
         }
         confirmLabel="Cambiar de hogar"
@@ -343,6 +366,8 @@ export const LoginOnboarding: React.FC = () => {
         }}
         onCancel={() => setSwitchConfirm(null)}
       />
+
+      <OnboardingWalkthrough open={walkthroughOpen} onClose={() => setWalkthroughOpen(false)} />
     </div>
   );
 };

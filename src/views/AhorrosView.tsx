@@ -1,5 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
+  Archive,
   ArrowDownCircle,
   ArrowUpCircle,
   Download,
@@ -7,25 +9,28 @@ import {
   Pencil,
   PiggyBank,
   Plus,
+  RotateCcw,
   ShieldCheck,
   Sparkles,
   Trash2,
 } from 'lucide-react';
 import { DonutChart } from '../components/Charts';
-import { ConfirmDialog } from '../components/ConfirmDialog';
 import { useNido } from '../context/NidoContext';
 import { downloadTextFile, generateSpanishCSV } from '../domain/backup';
 import {
   computeEmergencyTarget,
   computeGoalProgress,
   computeSavingsByMember,
+  computeSavingsCapacity,
   formatDateES,
   formatEUR,
   formatPctES,
+  getCurrentMonthKeyLocal,
   getTodayLocalISO,
   roundCents,
 } from '../domain/finance';
 import { GOAL_TYPE_LABELS } from '../domain/presets';
+import { toUserFriendlyErrorMessage } from '../services/firebase';
 import { exportNidoPDF } from '../services/pdfExport';
 import type { GoalType, SavingsGoal } from '../types/nido';
 
@@ -42,9 +47,9 @@ export const AhorrosView: React.FC = () => {
     goals,
     goalMovements,
     recurring,
-    monthTransactions,
-    initialCosts,
-    furnitureItems,
+    recentTransactions,
+    monthClosures,
+    currentMonthBudget,
     repo,
     showToast,
   } = useNido();
@@ -69,8 +74,10 @@ export const AhorrosView: React.FC = () => {
 
   const [celebratedGoalName, setCelebratedGoalName] = useState<string | null>(null);
   const [deleteGoalTarget, setDeleteGoalTarget] = useState<SavingsGoal | null>(null);
+  const [deletingGoal, setDeletingGoal] = useState(false);
 
   const activeGoals = useMemo(() => goals.filter((g) => !g.archived), [goals]);
+  const archivedGoals = useMemo(() => goals.filter((g) => g.archived), [goals]);
 
   const goalsProgress = useMemo(
     () => activeGoals.map((g) => computeGoalProgress(g, goalMovements, todayISO)),
@@ -85,6 +92,38 @@ export const AhorrosView: React.FC = () => {
   const totalTarget = useMemo(
     () => roundCents(activeGoals.reduce((s, g) => s + Math.max(0, Number(g.targetAmount) || 0), 0)),
     [activeGoals]
+  );
+
+  const currentMonthKey = getCurrentMonthKeyLocal();
+
+  const savingsCapacity = useMemo(
+    () =>
+      household
+        ? computeSavingsCapacity(household.settings, recurring, {
+            transactions: recentTransactions,
+            monthClosures,
+            currentMonthKey,
+            budget: currentMonthBudget,
+          })
+        : null,
+    [household, recurring, recentTransactions, monthClosures, currentMonthKey, currentMonthBudget]
+  );
+
+  const totalMonthlySuggested = useMemo(
+    () =>
+      roundCents(
+        goalsProgress.reduce(
+          (sum, gp) => sum + (!gp.isCompleted && gp.monthlyNeeded !== null ? gp.monthlyNeeded : 0),
+          0
+        )
+      ),
+    [goalsProgress]
+  );
+
+  const suggestionsExceedCapacity = Boolean(
+    savingsCapacity?.hasIncomeConfigured &&
+      totalMonthlySuggested > 0 &&
+      totalMonthlySuggested > savingsCapacity.capacity
   );
 
   const emergency3x = useMemo(() => computeEmergencyTarget(recurring, 3), [recurring]);
@@ -106,12 +145,17 @@ export const AhorrosView: React.FC = () => {
     [goalsProgress]
   );
 
-  const openMovementModal = (goal: SavingsGoal, direction: 'add' | 'withdraw') => {
+  const openMovementModal = (
+    goal: SavingsGoal,
+    direction: 'add' | 'withdraw',
+    initialAmount = '',
+    initialNote = ''
+  ) => {
     setMoveGoal(goal);
     setMoveDirection(direction);
-    setMoveAmount('');
+    setMoveAmount(initialAmount);
     setMoveBy(currentUserProfile?.uid || memberA?.uid || '');
-    setMoveNote('');
+    setMoveNote(initialNote);
   };
 
   const handleSaveMovement = async (e: React.FormEvent) => {
@@ -221,9 +265,9 @@ export const AhorrosView: React.FC = () => {
       members,
       fromDate: todayISO.slice(0, 4) + '-01-01',
       toDate: todayISO,
-      transactions: monthTransactions,
-      initialCosts,
-      items: furnitureItems,
+      transactions: [],
+      initialCosts: [],
+      items: [],
       goals,
       goalMovements,
     });
@@ -385,17 +429,40 @@ export const AhorrosView: React.FC = () => {
           )}
         </section>
 
+        {/* Suggestions capacity indicator (Modo Sencillo) */}
+        {totalMonthlySuggested > 0 && (
+          <section
+            aria-label="Resumen de aportaciones mensuales"
+            className={`rounded-2xl border p-4 text-xs sm:text-sm flex items-start gap-2.5 ${
+              suggestionsExceedCapacity
+                ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200'
+                : 'bg-white dark:bg-[#132025] border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+            }`}
+          >
+            {suggestionsExceedCapacity && (
+              <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-300 shrink-0 mt-0.5" />
+            )}
+            <p className="tabular-nums">
+              {suggestionsExceedCapacity && savingsCapacity
+                ? savingsCapacity.capacity > 0
+                  ? `Las metas con fecha suman ${formatEUR(totalMonthlySuggested)}/mes y superan lo que os sobra al mes (${formatEUR(savingsCapacity.capacity)}).`
+                  : `Las metas con fecha suman ${formatEUR(totalMonthlySuggested)}/mes, pero este mes vais justos.`
+                : `Para cumplir vuestras fechas objetivo haría falta apartar ${formatEUR(totalMonthlySuggested)}/mes.`}
+            </p>
+          </section>
+        )}
+
         {/* Goal Cards */}
         {goalsProgress.length === 0 ? (
           <div className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
             <p className="text-base font-bold">No tenéis metas de ahorro todavía</p>
-            <p className="text-sm text-slate-500 dark:text-slate-400">
-              Cuando creéis una meta aparecerá aquí para ir sumando.
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              Para crear o editar una meta, cambia al Modo Avanzado desde tu foto de perfil arriba a la derecha.
             </p>
           </div>
         ) : (
           <div className="space-y-4">
-            {goalsProgress.map(({ goal, savedAmount, pct, remaining, isCompleted }) => (
+            {goalsProgress.map(({ goal, savedAmount, pct, remaining, monthlyNeeded, isCompleted }) => (
               <article
                 key={goal.id}
                 className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
@@ -431,25 +498,49 @@ export const AhorrosView: React.FC = () => {
                       Objetivo: {formatEUR(goal.targetAmount)}
                     </p>
                   )}
+                  {!isCompleted && monthlyNeeded !== null && (
+                    <p className="text-xs font-medium text-[#0E5A64] dark:text-[#5EEAD4] tabular-nums">
+                      Sugerencia: {formatEUR(monthlyNeeded)}/mes
+                    </p>
+                  )}
                 </div>
 
-                <div className="grid grid-cols-2 gap-3 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => openMovementModal(goal, 'add')}
-                    className="min-h-[48px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <ArrowUpCircle className="w-5 h-5" />
-                    <span>Aportar</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => openMovementModal(goal, 'withdraw')}
-                    className="min-h-[48px] px-4 rounded-2xl border border-slate-200 dark:border-slate-700 text-sm font-bold flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
-                  >
-                    <ArrowDownCircle className="w-5 h-5" />
-                    <span>Retirar</span>
-                  </button>
+                <div className="space-y-2 pt-1">
+                  {!isCompleted && monthlyNeeded !== null && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openMovementModal(
+                          goal,
+                          'add',
+                          String(monthlyNeeded).replace('.', ','),
+                          'Aportación mensual sugerida'
+                        )
+                      }
+                      className="w-full min-h-[46px] px-4 rounded-2xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] border border-[#15803D]/25 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5"
+                    >
+                      <Sparkles className="w-4 h-4" />
+                      <span>Aportar lo sugerido ({formatEUR(monthlyNeeded)})</span>
+                    </button>
+                  )}
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => openMovementModal(goal, 'add')}
+                      className="min-h-[48px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold flex items-center justify-center gap-2 transition-colors"
+                    >
+                      <ArrowUpCircle className="w-5 h-5" />
+                      <span>Aportar</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openMovementModal(goal, 'withdraw')}
+                      className="min-h-[48px] px-4 rounded-2xl border border-slate-200 dark:border-slate-700 text-sm font-bold flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      <ArrowDownCircle className="w-5 h-5" />
+                      <span>Retirar</span>
+                    </button>
+                  </div>
                 </div>
               </article>
             ))}
@@ -584,6 +675,38 @@ export const AhorrosView: React.FC = () => {
         </section>
       </div>
 
+      {/* Suggestions total vs savings capacity banner */}
+      {totalMonthlySuggested > 0 && (
+        <section
+          aria-label="Sugerencias mensuales frente a capacidad de ahorro"
+          className={`rounded-2xl border p-4 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm ${
+            suggestionsExceedCapacity
+              ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200'
+              : 'bg-white dark:bg-[#132025] border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+          }`}
+        >
+          <div className="flex items-start gap-2.5">
+            {suggestionsExceedCapacity && (
+              <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-300 shrink-0 mt-0.5" />
+            )}
+            <p className="tabular-nums">
+              Suma de sugerencias mensuales:{' '}
+              <strong>{formatEUR(totalMonthlySuggested)}/mes</strong>
+              {savingsCapacity?.hasIncomeConfigured ? (
+                <>
+                  {' · '}Capacidad de ahorro: <strong>{formatEUR(savingsCapacity.capacity)}/mes</strong>
+                  {suggestionsExceedCapacity
+                    ? ' (las sugerencias superan la capacidad disponible; amplía fechas objetivo o revisa gastos fijos).'
+                    : ' (dentro de vuestra capacidad de ahorro).'}
+                </>
+              ) : (
+                ' · Configura vuestros ingresos en Inicio o Ajustes para comparar con la capacidad de ahorro.'
+              )}
+            </p>
+          </div>
+        </section>
+      )}
+
       {/* Goal Cards */}
       {goalsProgress.length === 0 ? (
         <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
@@ -619,15 +742,15 @@ export const AhorrosView: React.FC = () => {
                     type="button"
                     aria-label={`Editar meta ${goal.name}`}
                     onClick={() => openGoalEditor(goal)}
-                    className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
                   >
                     <Pencil className="w-4 h-4" />
                   </button>
                   <button
                     type="button"
-                    aria-label={`Eliminar meta ${goal.name}`}
+                    aria-label={`Archivar o eliminar meta ${goal.name}`}
                     onClick={() => setDeleteGoalTarget(goal)}
-                    className="min-h-[40px] min-w-[40px] rounded-xl flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                    className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
@@ -655,7 +778,7 @@ export const AhorrosView: React.FC = () => {
                 {remaining > 0 ? (
                   <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
                     Faltan {formatEUR(remaining)}
-                    {monthlyNeeded !== null ? ` → ${formatEUR(monthlyNeeded)}/mes hasta la fecha objetivo` : ''}
+                    {monthlyNeeded !== null ? ` → Sugerido: ${formatEUR(monthlyNeeded)}/mes` : ''}
                   </p>
                 ) : (
                   <p className="text-xs font-semibold text-[#15803D] dark:text-[#4ADE80]">
@@ -664,27 +787,102 @@ export const AhorrosView: React.FC = () => {
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => openMovementModal(goal, 'add')}
-                  className="min-h-[44px] px-3 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5"
-                >
-                  <ArrowUpCircle className="w-4 h-4" />
-                  <span>Aportar</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openMovementModal(goal, 'withdraw')}
-                  className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
-                >
-                  <ArrowDownCircle className="w-4 h-4" />
-                  <span>Retirar</span>
-                </button>
+              <div className="space-y-2 pt-1">
+                {!isCompleted && monthlyNeeded !== null && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openMovementModal(
+                        goal,
+                        'add',
+                        String(monthlyNeeded).replace('.', ','),
+                        'Aportación mensual sugerida'
+                      )
+                    }
+                    className="w-full min-h-[44px] px-3 rounded-xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] border border-[#15803D]/25 text-xs font-bold flex items-center justify-center gap-1.5 hover:bg-[#15803D]/18"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Aportar lo sugerido ({formatEUR(monthlyNeeded)})</span>
+                  </button>
+                )}
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => openMovementModal(goal, 'add')}
+                    className="min-h-[44px] px-3 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5"
+                  >
+                    <ArrowUpCircle className="w-4 h-4" />
+                    <span>Aportar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openMovementModal(goal, 'withdraw')}
+                    className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  >
+                    <ArrowDownCircle className="w-4 h-4" />
+                    <span>Retirar</span>
+                  </button>
+                </div>
               </div>
             </article>
           ))}
         </div>
+      )}
+
+      {/* Archived Goals (Modo Avanzado) */}
+      {archivedGoals.length > 0 && (
+        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3">
+          <div className="flex items-center gap-2 text-slate-600 dark:text-slate-300">
+            <Archive className="w-4 h-4" />
+            <h2 className="font-display text-sm font-bold">
+              Metas archivadas ({archivedGoals.length})
+            </h2>
+          </div>
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+            {archivedGoals.map((ag) => {
+              const prog = computeGoalProgress(ag, goalMovements, todayISO);
+              return (
+                <li
+                  key={ag.id}
+                  className="py-2.5 first:pt-0 last:pb-0 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm"
+                >
+                  <div>
+                    <p className="font-semibold">{ag.name}</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                      Acumulado: {formatEUR(prog.savedAmount)} de {formatEUR(ag.targetAmount)}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        householdId &&
+                        currentUserProfile &&
+                        void repo.upsertGoal(
+                          householdId,
+                          { ...ag, archived: false },
+                          currentUserProfile
+                        )
+                      }
+                      className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Reactivar</span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Borrar definitivamente ${ag.name}`}
+                      onClick={() => setDeleteGoalTarget(ag)}
+                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
       )}
 
       {/* Advanced: Recent Goal Movements Table */}
@@ -726,7 +924,7 @@ export const AhorrosView: React.FC = () => {
                       </td>
                       <td
                         className={`py-2.5 pr-3 text-right font-mono-num font-bold whitespace-nowrap ${
-                          m.amount >= 0 ? 'text-[#15803D] dark:text-[#4ADE80]' : 'text-[#DC4C3E]'
+                          m.amount >= 0 ? 'text-[#15803D] dark:text-[#4ADE80]' : 'text-[#B42318] dark:text-[#FCA5A5]'
                         }`}
                       >
                         {m.amount >= 0 ? `+${formatEUR(m.amount)}` : formatEUR(m.amount)}
@@ -745,7 +943,7 @@ export const AhorrosView: React.FC = () => {
                               currentUserProfile
                             )
                           }
-                          className="min-h-[36px] min-w-[36px] rounded-lg inline-flex items-center justify-center text-slate-400 hover:text-[#DC4C3E]"
+                          className="min-h-[44px] min-w-[44px] rounded-lg inline-flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -852,20 +1050,107 @@ export const AhorrosView: React.FC = () => {
         </div>
       )}
 
-      <ConfirmDialog
-        open={Boolean(deleteGoalTarget)}
-        title="Eliminar meta de ahorro"
-        description={`Vas a eliminar la meta "${deleteGoalTarget?.name ?? ''}". Los movimientos asociados dejarán de mostrarse en el panel.`}
-        confirmLabel="Eliminar meta"
-        onConfirm={async () => {
-          if (!deleteGoalTarget || !householdId || !currentUserProfile) return;
-          const target = deleteGoalTarget;
-          setDeleteGoalTarget(null);
-          await repo.deleteGoal(householdId, target.id, target.name, currentUserProfile);
-          showToast('Meta eliminada');
-        }}
-        onCancel={() => setDeleteGoalTarget(null)}
-      />
+      {deleteGoalTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-xs p-0 sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-goal-dialog-title"
+        >
+          {(() => {
+            const associatedCount = goalMovements.filter(
+              (m) => m.goalId === deleteGoalTarget.id
+            ).length;
+            const handleArchive = async () => {
+              if (!householdId || !currentUserProfile) return;
+              setDeletingGoal(true);
+              try {
+                await repo.upsertGoal(
+                  householdId,
+                  { ...deleteGoalTarget, archived: true },
+                  currentUserProfile
+                );
+                setDeleteGoalTarget(null);
+                showToast('Meta archivada (sus movimientos se conservan)');
+              } catch (err) {
+                showToast(toUserFriendlyErrorMessage(err, 'No se pudo archivar la meta.'));
+              } finally {
+                setDeletingGoal(false);
+              }
+            };
+            const handleDeleteAll = async () => {
+              if (!householdId || !currentUserProfile) return;
+              setDeletingGoal(true);
+              try {
+                await repo.deleteGoalWithMovements(
+                  householdId,
+                  deleteGoalTarget.id,
+                  deleteGoalTarget.name,
+                  currentUserProfile
+                );
+                setDeleteGoalTarget(null);
+                showToast('Meta y sus movimientos eliminados');
+              } catch (err) {
+                showToast(
+                  toUserFriendlyErrorMessage(err, 'No se pudo eliminar la meta y sus movimientos.')
+                );
+              } finally {
+                setDeletingGoal(false);
+              }
+            };
+
+            return (
+              <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4">
+                <div className="space-y-2">
+                  <h2 id="delete-goal-dialog-title" className="font-display text-lg font-bold">
+                    ¿Qué quieres hacer con «{deleteGoalTarget.name}»?
+                  </h2>
+                  <p className="text-sm text-slate-600 dark:text-slate-300">
+                    {associatedCount > 0
+                      ? `Esta meta tiene ${associatedCount} movimiento${associatedCount === 1 ? '' : 's'} guardado${associatedCount === 1 ? '' : 's'}. Si la archivas, conservas el historial y podrás reactivarla más adelante.`
+                      : 'Si la archivas, la conservas en el historial; si la borras, desaparecerá de forma permanente.'}
+                  </p>
+                </div>
+
+                <div className="space-y-2 pt-1">
+                  {!deleteGoalTarget.archived && (
+                    <button
+                      type="button"
+                      disabled={deletingGoal}
+                      onClick={() => void handleArchive()}
+                      className="w-full min-h-[46px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-50 text-white text-sm font-semibold flex items-center justify-center gap-2"
+                    >
+                      <Archive className="w-4 h-4" />
+                      <span>Archivar (recomendado)</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={deletingGoal}
+                    onClick={() => void handleDeleteAll()}
+                    className="w-full min-h-[46px] px-4 rounded-xl bg-[#B42318] hover:bg-[#912018] disabled:opacity-50 text-white text-sm font-semibold flex items-center justify-center gap-2"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>
+                      {associatedCount > 0
+                        ? `Borrar con sus ${associatedCount} movimientos`
+                        : 'Borrar meta definitivamente'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deletingGoal}
+                    onClick={() => setDeleteGoalTarget(null)}
+                    className="w-full min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium"
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      )}
     </div>
   );
 };

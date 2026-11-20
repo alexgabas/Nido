@@ -1,6 +1,8 @@
 import type {
   ActivityEntry,
   ChecklistItem,
+  CsvCategoryKeywords,
+  ExpenseCategory,
   FurnitureItem,
   FurnitureStatus,
   GoalMovement,
@@ -13,6 +15,7 @@ import type {
   NidoBackupV1,
   RecurringExpense,
   SavingsGoal,
+  ShoppingItem,
   Transaction,
   UiMode,
 } from '../types/nido';
@@ -27,6 +30,18 @@ export interface UserProfileInput {
 
 export interface JoinHouseholdOptions {
   confirmSwitch?: boolean;
+}
+
+export interface BankCsvImportItem {
+  monthKey: string;
+  concept: string;
+  category: ExpenseCategory;
+  amount: number;
+  date: string;
+  paidBy: string;
+  splitPctA: number;
+  isPrivate: boolean;
+  notes: string;
 }
 
 export class HouseholdSwitchConfirmationRequiredError extends Error {
@@ -58,7 +73,7 @@ export interface HouseholdRepository {
   hasPendingDefaultSeed(householdId: string): boolean;
   regenerateInviteCode(householdId: string, oldCode: string, actor: UserProfileInput): Promise<string>;
 
-  // Subscriptions
+  // Subscriptions & On-Demand Queries
   subscribeHousehold(
     householdId: string,
     onData: (h: Household | null) => void,
@@ -109,12 +124,7 @@ export interface HouseholdRepository {
     onData: (items: Transaction[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
-  subscribeAllTransactions(
-    householdId: string,
-    viewerUid: string,
-    onData: (items: Transaction[]) => void,
-    onError: (e: Error) => void
-  ): Unsubscribe;
+  fetchAllTransactions(householdId: string, viewerUid: string): Promise<Transaction[]>;
   subscribeBudget(
     householdId: string,
     monthKey: string,
@@ -136,6 +146,11 @@ export interface HouseholdRepository {
     onData: (m: GoalMovement[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
+  subscribeShopping(
+    householdId: string,
+    onData: (items: ShoppingItem[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
 
   // Settings & Member
   updateSettings(
@@ -149,6 +164,7 @@ export interface HouseholdRepository {
     name: string,
     actor: UserProfileInput
   ): Promise<void>;
+  updateCsvKeywords(householdId: string, keywords: CsvCategoryKeywords): Promise<void>;
   updateMemberUiMode(
     householdId: string,
     uid: string,
@@ -264,6 +280,11 @@ export interface HouseholdRepository {
     items: Array<{ id: string; concept: string; isPrivate?: boolean }>,
     actor: UserProfileInput
   ): Promise<void>;
+  importBankTransactions(
+    householdId: string,
+    items: BankCsvImportItem[],
+    actor: UserProfileInput
+  ): Promise<number>;
 
   // Budgets & Closures
   saveBudget(
@@ -295,6 +316,12 @@ export interface HouseholdRepository {
     name: string,
     actor: UserProfileInput
   ): Promise<void>;
+  deleteGoalWithMovements(
+    householdId: string,
+    id: string,
+    name: string,
+    actor: UserProfileInput
+  ): Promise<void>;
   addGoalMovement(
     householdId: string,
     movement: Omit<GoalMovement, 'id' | 'createdAt'>,
@@ -307,6 +334,15 @@ export interface HouseholdRepository {
     goalName: string,
     actor: UserProfileInput
   ): Promise<void>;
+
+  // Shopping List (sin log de actividad por ítem)
+  upsertShoppingItem(
+    householdId: string,
+    item: { id?: string; text: string; qty: number; done: boolean },
+    actor: UserProfileInput
+  ): Promise<string>;
+  deleteShoppingItem(householdId: string, id: string): Promise<void>;
+  deleteShoppingItemsBulk(householdId: string, ids: string[]): Promise<void>;
 
   // Export & Backup Restore
   exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1>;

@@ -73,6 +73,26 @@
           "type": "object",
           "description": "Split configuration and currency settings."
         },
+        "csvKeywords": {
+          "type": "object",
+          "description": "Optional comma-separated keyword rules keyed by the 13 ExpenseCategory keys for bank CSV auto-categorization.",
+          "properties": {
+            "alquiler": { "type": "string", "maxLength": 300 },
+            "luz": { "type": "string", "maxLength": 300 },
+            "agua": { "type": "string", "maxLength": 300 },
+            "gas": { "type": "string", "maxLength": 300 },
+            "internet": { "type": "string", "maxLength": 300 },
+            "movil": { "type": "string", "maxLength": 300 },
+            "suscripciones": { "type": "string", "maxLength": 300 },
+            "seguros": { "type": "string", "maxLength": 300 },
+            "comunidad": { "type": "string", "maxLength": 300 },
+            "supermercado": { "type": "string", "maxLength": 300 },
+            "transporte": { "type": "string", "maxLength": 300 },
+            "ocio": { "type": "string", "maxLength": 300 },
+            "otros": { "type": "string", "maxLength": 300 }
+          },
+          "additionalProperties": false
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
@@ -560,6 +580,38 @@
         }
       },
       "required": ["goalId", "amount", "by", "date", "note", "createdAt"]
+    },
+    "ShoppingItem": {
+      "title": "ShoppingItem",
+      "description": "Shared household shopping list item synced in real time.",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "qty": {
+          "type": "number"
+        },
+        "done": {
+          "type": "boolean"
+        },
+        "addedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["text", "qty", "done", "addedBy", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -618,6 +670,10 @@
     "/households/{hid}/goalMovements/{id}": {
       "schema": { "$ref": "#/entities/GoalMovement" },
       "description": "Deposits and withdrawals on savings goals."
+    },
+    "/households/{hid}/shopping/{id}": {
+      "schema": { "$ref": "#/entities/ShoppingItem" },
+      "description": "Shared household shopping list items."
     }
   }
 }

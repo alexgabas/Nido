@@ -190,3 +190,20 @@ export const SPLIT_PRESETS: Array<{ label: string; a: number; b: number }> = [
   { label: '70 / 30', a: 70, b: 30 },
   { label: '30 / 70', a: 30, b: 70 },
 ];
+
+export const DEFAULT_CSV_KEYWORDS: Record<ExpenseCategory, string> = {
+  alquiler: 'alquiler, renta piso, arrendamiento, inmobiliaria',
+  luz: 'endesa, iberdrola, naturgy, holaluz, energia, electricidad',
+  agua: 'aigues, agbar, aqualia, agua, ematsa',
+  gas: 'gas natural, nedgia, repsol gas, butano',
+  internet: 'digi, movistar, orange, vodafone, o2, fibra, pepephone',
+  movil: 'simyo, lowi, yoigo, masmovil, finetwork, recarga movil',
+  suscripciones: 'netflix, spotify, hbo, disney, prime video, youtube, icloud, apple',
+  seguros: 'mapfre, mutua, axa, allianz, adeslas, sanitas, seguro',
+  comunidad: 'comunidad, fincas, administrador',
+  supermercado: 'mercadona, bonpreu, esclat, lidl, aldi, carrefour, alcampo, consum, caprabo, dia, eroski, supermercado',
+  transporte: 'tmb, renfe, rodalies, fgc, metro, uber, cabify, gasolinera, repsol, cepsa, bp, autopista, peaje, parking',
+  ocio: 'restaurante, bar, cafe, cafeteria, glovo, just eat, cine, teatro, concierto, amazon, decathlon',
+  otros: '',
+};
+

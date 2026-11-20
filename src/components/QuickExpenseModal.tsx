@@ -28,6 +28,7 @@ import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
   COMMON_ACCOUNT_ID,
   type ExpenseCategory,
+  type ExpensePrefill,
   type SplitPresetChoice,
   type Transaction,
 } from '../types/nido';
@@ -36,6 +37,8 @@ interface QuickExpenseModalProps {
   open: boolean;
   onClose: () => void;
   editingTx?: Transaction | null;
+  prefill?: ExpensePrefill | null;
+  onSaved?: (() => Promise<void> | void) | null;
 }
 
 const SENCILLO_CATEGORIES: Array<{
@@ -55,11 +58,23 @@ const SENCILLO_CATEGORIES: Array<{
 
 const KEYPAD_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', ',', '0', 'BACK'] as const;
 
-const AVANZADO_SPLIT_OPTIONS: Array<{ id: SplitPresetChoice; label: string }> = [
+const AVANZADO_SPLIT_OPTIONS: Array<{
+  id: SplitPresetChoice;
+  label: string;
+  helper?: string;
+}> = [
   { id: 'segun_reparto', label: 'Según reparto' },
   { id: 'a_medias', label: 'A medias' },
-  { id: 'solo_yo', label: 'Solo yo' },
-  { id: 'solo_pareja', label: 'Solo mi pareja' },
+  {
+    id: 'solo_yo',
+    label: 'Lo pago y asumo yo (cuenta en el hogar)',
+    helper: 'Lo ve tu pareja y suma al total del hogar, pero el 100 % te corresponde a ti.',
+  },
+  {
+    id: 'solo_pareja',
+    label: 'Solo mi pareja',
+    helper: 'Suma al total del hogar, pero el 100 % corresponde a tu pareja.',
+  },
   { id: 'personalizado', label: 'Personalizado' },
 ];
 
@@ -75,6 +90,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   open,
   onClose,
   editingTx = null,
+  prefill = null,
+  onSaved = null,
 }) => {
   const {
     householdId,
@@ -122,8 +139,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     if (!open) return;
     setError(null);
     setWizardStep(1);
-    setConceptTouched(false);
     if (editingTx) {
+      setConceptTouched(false);
       const clampedSplit = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
       setAmount(String(editingTx.amount));
       setConcept(editingTx.concept);
@@ -143,19 +160,25 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             ? today
             : `${selectedMonthKey}-01`;
       const defaultSplit = clampSplitPct(effectiveSplitPctA, 50);
-      setAmount('');
-      setConcept(uiMode === 'sencillo' ? EXPENSE_CATEGORY_LABELS.supermercado : '');
-      setCategory('supermercado');
+      const initialCategory = prefill?.category ?? 'supermercado';
+      const initialConcept =
+        prefill?.concept ??
+        (uiMode === 'sencillo' ? EXPENSE_CATEGORY_LABELS[initialCategory] : '');
+      setConceptTouched(Boolean(prefill?.concept));
+      setAmount(prefill?.amount ? prefill.amount.trim().replace('.', ',') : '');
+      setConcept(initialConcept);
+      setCategory(initialCategory);
       setPaidBy(currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID);
       setDate(defaultDate);
       setSplitChoice('segun_reparto');
       setSplitPctInput(String(defaultSplit));
       setIsPrivate(false);
-      setNotes('');
+      setNotes(prefill?.notes ?? '');
     }
   }, [
     open,
     editingTx,
+    prefill,
     selectedMonthKey,
     currentUserProfile,
     memberA,
@@ -283,7 +306,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
         return;
       }
       safeSplitPctA = clampSplitPct(numSplit, effectiveSplitPctA);
-    } else if (isSimpleEdit && splitChoice !== 'segun_reparto' && splitChoice !== 'solo_yo' && editingTx) {
+    } else if (isSimpleWizard) {
+      safeSplitPctA = clampSplitPct(effectiveSplitPctA, 50);
+    } else if (isSimpleEdit && editingTx) {
       safeSplitPctA = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
     } else {
       safeSplitPctA = resolveSplitPctForChoice(
@@ -315,10 +340,19 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
           settlementTo: '',
           isPrivate,
           createdBy: editingTx?.createdBy || currentUserProfile.uid,
-          notes: isSimpleWizard ? '' : notes,
+          notes: notes.trim(),
         },
         currentUserProfile
       );
+      if (onSaved) {
+        try {
+          await onSaved();
+        } catch {
+          showToast('Gasto guardado, pero no se pudieron limpiar los artículos marcados.');
+          onClose();
+          return;
+        }
+      }
       showToast(editingTx ? 'Gasto actualizado' : 'Gasto guardado');
       onClose();
     } catch (err) {
@@ -345,6 +379,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     splitPctInput
   );
   const previewSplitPctB = Math.round((100 - previewSplitPctA) * 10) / 10;
+
+  const activeSplitOption = AVANZADO_SPLIT_OPTIONS.find((o) => o.id === splitChoice);
 
   // ─── MODO SENCILLO: FULL-SCREEN 3-STEP WIZARD ──────────────────────────────
   if (isSimpleWizard) {
@@ -421,10 +457,15 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                 <p className="text-base font-semibold text-slate-600 dark:text-slate-300">
                   ¿Cuánto ha costado?
                 </p>
+                {notes.trim() && (
+                  <p className="text-xs text-[#0E5A64] dark:text-[#5EEAD4] font-medium px-3">
+                    {notes}
+                  </p>
+                )}
                 <div
                   aria-live="polite"
                   className={`font-display text-5xl sm:text-6xl font-bold tabular-nums tracking-tight py-3 ${
-                    amount ? 'text-[#0F1F24] dark:text-[#F0F5F6]' : 'text-slate-400 dark:text-slate-500'
+                    amount ? 'text-[#0F1F24] dark:text-[#F0F5F6]' : 'text-slate-500 dark:text-slate-400'
                   }`}
                 >
                   {formattedAmountDisplay}
@@ -505,7 +546,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           )}
 
-          {/* PASO 3: QUIÉN PAGÓ + OPCIÓN SECUNDARIA REPARTO/PERSONAL + CONCEPTO */}
+          {/* PASO 3: QUIÉN PAGÓ + OPCIÓN SEGÚN REPARTO vs PRIVADO (SIN SOLO YO) */}
           {wizardStep === 3 && (
             <div className="flex-1 flex flex-col justify-between gap-5">
               <div className="space-y-4">
@@ -514,7 +555,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                     {formatEUR(numericAmount)} · {EXPENSE_CATEGORY_LABELS[category]}
                   </p>
                   <h2 className="font-display text-2xl font-bold">
-                    {isPrivate ? 'Gasto solo tuyo' : '¿Quién lo ha pagado?'}
+                    {isPrivate ? 'Gasto privado' : '¿Quién lo ha pagado?'}
                   </h2>
                 </div>
 
@@ -524,7 +565,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                       <button
                         type="button"
                         onClick={() => setPaidBy(memberA.uid)}
-                        className={`w-full min-h-[68px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
+                        className={`w-full min-h-[64px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
                           paidBy === memberA.uid
                             ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
                             : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
@@ -554,7 +595,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                       <button
                         type="button"
                         onClick={() => setPaidBy(memberB.uid)}
-                        className={`w-full min-h-[68px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
+                        className={`w-full min-h-[64px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
                           paidBy === memberB.uid
                             ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
                             : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
@@ -583,7 +624,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                     <button
                       type="button"
                       onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
-                      className={`w-full min-h-[68px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
+                      className={`w-full min-h-[64px] px-4 rounded-2xl border flex items-center justify-between gap-3 transition-all ${
                         paidBy === COMMON_ACCOUNT_ID
                           ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
                           : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
@@ -602,48 +643,51 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                   </div>
                 )}
 
-                {/* Secondary split option in Sencillo: ONLY "Según reparto" and "Solo yo" */}
-                {!isPrivate && (
-                  <div className="space-y-1.5">
-                    <span className="block text-xs font-semibold text-slate-500 dark:text-slate-400">
-                      ¿Cómo se reparte?
-                    </span>
-                    <div className="grid grid-cols-2 gap-2">
-                      {(
-                        [
-                          { id: 'segun_reparto', label: 'Según reparto' },
-                          { id: 'solo_yo', label: 'Solo yo' },
-                        ] as const
-                      ).map((opt) => (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          onClick={() => handleSelectSplitChoice(opt.id)}
-                          className={`min-h-[44px] px-3 rounded-xl border text-xs font-bold transition-colors ${
-                            splitChoice === opt.id
-                              ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                              : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-slate-600 dark:text-slate-300'
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                <label className="min-h-[46px] px-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] flex items-center justify-between gap-3 cursor-pointer">
-                  <span className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    <Lock className="w-4 h-4 text-slate-500 shrink-0" />
-                    <span>Gasto personal (solo para mí)</span>
+                {/* Modo Sencillo: SOLO "Según reparto" y "Privado (no lo ve mi pareja)" */}
+                <div className="space-y-2">
+                  <span className="block text-xs font-semibold text-slate-500 dark:text-slate-400">
+                    Tipo de gasto
                   </span>
-                  <input
-                    type="checkbox"
-                    checked={isPrivate}
-                    onChange={(e) => handleTogglePrivate(e.target.checked)}
-                    className="w-5 h-5 accent-[#0E5A64]"
-                  />
-                </label>
+                  <div className="grid grid-cols-1 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleTogglePrivate(false);
+                        handleSelectSplitChoice('segun_reparto');
+                      }}
+                      className={`min-h-[56px] p-3.5 rounded-2xl border text-left transition-colors ${
+                        !isPrivate
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
+                          : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
+                      }`}
+                    >
+                      <p className="text-sm font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+                        Según reparto
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                        Se comparte entre los dos según vuestro reparto del hogar.
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleTogglePrivate(true)}
+                      className={`min-h-[56px] p-3.5 rounded-2xl border text-left transition-colors ${
+                        isPrivate
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 dark:bg-[#0E5A64]/20'
+                          : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025]'
+                      }`}
+                    >
+                      <p className="text-sm font-bold text-[#0F1F24] dark:text-[#F0F5F6] flex items-center gap-1.5">
+                        <Lock className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                        <span>Privado (no lo ve mi pareja)</span>
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                        Solo lo ves tú y no entra en el reparto ni en los totales del hogar.
+                      </p>
+                    </button>
+                  </div>
+                </div>
 
                 <div>
                   <label
@@ -664,7 +708,12 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                     placeholder={EXPENSE_CATEGORY_LABELS[category]}
                     className="w-full min-h-[48px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-sm font-medium"
                   />
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+                  {notes.trim() && (
+                    <p className="text-xs text-[#0E5A64] dark:text-[#5EEAD4] mt-1.5">
+                      Nota incluida: {notes}
+                    </p>
+                  )}
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
                     Se guardará con fecha de hoy.
                   </p>
                 </div>
@@ -685,7 +734,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     );
   }
 
-  // ─── MODO SENCILLO: EDICIÓN SIMPLIFICADA (SIN % NI URL NI CAMPOS TÉCNICOS) ─
+  // ─── MODO SENCILLO: EDICIÓN SIMPLIFICADA (SIN SOLO YO, SIN % NI URL) ──────
   if (isSimpleEdit) {
     return (
       <div
@@ -766,98 +815,91 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
 
             {!isPrivate && (
-              <>
-                <div>
-                  <span className="block text-xs font-medium mb-1.5">Quién pagó</span>
-                  <div className="grid grid-cols-3 gap-2">
-                    {memberA && (
-                      <button
-                        type="button"
-                        onClick={() => setPaidBy(memberA.uid)}
-                        className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
-                          paidBy === memberA.uid
-                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                            : 'border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        {fullNameA}
-                      </button>
-                    )}
-                    {memberB && (
-                      <button
-                        type="button"
-                        onClick={() => setPaidBy(memberB.uid)}
-                        className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
-                          paidBy === memberB.uid
-                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                            : 'border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        {fullNameB}
-                      </button>
-                    )}
+              <div>
+                <span className="block text-xs font-medium mb-1.5">Quién pagó</span>
+                <div className="grid grid-cols-3 gap-2">
+                  {memberA && (
                     <button
                       type="button"
-                      onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
+                      onClick={() => setPaidBy(memberA.uid)}
                       className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
-                        paidBy === COMMON_ACCOUNT_ID
+                        paidBy === memberA.uid
                           ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
                           : 'border-slate-200 dark:border-slate-700'
                       }`}
                     >
-                      Cuenta común
+                      {fullNameA}
                     </button>
-                  </div>
+                  )}
+                  {memberB && (
+                    <button
+                      type="button"
+                      onClick={() => setPaidBy(memberB.uid)}
+                      className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
+                        paidBy === memberB.uid
+                          ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {fullNameB}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setPaidBy(COMMON_ACCOUNT_ID)}
+                    className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold border truncate ${
+                      paidBy === COMMON_ACCOUNT_ID
+                        ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                        : 'border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    Cuenta común
+                  </button>
                 </div>
-
-                <div>
-                  <span className="block text-xs font-medium mb-1.5">Cómo se reparte</span>
-                  <div className="grid grid-cols-2 gap-2">
-                    {(
-                      [
-                        { id: 'segun_reparto', label: 'Según reparto' },
-                        { id: 'solo_yo', label: 'Solo yo' },
-                      ] as const
-                    ).map((opt) => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => handleSelectSplitChoice(opt.id)}
-                        className={`min-h-[44px] px-3 rounded-xl border text-xs font-bold ${
-                          splitChoice === opt.id
-                            ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                            : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                        }`}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </>
+              </div>
             )}
 
-            <label
-              className={`min-h-[46px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 ${
-                createdByPartner ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
-              }`}
-            >
-              <span className="flex items-center gap-2 text-xs font-semibold">
-                <Lock className="w-4 h-4 text-slate-500 shrink-0" />
-                <span>
-                  {createdByPartner
-                    ? 'Solo quien lo creó puede marcarlo como personal'
-                    : 'Gasto personal (solo visible para mí)'}
-                </span>
-              </span>
-              <input
-                type="checkbox"
-                disabled={createdByPartner}
-                checked={isPrivate}
-                onChange={(e) => handleTogglePrivate(e.target.checked)}
-                className="w-5 h-5 accent-[#0E5A64]"
-              />
-            </label>
+            <div className="space-y-2">
+              <span className="block text-xs font-medium">Tipo de gasto</span>
+              <div className="grid grid-cols-1 gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleTogglePrivate(false)}
+                  className={`min-h-[52px] p-3 rounded-xl border text-left ${
+                    !isPrivate
+                      ? 'border-[#0E5A64] bg-[#0E5A64]/10'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <p className="text-xs font-bold">Según reparto</p>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Visible para los dos y repartido según el acuerdo del hogar.
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  disabled={createdByPartner}
+                  onClick={() => handleTogglePrivate(true)}
+                  className={`min-h-[52px] p-3 rounded-xl border text-left ${
+                    createdByPartner ? 'opacity-60 cursor-not-allowed' : ''
+                  } ${
+                    isPrivate
+                      ? 'border-[#0E5A64] bg-[#0E5A64]/10'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <p className="text-xs font-bold flex items-center gap-1.5">
+                    <Lock className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                    <span>Privado (no lo ve mi pareja)</span>
+                  </p>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    {createdByPartner
+                      ? 'Solo quien creó este gasto puede marcarlo como privado.'
+                      : 'Solo visible para ti; excluido del reparto y las cuentas del hogar.'}
+                  </p>
+                </button>
+              </div>
+            </div>
 
             <div>
               <label htmlFor="simple-edit-date" className="block text-xs font-medium mb-1">
@@ -886,7 +928,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     );
   }
 
-  // ─── MODO AVANZADO: MODAL COMPLETO CON REPARTO PUNTUAL Y GASTO PERSONAL ────
+  // ─── MODO AVANZADO: MODAL COMPLETO CON REPARTO PUNTUAL Y PRIVADO ───────────
   return (
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-xs p-0 sm:p-4"
@@ -961,7 +1003,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                   key={cat}
                   type="button"
                   onClick={() => setCategory(cat)}
-                  className={`min-h-[40px] px-3 rounded-xl text-xs font-medium transition-colors whitespace-nowrap ${
+                  className={`min-h-[44px] px-3 rounded-xl text-xs font-medium transition-colors whitespace-nowrap ${
                     category === cat
                       ? 'bg-[#0E5A64] text-white'
                       : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
@@ -973,9 +1015,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           </div>
 
-          {/* Gasto personal toggle */}
+          {/* Privado (no lo ve mi pareja) */}
           <label
-            className={`min-h-[48px] px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/60 flex items-center justify-between gap-3 ${
+            className={`min-h-[52px] px-3.5 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/60 flex items-center justify-between gap-3 ${
               createdByPartner ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
             }`}
           >
@@ -983,11 +1025,11 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
               <Lock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0 mt-0.5" />
               <div className="min-w-0">
                 <p className="text-xs font-semibold text-[#0F1F24] dark:text-[#F0F5F6]">
-                  Gasto personal (solo visible para mí)
+                  Privado (no lo ve mi pareja)
                 </p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
                   {createdByPartner
-                    ? 'Solo quien creó este gasto puede marcarlo como personal.'
+                    ? 'Solo quien creó este gasto puede marcarlo como privado.'
                     : 'Excluido del reparto, saldos, totales del hogar y exportaciones de tu pareja.'}
                 </p>
               </div>
@@ -1063,7 +1105,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                       key={opt.id}
                       type="button"
                       onClick={() => handleSelectSplitChoice(opt.id)}
-                      className={`min-h-[40px] px-3 rounded-xl text-xs font-semibold border transition-colors ${
+                      className={`min-h-[44px] px-3 rounded-xl text-xs font-semibold border transition-colors ${
                         splitChoice === opt.id
                           ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
                           : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
@@ -1073,6 +1115,10 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                     </button>
                   ))}
                 </div>
+                <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                  {activeSplitOption?.helper ||
+                    'Lo pago y asumo yo (cuenta en el hogar): lo ve tu pareja y suma al hogar, pero el 100 % te corresponde a ti.'}
+                </p>
                 {splitChoice === 'personalizado' && (
                   <div className="pt-1">
                     <label

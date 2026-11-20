@@ -102,9 +102,35 @@ service cloud.firestore {
         && s.currency == 'EUR';
     }
 
+    function isValidCsvKeywordStr(kw, key) {
+      return !(key in kw) || (kw[key] is string && kw[key].size() <= 300);
+    }
+
+    function isValidCsvKeywords(kw) {
+      return kw is map
+        && kw.keys().hasOnly([
+          'alquiler', 'luz', 'agua', 'gas', 'internet', 'movil',
+          'suscripciones', 'seguros', 'comunidad', 'supermercado',
+          'transporte', 'ocio', 'otros'
+        ])
+        && isValidCsvKeywordStr(kw, 'alquiler')
+        && isValidCsvKeywordStr(kw, 'luz')
+        && isValidCsvKeywordStr(kw, 'agua')
+        && isValidCsvKeywordStr(kw, 'gas')
+        && isValidCsvKeywordStr(kw, 'internet')
+        && isValidCsvKeywordStr(kw, 'movil')
+        && isValidCsvKeywordStr(kw, 'suscripciones')
+        && isValidCsvKeywordStr(kw, 'seguros')
+        && isValidCsvKeywordStr(kw, 'comunidad')
+        && isValidCsvKeywordStr(kw, 'supermercado')
+        && isValidCsvKeywordStr(kw, 'transporte')
+        && isValidCsvKeywordStr(kw, 'ocio')
+        && isValidCsvKeywordStr(kw, 'otros');
+    }
+
     function isValidHousehold(data) {
       return data.keys().hasAll(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'createdAt', 'updatedAt'])
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
         && data.memberUids is list
         && data.memberUids.size() >= 1 && data.memberUids.size() <= 2
@@ -112,6 +138,7 @@ service cloud.firestore {
         && (data.memberUids.size() == 1 || (data.memberUids[1] is string && data.memberUids[1].size() >= 1 && data.memberUids[1].size() <= 128 && data.memberUids[1] != data.memberUids[0]))
         && isValidInviteCode(data.inviteCode)
         && isValidSettings(data.settings)
+        && (!('csvKeywords' in data) || isValidCsvKeywords(data.csvKeywords))
         && data.createdAt is timestamp
         && data.updatedAt == request.time;
     }
@@ -292,6 +319,17 @@ service cloud.firestore {
         && data.createdAt == request.time;
     }
 
+    function isValidShoppingItem(data) {
+      return data.keys().hasAll(['text', 'qty', 'done', 'addedBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['text', 'qty', 'done', 'addedBy', 'createdAt', 'updatedAt'])
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 120
+        && isFiniteNumber(data.qty) && data.qty >= 1 && data.qty <= 999
+        && data.done is bool
+        && data.addedBy is string && data.addedBy.size() >= 1 && data.addedBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
     // ─── /users/{uid} ────────────────────────────────────────────────────────
     match /users/{uid} {
       allow get: if isSignedIn() && isValidId(uid) && request.auth.uid == uid;
@@ -363,6 +401,12 @@ service cloud.firestore {
             && get(/databases/$(database)/documents/invites/$(existing().inviteCode)).data.householdId == hid
             && getAfter(/databases/$(database)/documents/invites/$(existing().inviteCode)).data.memberCount == 2
           )
+          ||
+          // Action 4: Update CSV category keywords by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['csvKeywords', 'updatedAt'])
+          )
         );
 
       allow delete: if false;
@@ -403,7 +447,7 @@ service cloud.firestore {
         allow create: if isValidId(hid) && isValidId(costId)
           && isHouseholdMember(hid)
           && isValidInitialCost(incoming(), hid)
-          && incoming().createdAt == request.time;
+          && incoming().createdAt <= request.time;
         allow update: if isValidId(hid) && isValidId(costId)
           && isHouseholdMember(hid)
           && isValidInitialCost(incoming(), hid)
@@ -477,8 +521,14 @@ service cloud.firestore {
         allow create: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
           && isValidTransaction(incoming(), hid)
-          && incoming().createdBy == request.auth.uid
-          && incoming().createdAt == request.time;
+          && incoming().createdAt <= request.time
+          && (
+            incoming().createdBy == request.auth.uid
+            || (
+              incoming().isPrivate == false
+              && (incoming().createdBy in get(/databases/$(database)/documents/households/$(hid)).data.memberUids)
+            )
+          );
         allow update: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
           && isValidTransaction(incoming(), hid)
@@ -556,6 +606,24 @@ service cloud.firestore {
           );
         allow update: if false;
         allow delete: if isValidId(hid) && isValidId(movId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/shopping/{itemId} ──────────────────────────────
+      match /shopping/{itemId} {
+        allow get: if isValidId(hid) && isValidId(itemId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(itemId)
+          && isHouseholdMember(hid)
+          && isValidShoppingItem(incoming())
+          && incoming().addedBy == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(itemId)
+          && isHouseholdMember(hid)
+          && isValidShoppingItem(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().addedBy == existing().addedBy
+          && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'qty', 'done', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(itemId) && isHouseholdMember(hid);
       }
     }
   }
