@@ -17,6 +17,8 @@ import {
 import { useNido } from '../context/NidoContext';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import type { NavTab } from '../types/nido';
+import { PWAInstallBanner } from './PWAInstallBanner';
+import { PWAUpdateBanner } from './PWAUpdateBanner';
 import { QuickExpenseModal } from './QuickExpenseModal';
 
 const AVANZADO_NAV_ITEMS: Array<{
@@ -391,8 +393,12 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         </div>
       )}
 
+      {/* PWA update & install banners */}
+      <PWAUpdateBanner />
+      <PWAInstallBanner />
+
       {/* Main Content */}
-      <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-5 pb-24 md:pb-10 min-w-0 overflow-x-hidden">
+      <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 pt-5 pb-[calc(6rem+env(safe-area-inset-bottom))] md:pb-10 min-w-0 overflow-x-hidden">
         {children}
       </main>
 
@@ -400,7 +406,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       {uiMode === 'sencillo' ? (
         <nav
           aria-label="Navegación inferior móvil"
-          className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-[66px] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-3 items-center px-3"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 min-h-[calc(66px+env(safe-area-inset-bottom))] pb-[env(safe-area-inset-bottom)] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-3 items-center px-3"
         >
           <button
             type="button"
@@ -442,7 +448,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       ) : (
         <nav
           aria-label="Navegación inferior móvil"
-          className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-[62px] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-5 items-center px-1"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 min-h-[calc(62px+env(safe-area-inset-bottom))] pb-[env(safe-area-inset-bottom)] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-5 items-center px-1"
         >
           {AVANZADO_NAV_ITEMS.map((item) => {
             const Icon = item.icon;

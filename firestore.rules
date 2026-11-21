@@ -128,9 +128,35 @@ service cloud.firestore {
         && isValidCsvKeywordStr(kw, 'otros');
     }
 
+    function isValidCategoryColorVal(cc, key) {
+      return !(key in cc) || (cc[key] is string && cc[key].size() == 7 && cc[key].matches('^#[0-9A-Fa-f]{6}$'));
+    }
+
+    function isValidCategoryColors(cc) {
+      return cc is map
+        && cc.keys().hasOnly([
+          'alquiler', 'luz', 'agua', 'gas', 'internet', 'movil',
+          'suscripciones', 'seguros', 'comunidad', 'supermercado',
+          'transporte', 'ocio', 'otros'
+        ])
+        && isValidCategoryColorVal(cc, 'alquiler')
+        && isValidCategoryColorVal(cc, 'luz')
+        && isValidCategoryColorVal(cc, 'agua')
+        && isValidCategoryColorVal(cc, 'gas')
+        && isValidCategoryColorVal(cc, 'internet')
+        && isValidCategoryColorVal(cc, 'movil')
+        && isValidCategoryColorVal(cc, 'suscripciones')
+        && isValidCategoryColorVal(cc, 'seguros')
+        && isValidCategoryColorVal(cc, 'comunidad')
+        && isValidCategoryColorVal(cc, 'supermercado')
+        && isValidCategoryColorVal(cc, 'transporte')
+        && isValidCategoryColorVal(cc, 'ocio')
+        && isValidCategoryColorVal(cc, 'otros');
+    }
+
     function isValidHousehold(data) {
       return data.keys().hasAll(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'seedPending', 'recurringSeedVersion', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'categoryColors', 'seedPending', 'recurringSeedVersion', 'createdAt', 'updatedAt'])
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
         && data.memberUids is list
         && data.memberUids.size() >= 1 && data.memberUids.size() <= 2
@@ -139,6 +165,7 @@ service cloud.firestore {
         && isValidInviteCode(data.inviteCode)
         && isValidSettings(data.settings)
         && (!('csvKeywords' in data) || isValidCsvKeywords(data.csvKeywords))
+        && (!('categoryColors' in data) || isValidCategoryColors(data.categoryColors))
         && (!('seedPending' in data) || data.seedPending is bool)
         && (!('recurringSeedVersion' in data) || (data.recurringSeedVersion is int && data.recurringSeedVersion >= 0 && data.recurringSeedVersion <= 1000))
         && data.createdAt is timestamp
@@ -214,12 +241,13 @@ service cloud.firestore {
 
     function isValidRecurring(data, hid) {
       return data.keys().hasAll(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
         && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros'])
         && isNonNegNumber(data.amount)
         && (data.frequency in ['mensual', 'bimestral', 'trimestral', 'anual'])
         && isFiniteNumber(data.dayOfMonth) && data.dayOfMonth >= 1 && data.dayOfMonth <= 31
+        && (!('startMonth' in data) || data.startMonth == '' || isValidMonthKey(data.startMonth))
         && (data.splitOverride == null || (isFiniteNumber(data.splitOverride) && data.splitOverride >= 0 && data.splitOverride <= 100))
         && isHouseholdPayer(hid, data.paidByDefault)
         && data.active is bool
@@ -415,6 +443,12 @@ service cloud.firestore {
             (request.auth.uid in existing().memberUids)
             && incoming().diff(existing()).affectedKeys().hasOnly(['seedPending', 'recurringSeedVersion', 'updatedAt'])
           )
+          ||
+          // Action 6: Update shared category color palette by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['categoryColors', 'updatedAt'])
+          )
         );
 
       allow delete: if false;
@@ -514,7 +548,7 @@ service cloud.firestore {
           && isHouseholdMember(hid)
           && isValidRecurring(incoming(), hid)
           && incoming().createdAt == existing().createdAt
-          && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'updatedAt']);
+          && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'splitOverride', 'paidByDefault', 'active', 'updatedAt']);
         allow delete: if isValidId(hid) && isValidId(recId) && isHouseholdMember(hid);
       }
 

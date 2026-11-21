@@ -9,6 +9,7 @@ import {
   computeEmergencyTarget,
   computeFurnitureSummary,
   computeGoalProgress,
+  computeRecurringHistoricalAverage,
   computeSavingsCapacity,
   filterGlobalTransactions,
   findMissingRecurringForMonth,
@@ -32,6 +33,7 @@ import {
   parseBankAmount,
   parseBankDateToISO,
   parseCsvMatrix,
+  suggestKeywordTokenFromDescription,
 } from './csvImport';
 import {
   findMatchingRecurringForPreset,
@@ -39,7 +41,31 @@ import {
   RECURRING_CATALOG_SEED_VERSION,
   VARIABLE_BUDGET_SUGGESTIONS,
 } from './presets';
-import { generateSpanishCSV, validateAndMigrateBackup } from './backup';
+import {
+  buildDeterministicRecurringTxId,
+  getNextRecurringDueDate,
+  getRecurringDueDateForMonth,
+  isRecurringDueInMonth,
+  isRecurringMissingStartMonth,
+} from './recurrence';
+import {
+  buildMonthAgendaGroups,
+  buildMonthCalendarGrid,
+} from './calendar';
+import {
+  DEFAULT_CATEGORY_COLORS,
+  resolveCategoryColor,
+  sanitizeCategoryColors,
+} from './categoryPalette';
+import { computeCommonAccountRadar } from './commonAccountRadar';
+import { buildRecurringIcsCalendar } from './icsExport';
+import { getDueNotificationsForDevice } from './localNotifications';
+import {
+  daysSinceLastBackup,
+  generateSpanishCSV,
+  shouldShowBackupReminder,
+  validateAndMigrateBackup,
+} from './backup';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import {
   COMMON_ACCOUNT_ID,
@@ -1676,4 +1702,581 @@ test('13. Presupuesto vs real (computeBudgetProgress): fijos dentro de límite e
   assert.equal(byCat.supermercado.pct, 85);
   assert.equal(byCat.supermercado.isRecurringOnly, false);
   assert.equal(byCat.supermercado.status, 'ambar');
+});
+
+test('14. Fase 1: motor unificado de recurrencias (startMonth, bisiestos/días 29-31, legado sin ancla y anti-duplicados)', async () => {
+  const mkRec = (over: Partial<RecurringExpense>): RecurringExpense => ({
+    id: 'r_base',
+    concept: 'Plantilla',
+    category: 'otros',
+    amount: 100,
+    frequency: 'mensual',
+    dayOfMonth: 1,
+    splitOverride: null,
+    paidByDefault: COMMON_ACCOUNT_ID,
+    active: true,
+    createdAt: '',
+    updatedAt: '',
+    ...over,
+  });
+
+  // 1) Anual anclada a octubre -> solo vence en octubre (no enero)
+  const anualOct = mkRec({
+    id: 'r_oct',
+    concept: 'IBI / Seguro anual',
+    category: 'seguros',
+    amount: 240,
+    frequency: 'anual',
+    dayOfMonth: 15,
+    startMonth: '2026-10',
+  });
+  assert.equal(isRecurringDueInMonth(anualOct, '2026-09'), false);
+  assert.equal(isRecurringDueInMonth(anualOct, '2026-10'), true);
+  assert.equal(isRecurringDueInMonth(anualOct, '2026-11'), false);
+  assert.equal(isRecurringDueInMonth(anualOct, '2027-01'), false);
+  assert.equal(isRecurringDueInMonth(anualOct, '2027-10'), true);
+  assert.equal(getNextRecurringDueDate(anualOct, '2026-11-01', 12), '2027-10-15');
+  assert.equal(getNextRecurringDueDate(anualOct, '2026-10-10', 12), '2026-10-15');
+
+  // 2) Bimestral con salto de año (2026-12 -> 2027-02 -> 2027-04) y día 31 en febrero bisiesto vs no bisiesto
+  const bimFinMes = mkRec({
+    id: 'r_bim31',
+    concept: 'Agua bimestral',
+    category: 'agua',
+    amount: 55,
+    frequency: 'bimestral',
+    dayOfMonth: 31,
+    startMonth: '2024-02',
+  });
+  assert.equal(isRecurringDueInMonth(bimFinMes, '2024-02'), true);
+  assert.equal(isRecurringDueInMonth(bimFinMes, '2024-03'), false);
+  assert.equal(isRecurringDueInMonth(bimFinMes, '2024-04'), true);
+  assert.equal(isRecurringDueInMonth(bimFinMes, '2026-12'), true);
+  assert.equal(isRecurringDueInMonth(bimFinMes, '2027-01'), false);
+  assert.equal(isRecurringDueInMonth(bimFinMes, '2027-02'), true);
+
+  assert.equal(getRecurringDueDateForMonth(bimFinMes, '2024-02'), '2024-02-29'); // bisiesto
+  assert.equal(getRecurringDueDateForMonth(bimFinMes, '2025-02'), '2025-02-28'); // no bisiesto
+  assert.equal(getRecurringDueDateForMonth(bimFinMes, '2026-04'), '2026-04-30'); // 30 días
+
+  // 3) Trimestral (2026-11 -> 2027-02 -> 2027-05)
+  const trim = mkRec({
+    id: 'r_trim',
+    frequency: 'trimestral',
+    dayOfMonth: 29,
+    startMonth: '2026-11',
+  });
+  assert.equal(isRecurringDueInMonth(trim, '2026-11'), true);
+  assert.equal(isRecurringDueInMonth(trim, '2026-12'), false);
+  assert.equal(isRecurringDueInMonth(trim, '2027-02'), true);
+  assert.equal(getRecurringDueDateForMonth(trim, '2027-02'), '2027-02-28');
+
+  // 4) Inactiva o importe 0 nunca vence
+  assert.equal(isRecurringDueInMonth(mkRec({ active: false }), '2026-11'), false);
+  assert.equal(isRecurringDueInMonth(mkRec({ amount: 0 }), '2026-11'), false);
+
+  // 5) Plantilla periódica heredada sin startMonth se marca pendiente de confirmar y NO inventa fecha
+  const legacyNoStart = mkRec({
+    id: 'r_legacy_anual',
+    frequency: 'anual',
+    startMonth: '',
+    active: true,
+  });
+  assert.equal(isRecurringMissingStartMonth(legacyNoStart), true);
+  assert.equal(isRecurringDueInMonth(legacyNoStart, '2026-11'), false);
+  assert.equal(getNextRecurringDueDate(legacyNoStart, '2026-11-01', 12), null);
+
+  // 6) ID determinista siempre cumple ^[a-zA-Z0-9_-]{1,128}$ incluso con IDs largos o especiales
+  const det1 = buildDeterministicRecurringTxId('2026-11', 'seed_rec_alquiler');
+  assert.match(det1, /^[a-zA-Z0-9_-]{1,128}$/);
+  const longRecId = 'rec_' + 'x'.repeat(200) + ' áéí';
+  const detLong = buildDeterministicRecurringTxId('2026-11', longRecId);
+  assert.match(detLong, /^[a-zA-Z0-9_-]{1,128}$/);
+  assert.equal(detLong, buildDeterministicRecurringTxId('2026-11', longRecId));
+
+  // 7) Concurrencia / doble clic en generateMonthTransactions no crea duplicados
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  let txsInDec: Transaction[] = [];
+  const uT = repo.subscribeTransactionsByMonth('demo_hogar_santsadurni', 'demo_alex', '2027-02', (list) => {
+    txsInDec = list;
+  });
+  const missingFeb = [
+    mkRec({ id: 'rec_conc_1', concept: 'Alquiler conc', category: 'alquiler', amount: 850, frequency: 'mensual', dayOfMonth: 1 }),
+    mkRec({ id: 'rec_conc_2', concept: 'Luz conc', category: 'luz', amount: 65, frequency: 'mensual', dayOfMonth: 10 }),
+  ];
+  const [c1, c2] = await Promise.all([
+    repo.generateMonthTransactions('demo_hogar_santsadurni', '2027-02', missingFeb, 55, actor),
+    repo.generateMonthTransactions('demo_hogar_santsadurni', '2027-02', missingFeb, 55, actor),
+  ]);
+  assert.equal(c1 + c2, 2);
+  assert.equal(txsInDec.filter((t) => t.recurringId === 'rec_conc_1').length, 1);
+  assert.equal(txsInDec.filter((t) => t.recurringId === 'rec_conc_2').length, 1);
+  uT();
+
+  // 8) Backup JSON conserva startMonth y rechaza startMonth inválido
+  const sampleBackup: NidoBackupV1 = {
+    schemaVersion: 1,
+    app: 'nido',
+    exportedAt: '2026-11-18T10:00:00Z',
+    householdName: 'Piso',
+    settings: { splitMode: 'preset', presetA: 50, presetB: 50, incomeA: 0, incomeB: 0, currency: 'EUR' },
+    initialCosts: [],
+    checklist: [],
+    items: [],
+    recurring: [
+      {
+        id: 'r_b1',
+        concept: 'Seguro',
+        category: 'seguros',
+        amount: 200,
+        frequency: 'anual',
+        dayOfMonth: 10,
+        startMonth: '2026-10',
+        splitOverride: null,
+        paidByDefault: COMMON_ACCOUNT_ID,
+        active: true,
+      },
+    ],
+    transactions: [],
+    budgets: [],
+    monthClosures: [],
+    goals: [],
+    goalMovements: [],
+  };
+  const parsedB = validateAndMigrateBackup(JSON.parse(JSON.stringify(sampleBackup)));
+  assert.equal(parsedB.recurring[0].startMonth, '2026-10');
+  assert.throws(() =>
+    validateAndMigrateBackup({
+      ...sampleBackup,
+      recurring: [{ ...sampleBackup.recurring[0], startMonth: '2026-99-01' }],
+    })
+  );
+});
+
+test('15. Fase 2: calendario mensual (lunes-domingo, previstos vs registrados, futuro y legado) y paleta compartida', async () => {
+  const mkRec = (over: Partial<RecurringExpense>): RecurringExpense => ({
+    id: 'r_cal',
+    concept: 'Plantilla',
+    category: 'otros',
+    amount: 100,
+    frequency: 'mensual',
+    dayOfMonth: 1,
+    startMonth: '2026-01',
+    splitOverride: null,
+    paidByDefault: COMMON_ACCOUNT_ID,
+    active: true,
+    createdAt: '',
+    updatedAt: '',
+    ...over,
+  });
+
+  // Noviembre 2026 empieza en domingo (01/11/2026) -> 6 celdas vacías al principio en cuadrícula Lun-Dom
+  // Febrero 2024 (bisiesto): 29 días, empieza en jueves -> 3 celdas vacías
+  const feb2024 = buildMonthCalendarGrid('2024-02', [], [], '2024-02-10');
+  assert.equal(feb2024.leadingEmptyCells, 3);
+  assert.equal(feb2024.days.length, 29);
+
+  const novTxs: Transaction[] = [
+    // Alquiler ya registrado (no debe duplicarse como previsto)
+    makeTx({
+      id: 'tx_rent_nov',
+      monthKey: '2026-11',
+      concept: 'Alquiler',
+      category: 'alquiler',
+      amount: 850,
+      date: '2026-11-01',
+      recurringId: 'rec_rent',
+    }),
+    // Gasto con fecha futura respecto a todayISO ('2026-11-10')
+    makeTx({
+      id: 'tx_future_dinner',
+      monthKey: '2026-11',
+      concept: 'Reserva aniversario',
+      category: 'ocio',
+      amount: 95,
+      date: '2026-11-22',
+    }),
+    // Gasto privado también visible para su autor en calendario pero sin afectar a otros
+    makeTx({
+      id: 'tx_priv_nov',
+      monthKey: '2026-11',
+      concept: 'Detalle privado',
+      category: 'otros',
+      amount: 30,
+      date: '2026-11-10',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+    }),
+  ];
+
+  const recs: RecurringExpense[] = [
+    mkRec({ id: 'rec_rent', concept: 'Alquiler', category: 'alquiler', amount: 850, dayOfMonth: 1 }),
+    mkRec({ id: 'rec_luz', concept: 'Luz', category: 'luz', amount: 65, dayOfMonth: 15 }),
+    // Anual sin startMonth: no inventa fecha, se expone en unanchoredActiveTemplates
+    mkRec({
+      id: 'rec_legacy_no_ref',
+      concept: 'IBI legado',
+      category: 'seguros',
+      amount: 300,
+      frequency: 'anual',
+      dayOfMonth: 20,
+      startMonth: '',
+    }),
+    // Inactiva 0 €: nunca genera evento previsto
+    mkRec({ id: 'rec_inactive', concept: 'Agua', category: 'agua', amount: 0, active: false, dayOfMonth: 18 }),
+  ];
+
+  const grid = buildMonthCalendarGrid('2026-11', novTxs, recs, '2026-11-10');
+  assert.equal(grid.leadingEmptyCells, 6);
+  assert.equal(grid.days.length, 30);
+  // Apuntado compartido = 850 + 95 = 945 (excluye el gasto privado de 30 € y la prevista de 65 €)
+  assert.equal(grid.totalRegistered, 945);
+  assert.equal(grid.totalPlannedPending, 65);
+  assert.equal(grid.unanchoredActiveTemplates.length, 1);
+  assert.equal(grid.unanchoredActiveTemplates[0].id, 'rec_legacy_no_ref');
+
+  const day1 = grid.days[0];
+  assert.equal(day1.events.length, 1);
+  assert.equal(day1.events[0].kind, 'registered');
+  assert.equal(day1.events[0].recurring?.id, undefined); // es transacción real, no prevista
+
+  const day15 = grid.days[14];
+  assert.equal(day15.events.length, 1);
+  assert.equal(day15.events[0].kind, 'planned');
+  assert.equal(day15.events[0].amount, 65);
+
+  const day22 = grid.days[21];
+  assert.equal(day22.events[0].kind, 'future_registered');
+
+  // Agenda del mes en Sencillo ordena días cronológicamente con los eventos reales y previstos
+  const agenda = buildMonthAgendaGroups('2026-11', novTxs, recs, '2026-11-10');
+  assert.deepEqual(
+    agenda.groups.map((g) => g.dateISO),
+    ['2026-11-01', '2026-11-10', '2026-11-15', '2026-11-22']
+  );
+
+  // Paleta de categorías compartida: sanitización, respaldo por defecto y persistencia
+  const sanitized = sanitizeCategoryColors({
+    alquiler: '#1d4ed8',
+    luz: 'javascript:alert(1)',
+    inventada: '#FFFFFF',
+  } as Record<string, string>);
+  assert.deepEqual(sanitized, { alquiler: '#1D4ED8' });
+  assert.equal(resolveCategoryColor('alquiler', sanitized), '#1D4ED8');
+  assert.equal(resolveCategoryColor('luz', sanitized), DEFAULT_CATEGORY_COLORS.luz);
+
+  const backupWithColors: NidoBackupV1 = {
+    schemaVersion: 1,
+    app: 'nido',
+    exportedAt: '2026-11-18T10:00:00Z',
+    householdName: 'Piso',
+    settings: { splitMode: 'preset', presetA: 50, presetB: 50, incomeA: 0, incomeB: 0, currency: 'EUR' },
+    categoryColors: { alquiler: '#1D4ED8', supermercado: '#0F766E' },
+    initialCosts: [],
+    checklist: [],
+    items: [],
+    recurring: [],
+    transactions: [],
+    budgets: [],
+    monthClosures: [],
+    goals: [],
+    goalMovements: [],
+  };
+  const parsedColors = validateAndMigrateBackup(JSON.parse(JSON.stringify(backupWithColors)));
+  assert.deepEqual(parsedColors.categoryColors, { alquiler: '#1D4ED8', supermercado: '#0F766E' });
+
+  assert.throws(() =>
+    validateAndMigrateBackup({
+      ...backupWithColors,
+      categoryColors: { alquiler: 'rojo' },
+    })
+  );
+
+  // DemoHouseholdRepository.updateCategoryColors actualiza y exporta colores compartidos
+  const repo = new DemoHouseholdRepository();
+  await repo.updateCategoryColors('demo_hogar_santsadurni', {
+    alquiler: '#7C3AED',
+    luz: '#D97706',
+  });
+  const exportedAfter = await repo.exportBackup('demo_hogar_santsadurni', 'demo_alex');
+  assert.deepEqual(exportedAfter.categoryColors, { alquiler: '#7C3AED', luz: '#D97706' });
+});
+
+test('16. Fase 3: Radar de cuenta común (próximos 5 días vs resto de mes, saldo manual, reparto orientativo y sin generar deudas)', () => {
+  const mkRec = (over: Partial<RecurringExpense>): RecurringExpense => ({
+    id: 'r_radar',
+    concept: 'Plantilla',
+    category: 'otros',
+    amount: 100,
+    frequency: 'mensual',
+    dayOfMonth: 1,
+    startMonth: '2026-01',
+    splitOverride: null,
+    paidByDefault: COMMON_ACCOUNT_ID,
+    active: true,
+    createdAt: '',
+    updatedAt: '',
+    ...over,
+  });
+
+  const txs: Transaction[] = [
+    // Ya pagado en cuenta común hasta hoy (2026-11-10)
+    makeTx({
+      id: 'tx_rent_done',
+      monthKey: '2026-11',
+      concept: 'Alquiler',
+      category: 'alquiler',
+      amount: 850,
+      date: '2026-11-01',
+      paidBy: COMMON_ACCOUNT_ID,
+      recurringId: 'rec_rent',
+    }),
+    // Gasto futuro ya apuntado en cuenta común (2026-11-13 -> dentro de próximos 5 días desde 2026-11-10)
+    makeTx({
+      id: 'tx_future_com',
+      monthKey: '2026-11',
+      concept: 'Compra mensual común',
+      category: 'supermercado',
+      amount: 120,
+      date: '2026-11-13',
+      paidBy: COMMON_ACCOUNT_ID,
+      splitPctA: 50,
+    }),
+    // Pagado por miembro A (NO cuenta para el radar de cuenta común)
+    makeTx({
+      id: 'tx_alex_only',
+      monthKey: '2026-11',
+      concept: 'Cena Alex',
+      category: 'ocio',
+      amount: 60,
+      date: '2026-11-12',
+      paidBy: 'uid_alex',
+      splitPctA: 60,
+    }),
+    // Privado (excluido siempre)
+    makeTx({
+      id: 'tx_priv',
+      monthKey: '2026-11',
+      concept: 'Privado',
+      category: 'otros',
+      amount: 99,
+      date: '2026-11-12',
+      paidBy: COMMON_ACCOUNT_ID,
+      isPrivate: true,
+      createdBy: 'uid_alex',
+    }),
+  ];
+
+  const recs: RecurringExpense[] = [
+    // Alquiler ya registrado en txs -> no debe duplicarse
+    mkRec({ id: 'rec_rent', concept: 'Alquiler', category: 'alquiler', amount: 850, dayOfMonth: 1 }),
+    // Luz el día 14 -> dentro de próximos 5 días (2026-11-10 .. 2026-11-15)
+    mkRec({ id: 'rec_luz', concept: 'Electricidad', category: 'luz', amount: 70, dayOfMonth: 14 }),
+    // Internet el día 24 -> resto del mes (> 2026-11-15)
+    mkRec({ id: 'rec_net', concept: 'Fibra', category: 'internet', amount: 40, dayOfMonth: 24 }),
+    // Plantilla cuyo pagador por defecto es Alex (NO cuenta común)
+    mkRec({ id: 'rec_alex', concept: 'Móvil Alex', category: 'movil', amount: 25, dayOfMonth: 15, paidByDefault: 'uid_alex' }),
+  ];
+
+  // Caso 1: saldo insuficiente (150 € frente a 120 + 70 + 40 = 230 € -> faltan 80 €)
+  const shortRadar = computeCommonAccountRadar('2026-11', txs, recs, 60, {
+    todayISO: '2026-11-10',
+    currentCommonBalance: 150,
+  });
+  assert.equal(shortRadar.registeredToDateTotal, 850);
+  assert.equal(shortRadar.next5DaysTotal, 190); // 120 + 70
+  assert.equal(shortRadar.restOfMonthTotal, 40);
+  assert.equal(shortRadar.requiredAvailableTotal, 230);
+  assert.equal(shortRadar.balanceStatus, 'shortfall');
+  assert.equal(shortRadar.shortfallAmount, 80);
+  // Orientativo: 120*50% (60) + (70+40)*60% (66) = 126 A; 104 B
+  assert.equal(shortRadar.orientativeShareA, 126);
+  assert.equal(shortRadar.orientativeShareB, 104);
+
+  // Caso 2: saldo suficiente (300 € -> margen 70 €)
+  const coveredRadar = computeCommonAccountRadar('2026-11', txs, recs, 60, {
+    todayISO: '2026-11-10',
+    currentCommonBalance: 300,
+  });
+  assert.equal(coveredRadar.balanceStatus, 'covered');
+  assert.equal(coveredRadar.marginAmount, 70);
+
+  // Comprobar que el radar no altera calculateCoupleBalance (los pagos comunes siguen sin generar deuda)
+  const bal = calculateCoupleBalance(txs, memberA, memberB);
+  assert.equal(bal.balanceA, 24); // solo por tx_alex_only (60 - 60*0.60 = 24)
+});
+
+test('Fase 4: exportación .ics RFC 5545 y notificaciones locales en primer plano', () => {
+  const mkRec = (over: Partial<RecurringExpense>): RecurringExpense => ({
+    id: 'rec_base',
+    concept: 'Plantilla',
+    category: 'otros',
+    amount: 100,
+    frequency: 'mensual',
+    dayOfMonth: 1,
+    startMonth: '2026-10',
+    splitOverride: null,
+    paidByDefault: COMMON_ACCOUNT_ID,
+    active: true,
+    createdAt: '',
+    updatedAt: '',
+    ...over,
+  });
+
+  const recs: RecurringExpense[] = [
+    mkRec({
+      id: 'rec_luz',
+      concept: 'Electricidad, piso; norte',
+      category: 'luz',
+      amount: 72.5,
+      frequency: 'mensual',
+      dayOfMonth: 12,
+      startMonth: '2026-10',
+    }),
+    mkRec({
+      id: 'rec_agua',
+      concept: 'Agua bimestral',
+      category: 'agua',
+      amount: 45,
+      frequency: 'bimestral',
+      dayOfMonth: 20,
+      startMonth: '2026-11', // Nov 2026, Ene 2027 (NO Dic 2026)
+    }),
+    mkRec({
+      id: 'rec_sin_ancla',
+      concept: 'Sin startMonth',
+      category: 'seguros',
+      amount: 180,
+      frequency: 'anual',
+      dayOfMonth: 5,
+      startMonth: '',
+    }),
+    mkRec({
+      id: 'rec_inactiva',
+      concept: 'Inactiva',
+      category: 'otros',
+      amount: 30,
+      frequency: 'mensual',
+      dayOfMonth: 15,
+      active: false,
+    }),
+  ];
+
+  // 1) Exportación .ics a 3 meses desde 2026-11 con alarma 1 día antes
+  const ics3m = buildRecurringIcsCalendar({
+    householdName: 'Nido Alex & Sara',
+    recurring: recs,
+    fromMonthKey: '2026-11',
+    monthsHorizon: 3, // 2026-11, 2026-12, 2027-01
+    alarmDaysBefore: 1,
+    now: new Date('2026-11-10T10:00:00Z'),
+  });
+
+  // CRLF obligatorio y estructura VCALENDAR
+  assert.ok(ics3m.icsContent.includes('\r\n'));
+  assert.ok(ics3m.icsContent.startsWith('BEGIN:VCALENDAR\r\n'));
+  assert.ok(ics3m.icsContent.trimEnd().endsWith('END:VCALENDAR'));
+  // Luz (3 meses: Nov, Dic, Ene) + Agua bimestral (Nov y Ene = 2) = 5 eventos
+  assert.equal(ics3m.eventsCount, 5);
+  assert.equal(ics3m.skippedUnanchoredCount, 1);
+  // UID determinista + fecha todo el día + alarma -P1D + texto escapado
+  assert.ok(ics3m.icsContent.includes('UID:nido-2026-11-rec_luz@nido.local'));
+  assert.ok(ics3m.icsContent.includes('DTSTART;VALUE=DATE:20261112'));
+  assert.ok(ics3m.icsContent.includes('DTEND;VALUE=DATE:20261113'));
+  assert.ok(ics3m.icsContent.includes('TRIGGER:-P1D'));
+  assert.ok(ics3m.icsContent.includes('Electricidad\\, piso\\; norte'));
+
+  // Horizonte 1 mes con alarma el mismo día (-PT0S)
+  const ics1m = buildRecurringIcsCalendar({
+    householdName: 'Nido',
+    recurring: recs,
+    fromMonthKey: '2026-11',
+    monthsHorizon: 1,
+    alarmDaysBefore: 0,
+    now: new Date('2026-11-10T10:00:00Z'),
+  });
+  assert.equal(ics1m.eventsCount, 2);
+  assert.ok(ics1m.icsContent.includes('TRIGGER:-PT0S'));
+
+  // 2) Notificaciones locales en primer plano
+  const txs: Transaction[] = [
+    // Agua aún NO registrada -> debe avisar si entra en ventana; Luz SÍ registrada -> no avisar
+    makeTx({
+      id: 'tx_luz_paid',
+      monthKey: '2026-11',
+      concept: 'Electricidad',
+      category: 'luz',
+      amount: 72.5,
+      date: '2026-11-10',
+      recurringId: 'rec_luz',
+    }),
+    // Transacción privada con recurringId de rec_agua -> NO debe bloquear el aviso compartido
+    makeTx({
+      id: 'tx_priv_ignored',
+      monthKey: '2026-11',
+      concept: 'Privado',
+      category: 'agua',
+      amount: 45,
+      date: '2026-11-10',
+      recurringId: 'rec_agua',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+    }),
+  ];
+
+  // Hoy 2026-11-19 -> Agua vence mañana (2026-11-20), dentro de 2 días
+  const hiddenAmountPayload = getDueNotificationsForDevice(recs, txs, '2026-11-19', 2, false);
+  assert.equal(hiddenAmountPayload.count, 1);
+  assert.equal(hiddenAmountPayload.items[0].recurringId, 'rec_agua');
+  assert.ok(hiddenAmountPayload.body.includes('Mañana'));
+  assert.ok(!hiddenAmountPayload.body.includes('45'));
+
+  const visibleAmountPayload = getDueNotificationsForDevice(recs, txs, '2026-11-19', 2, true);
+  assert.equal(visibleAmountPayload.count, 1);
+  assert.ok(visibleAmountPayload.body.includes('45'));
+});
+
+test('Fase 5: media de últimas 3 facturas, sugerencia de palabra clave CSV y recordatorio 30 días', () => {
+  // 1) Media de las últimas 3 facturas compartidas de una plantilla (ignorando privadas y las más antiguas)
+  const history: Transaction[] = [
+    makeTx({ id: 'old', recurringId: 'rec_luz', amount: 200, date: '2026-07-05', monthKey: '2026-07' }),
+    makeTx({ id: 'm1', recurringId: 'rec_luz', amount: 60, date: '2026-08-05', monthKey: '2026-08' }),
+    makeTx({ id: 'm2', recurringId: 'rec_luz', amount: 75, date: '2026-09-05', monthKey: '2026-09' }),
+    makeTx({ id: 'm3', recurringId: 'rec_luz', amount: 90, date: '2026-10-05', monthKey: '2026-10' }),
+    makeTx({
+      id: 'priv',
+      recurringId: 'rec_luz',
+      amount: 999,
+      date: '2026-10-10',
+      monthKey: '2026-10',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+    }),
+  ];
+  const avg = computeRecurringHistoricalAverage(history, 'rec_luz', 3);
+  assert.ok(avg);
+  assert.equal(avg.sampleCount, 3);
+  assert.equal(avg.average, 75); // (60 + 75 + 90) / 3 = 75 (ignora 'old'=200 y 'priv'=999)
+  assert.equal(avg.lastDate, '2026-10-05');
+  assert.equal(computeRecurringHistoricalAverage(history, 'rec_inexistente', 3), null);
+
+  // 2) Sugerencia limpia de palabra clave CSV desde descripciones bancarias reales
+  assert.equal(
+    suggestKeywordTokenFromDescription('COMPRA TARJETA 14/11/2026 ES9121000418450200051332 CONSUM SUPERMERCADO'),
+    'consum supermercado'
+  );
+  assert.equal(
+    suggestKeywordTokenFromDescription('ADEUDO SEPA ENDESA ENERGIA XXI 9988776655'),
+    'endesa energia'
+  );
+  assert.equal(suggestKeywordTokenFromDescription('12345 2026-11-10'), '');
+
+  // 3) Recordatorio de copia JSON cada 30 días en fecha local
+  assert.equal(daysSinceLastBackup(null, '2026-11-20'), null);
+  assert.equal(shouldShowBackupReminder(null, '2026-11-20', 30), true);
+  assert.equal(daysSinceLastBackup('2026-11-01', '2026-11-20'), 19);
+  assert.equal(shouldShowBackupReminder('2026-11-01', '2026-11-20', 30), false);
+  assert.equal(daysSinceLastBackup('2026-10-21', '2026-11-20'), 30);
+  assert.equal(shouldShowBackupReminder('2026-10-21', '2026-11-20', 30), true);
 });

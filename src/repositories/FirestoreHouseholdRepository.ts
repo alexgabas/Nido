@@ -9,6 +9,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   Timestamp,
@@ -24,6 +25,12 @@ import {
   getTodayLocalISO,
   normalizeSplitPair,
 } from '../domain/finance';
+import { sanitizeCategoryColors } from '../domain/categoryPalette';
+import {
+  buildDeterministicRecurringTxId,
+  isRecurringDueInMonth,
+  isValidMonthKey,
+} from '../domain/recurrence';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -41,6 +48,7 @@ import {
   MAX_LENGTHS,
   type ActivityAction,
   type ActivityEntry,
+  type CategoryColorMap,
   type ChecklistItem,
   type CsvCategoryKeywords,
   type ExpenseCategory,
@@ -145,6 +153,7 @@ function generateInviteCode(): string {
 function mapHousehold(id: string, d: DocumentData): Household {
   const { presetA, presetB } = normalizeSplitPair(d.settings?.presetA);
   const csvKeywords = sanitizeCsvKeywords(d.csvKeywords);
+  const categoryColors = sanitizeCategoryColors(d.categoryColors);
   return {
     id,
     name: String(d.name ?? 'Mi hogar'),
@@ -159,6 +168,7 @@ function mapHousehold(id: string, d: DocumentData): Household {
       currency: 'EUR',
     },
     ...(csvKeywords ? { csvKeywords } : {}),
+    ...(categoryColors ? { categoryColors } : {}),
     ...(typeof d.seedPending === 'boolean' ? { seedPending: d.seedPending } : {}),
     ...(typeof d.recurringSeedVersion === 'number'
       ? { recurringSeedVersion: d.recurringSeedVersion }
@@ -228,6 +238,7 @@ function mapFurniture(id: string, d: DocumentData): FurnitureItem {
 }
 
 function mapRecurring(id: string, d: DocumentData): RecurringExpense {
+  const startMonth = isValidMonthKey(d.startMonth) ? d.startMonth : undefined;
   return {
     id,
     concept: String(d.concept ?? ''),
@@ -235,6 +246,7 @@ function mapRecurring(id: string, d: DocumentData): RecurringExpense {
     amount: Number(d.amount ?? 0),
     frequency: d.frequency ?? 'mensual',
     dayOfMonth: Number(d.dayOfMonth ?? 1),
+    ...(startMonth ? { startMonth } : {}),
     splitOverride:
       d.splitOverride === null || d.splitOverride === undefined
         ? null
@@ -1266,6 +1278,19 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async updateCategoryColors(householdId: string, colors: CategoryColorMap): Promise<void> {
+    const path = `households/${householdId}`;
+    const clean = sanitizeCategoryColors(colors) ?? {};
+    try {
+      await updateDoc(doc(db, 'households', householdId), {
+        categoryColors: clean,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
   async updateMemberUiMode(householdId: string, uid: string, uiMode: UiMode): Promise<void> {
     const path = `households/${householdId}/members/${uid}`;
     try {
@@ -1583,6 +1608,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       amount: Math.max(0, Number(rec.amount) || 0),
       frequency: rec.frequency,
       dayOfMonth: Math.max(1, Math.min(31, Math.round(Number(rec.dayOfMonth) || 1))),
+      startMonth: isValidMonthKey(rec.startMonth) ? rec.startMonth : '',
       splitOverride:
         rec.splitOverride === null || rec.splitOverride === undefined
           ? null
@@ -1704,55 +1730,113 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     defaultSplitPctA: number,
     actor: UserProfileInput
   ): Promise<number> {
-    if (missing.length === 0) return 0;
-    const baseSplit = clampSplitPct(defaultSplitPctA, 50);
-    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+    if (missing.length === 0 || !isValidMonthKey(monthKey)) return 0;
 
+    // 1) Deduplicate candidates and verify cadence strictly via unified engine
+    const seenRecIds = new Set<string>();
+    const dueCandidates: RecurringExpense[] = [];
     for (const rec of missing) {
-      const ref = doc(collection(db, 'households', householdId, 'transactions'));
-      const splitPctA =
-        rec.splitOverride !== null && rec.splitOverride !== undefined
-          ? clampSplitPct(rec.splitOverride, baseSplit)
-          : baseSplit;
-      ops.push({
-        path: `households/${householdId}/transactions/${ref.id}`,
-        apply: (batch) =>
-          batch.set(ref, {
-            monthKey,
-            concept: clampStr(rec.concept, MAX_LENGTHS.concept),
-            category: rec.category,
-            amount: Math.max(0, Number(rec.amount) || 0),
-            date: clampDateForMonth(monthKey, rec.dayOfMonth),
-            paidBy: normalizePayerValue(rec.paidByDefault),
-            recurringId: rec.id,
-            splitPctA,
-            isSettlement: false,
-            settlementTo: '',
-            isPrivate: false,
-            createdBy: actor.uid,
-            notes: 'Generado desde plantilla recurrente',
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          }),
-      });
+      if (seenRecIds.has(rec.id)) continue;
+      if (!isRecurringDueInMonth(rec, monthKey)) continue;
+      seenRecIds.add(rec.id);
+      dueCandidates.push(rec);
+    }
+    if (dueCandidates.length === 0) return 0;
+
+    // 2) Check existing non-private transactions in this month to avoid duplicating manual/legacy entries
+    let existingRecIdsInMonth = new Set<string>();
+    try {
+      const sharedSnap = await getDocs(
+        query(
+          collection(db, 'households', householdId, 'transactions'),
+          where('isPrivate', '==', false)
+        )
+      );
+      existingRecIdsInMonth = new Set(
+        sharedSnap.docs
+          .map((d) => d.data())
+          .filter((data) => data.monthKey === monthKey && typeof data.recurringId === 'string' && data.recurringId)
+          .map((data) => String(data.recurringId))
+      );
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, `households/${householdId}/transactions`);
     }
 
-    ops.push({
-      path: `households/${householdId}/activity`,
-      apply: (batch) =>
+    const toCreate = dueCandidates.filter((rec) => !existingRecIdsInMonth.has(rec.id));
+    if (toCreate.length === 0) return 0;
+
+    const baseSplit = clampSplitPct(defaultSplitPctA, 50);
+    let totalCreated = 0;
+
+    // 3) Atomic transaction per chunk (<= 15 writes) with deterministic IDs
+    for (let i = 0; i < toCreate.length; i += MAX_BATCH_DOCS) {
+      const slice = toCreate.slice(i, i + MAX_BATCH_DOCS);
+      try {
+        const chunkCreated = await runTransaction(db, async (trx) => {
+          const refsAndRecs = slice.map((rec) => {
+            const detId = buildDeterministicRecurringTxId(monthKey, rec.id);
+            return {
+              rec,
+              ref: doc(db, 'households', householdId, 'transactions', detId),
+            };
+          });
+
+          const snaps = await Promise.all(refsAndRecs.map(({ ref }) => trx.get(ref)));
+          let createdInChunk = 0;
+
+          refsAndRecs.forEach(({ rec, ref }, idx) => {
+            if (snaps[idx].exists()) return;
+            const splitPctA =
+              rec.splitOverride !== null && rec.splitOverride !== undefined
+                ? clampSplitPct(rec.splitOverride, baseSplit)
+                : baseSplit;
+            trx.set(ref, {
+              monthKey,
+              concept: clampStr(rec.concept, MAX_LENGTHS.concept),
+              category: rec.category,
+              amount: Math.max(0, Number(rec.amount) || 0),
+              date: clampDateForMonth(monthKey, rec.dayOfMonth),
+              paidBy: normalizePayerValue(rec.paidByDefault),
+              recurringId: rec.id,
+              splitPctA,
+              isSettlement: false,
+              settlementTo: '',
+              isPrivate: false,
+              createdBy: actor.uid,
+              notes: 'Generado desde plantilla recurrente',
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+            createdInChunk++;
+          });
+
+          return createdInChunk;
+        });
+        totalCreated += chunkCreated;
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `households/${householdId}/transactions`);
+      }
+    }
+
+    if (totalCreated > 0) {
+      try {
+        const actBatch = writeBatch(db);
         this.addActivityToBatch(
-          batch,
+          actBatch,
           householdId,
           actor,
           'create',
           'gastos_mes',
           monthKey,
-          `Generó ${missing.length} gastos recurrentes para ${monthKey}`
-        ),
-    });
+          `Generó ${totalCreated} gastos recurrentes para ${monthKey}`
+        );
+        await actBatch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `households/${householdId}/activity`);
+      }
+    }
 
-    await this.commitBatchOps(ops, OperationType.CREATE, `households/${householdId}/transactions`);
-    return missing.length;
+    return totalCreated;
   }
 
   async upsertTransaction(
@@ -2304,6 +2388,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           currency: 'EUR',
         },
         ...(hData?.csvKeywords ? { csvKeywords: hData.csvKeywords } : {}),
+        ...(hData?.categoryColors ? { categoryColors: hData.categoryColors } : {}),
         initialCosts: icSnap.docs.map((d) => {
           const { createdAt: _c, updatedAt: _u, ...rest } = mapInitialCost(d.id, d.data());
           return rest;
@@ -2439,6 +2524,17 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           }),
       });
     }
+    if (backup.categoryColors) {
+      const cleanColors = sanitizeCategoryColors(backup.categoryColors) ?? {};
+      ops.push({
+        path: `households/${householdId}`,
+        apply: (b) =>
+          b.update(doc(db, 'households', householdId), {
+            categoryColors: cleanColors,
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    }
 
     for (const item of backup.initialCosts) {
       const { id, ...fields } = item;
@@ -2479,7 +2575,11 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     for (const item of backup.recurring) {
       const { id, ...fields } = item;
-      const safeFields = { ...fields, paidByDefault: resolvePayer(fields.paidByDefault) };
+      const safeFields = {
+        ...fields,
+        startMonth: isValidMonthKey(fields.startMonth) ? fields.startMonth : '',
+        paidByDefault: resolvePayer(fields.paidByDefault),
+      };
       const ref = doc(db, 'households', householdId, 'recurring', id);
       ops.push({
         path: `households/${householdId}/recurring/${id}`,

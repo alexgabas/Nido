@@ -3,8 +3,17 @@ import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebas
 import {
   computeEffectiveSplitPctA,
   getCurrentMonthKeyLocal,
+  getTodayLocalISO,
+  getUpcomingChargesWithinDays,
   shiftMonthKey,
 } from '../domain/finance';
+import {
+  buildLocalNoticeStorageKey,
+  LOCAL_NOTICE_UPDATED_EVENT,
+  loadLocalNoticeSettings,
+  syncAppBadge,
+  triggerForegroundNotificationCheck,
+} from '../domain/localNotifications';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import { FirestoreHouseholdRepository } from '../repositories/FirestoreHouseholdRepository';
 import type {
@@ -89,6 +98,8 @@ interface NidoContextValue {
     onSaved?: () => Promise<void> | void
   ) => void;
   clearQuickExpensePrefill: () => void;
+  pendingOpenShopping: boolean;
+  consumePendingOpenShopping: () => void;
 
   // Real-time Collections
   activity: ActivityEntry[];
@@ -167,7 +178,30 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [focusMensualSection, setFocusMensualSection] = useState<'plantillas' | null>(null);
   const [quickExpenseOpen, setQuickExpenseOpen] = useState(false);
   const [quickExpensePrefill, setQuickExpensePrefill] = useState<ExpensePrefill | null>(null);
+  const [pendingOpenShopping, setPendingOpenShopping] = useState(false);
+  const [noticeSettingsTick, setNoticeSettingsTick] = useState(0);
   const quickExpenseOnSavedRef = useRef<(() => Promise<void> | void) | null>(null);
+  const pendingDeepLinkRef = useRef<{
+    tab: NavTab | null;
+    action: string | null;
+    open: string | null;
+  } | null>(
+    (() => {
+      if (typeof window === 'undefined') return null;
+      const params = new URLSearchParams(window.location.search);
+      const rawTab = params.get('tab');
+      const allowedTabs: NavTab[] = ['inicio', 'mudanza', 'mensual', 'ahorros', 'ajustes', 'ayuda'];
+      const validTab = rawTab && allowedTabs.includes(rawTab as NavTab) ? (rawTab as NavTab) : null;
+      const action = params.get('action');
+      const open = params.get('open');
+      if (!validTab && !action && !open) return null;
+      return { tab: validTab, action, open };
+    })()
+  );
+
+  const consumePendingOpenShopping = useCallback(() => {
+    setPendingOpenShopping(false);
+  }, []);
 
   const clearFocusMensualSection = useCallback(() => {
     setFocusMensualSection(null);
@@ -386,12 +420,13 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [householdId, viewerUid, effectiveTab, repo]);
 
-  // 5) Recurring templates (Inicio, Ahorros, or Avanzado Mensual/Ajustes)
+  // 5) Recurring templates (Inicio, Mensual in both modes, Ahorros, or Avanzado Ajustes)
   useEffect(() => {
     const needed =
       effectiveTab === 'inicio' ||
+      effectiveTab === 'mensual' ||
       effectiveTab === 'ahorros' ||
-      (uiMode === 'avanzado' && (effectiveTab === 'mensual' || effectiveTab === 'ajustes'));
+      (uiMode === 'avanzado' && effectiveTab === 'ajustes');
     if (!householdId || !viewerUid || !needed) {
       setRecurring([]);
       return;
@@ -625,6 +660,89 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setActiveTab('mensual');
   }, [uiMode, householdId, currentUserProfile, repo]);
 
+  // Apply PWA deep link ONLY once auth + household + members are ready, then clean URL params
+  useEffect(() => {
+    const dl = pendingDeepLinkRef.current;
+    if (!dl) return;
+    if (!isDemoMode && !authReady) return;
+    if (!householdId || !household || members.length === 0) return;
+
+    pendingDeepLinkRef.current = null;
+    if (dl.action === 'add-expense') {
+      setQuickExpenseOpen(true);
+    }
+    if (dl.open === 'shopping') {
+      setActiveTab('inicio');
+      setPendingOpenShopping(true);
+    } else if (dl.tab) {
+      setActiveTab(uiMode === 'sencillo' && dl.tab === 'ajustes' ? 'inicio' : dl.tab);
+    }
+
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('tab');
+      url.searchParams.delete('action');
+      url.searchParams.delete('open');
+      const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+    } catch {
+      // Ignore history errors
+    }
+  }, [isDemoMode, authReady, householdId, household, members.length, uiMode]);
+
+  // Keep local foreground notification settings reactive across AjustesView <-> NidoContext
+  useEffect(() => {
+    const onUpdated = () => setNoticeSettingsTick((n) => n + 1);
+    window.addEventListener(LOCAL_NOTICE_UPDATED_EVENT, onUpdated);
+    return () => window.removeEventListener(LOCAL_NOTICE_UPDATED_EVENT, onUpdated);
+  }, []);
+
+  // Opt-in foreground reminder + App Badge sync (zero server push, zero automatic permission prompt)
+  useEffect(() => {
+    if (!householdId || !viewerUid) {
+      void syncAppBadge(0);
+      return;
+    }
+    const canEvaluateCurrentMonth =
+      effectiveTab === 'inicio' ||
+      effectiveTab === 'ahorros' ||
+      (uiMode === 'avanzado' && (effectiveTab === 'mensual' || effectiveTab === 'ajustes')) ||
+      (effectiveTab === 'mensual' && selectedMonthKey === getCurrentMonthKeyLocal());
+
+    if (!canEvaluateCurrentMonth) return;
+
+    const storageKey = buildLocalNoticeStorageKey(householdId, viewerUid);
+    const settings = loadLocalNoticeSettings(storageKey);
+    const todayISO = getTodayLocalISO();
+    const currentMonthKey = getCurrentMonthKeyLocal();
+    const txSource =
+      effectiveTab === 'mensual' && selectedMonthKey === currentMonthKey
+        ? monthTransactions
+        : currentMonthTransactions;
+
+    const due = getUpcomingChargesWithinDays(recurring, todayISO, settings.daysAhead, txSource);
+    void syncAppBadge(settings.enabled ? due.length : 0);
+
+    if (settings.enabled && recurring.length > 0) {
+      triggerForegroundNotificationCheck({
+        storageKey,
+        recurring,
+        transactions: txSource,
+        todayISO,
+      });
+    }
+  }, [
+    householdId,
+    viewerUid,
+    effectiveTab,
+    uiMode,
+    selectedMonthKey,
+    recurring,
+    monthTransactions,
+    currentMonthTransactions,
+    noticeSettingsTick,
+  ]);
+
   const effectiveSeedPending = Boolean(household?.seedPending) || seedPending;
 
   const value: NidoContextValue = {
@@ -667,6 +785,8 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     quickExpenseOnSaved: quickExpenseOnSavedRef.current,
     openQuickExpenseWithPrefill,
     clearQuickExpensePrefill,
+    pendingOpenShopping,
+    consumePendingOpenShopping,
     activity,
     initialCosts,
     checklist,

@@ -11,7 +11,7 @@ export default defineConfig(() => {
       react(),
       tailwindcss(),
       VitePWA({
-        registerType: 'autoUpdate',
+        registerType: 'prompt',
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
@@ -42,6 +42,29 @@ export default defineConfig(() => {
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable',
+            },
+          ],
+          shortcuts: [
+            {
+              name: 'Añadir gasto',
+              short_name: 'Añadir gasto',
+              description: 'Registrar un gasto rápido en Nido',
+              url: '/?action=add-expense',
+              icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
+            },
+            {
+              name: 'Lista de la compra',
+              short_name: 'Compra',
+              description: 'Abrir la lista compartida del supermercado',
+              url: '/?tab=inicio&open=shopping',
+              icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
+            },
+            {
+              name: 'Gastos del mes',
+              short_name: 'Mensual',
+              description: 'Ver calendario y gastos mensuales',
+              url: '/?tab=mensual',
+              icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
             },
           ],
         },

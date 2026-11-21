@@ -93,6 +93,26 @@
           },
           "additionalProperties": false
         },
+        "categoryColors": {
+          "type": "object",
+          "description": "Optional shared hex color overrides keyed by the 13 ExpenseCategory keys.",
+          "properties": {
+            "alquiler": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "luz": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "agua": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "gas": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "internet": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "movil": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "suscripciones": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "seguros": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "comunidad": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "supermercado": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "transporte": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "ocio": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "otros": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+          },
+          "additionalProperties": false
+        },
         "seedPending": {
           "type": "boolean",
           "description": "True while Phase B default seeds (including inactive recurring catalog) are pending completion."
@@ -352,6 +372,11 @@
         },
         "dayOfMonth": {
           "type": "number"
+        },
+        "startMonth": {
+          "type": "string",
+          "pattern": "^(\\d{4}-\\d{2})?$",
+          "maxLength": 7
         },
         "splitOverride": {
           "type": "number"

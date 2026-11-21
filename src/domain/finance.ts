@@ -1,4 +1,9 @@
 import { TRANSACTION_CATEGORY_LABELS } from './presets';
+import {
+  getNextRecurringDueDate,
+  getRecurringDueDateForMonth,
+  isRecurringDueInMonth,
+} from './recurrence';
 import type {
   ExpenseCategory,
   FurnitureItem,
@@ -337,22 +342,13 @@ export function findMissingRecurringForMonth(
   monthKey: string
 ): RecurringExpense[] {
   const existingIds = new Set(
-    existingMonthTransactions.map((t) => t.recurringId).filter((id): id is string => Boolean(id))
+    existingMonthTransactions
+      .filter((t) => !t.isPrivate && Boolean(t.recurringId))
+      .map((t) => t.recurringId as string)
   );
-  const monthNum = Number(monthKey.split('-')[1]);
   return recurringList.filter((rec) => {
-    if (!rec.active || (Number(rec.amount) || 0) <= 0) return false;
     if (existingIds.has(rec.id)) return false;
-    // Generate monthly items every month, and periodic items in matching cadence or always if user explicitly triggers?
-    // Checking cadence: mensual = always, bimestral = odd months (or every 2), trimestral = 1,4,7,10, anual = 1.
-    // Wait: in practice, generating active monthly + due periodic items (and letting user toggle or generate all active)
-    // Wait: user prompt says "Generar gastos del mes desde plantillas (no duplicar si ya existen). Los no mensuales se muestran además prorrateados ('equivalente mensual')."
-    // So active monthly templates generate every month, and non-monthly templates generate when due by cadence (e.g. bimestral every 2 months, trimestral every 3 months, anual month 1 or 12? Actually, let's check if monthNum matches or allow generating monthly + due periodic). Let's include mensual always, bimestral on odd months (1,3,5,7,9,11), trimestral on 1,4,7,10, anual on 1 (or if none generated yet, generate mensual + due ones!). Better yet: let's return all active items not yet in the month when frequency is mensual or due this month, OR let's check: if someone tests in November (month 11) with an annual home insurance template, they might want to see monthly equivalent AND optionally generate it. Let's make `isRecurringDueInMonth` true for mensual, bimestral on odd months (11 is odd!), trimestral on (1,4,7,10), anual on month 1, AND expose a helper to check cadence.
-    if (rec.frequency === 'mensual') return true;
-    if (rec.frequency === 'bimestral') return monthNum % 2 === 1;
-    if (rec.frequency === 'trimestral') return (monthNum - 1) % 3 === 0;
-    if (rec.frequency === 'anual') return monthNum === 1;
-    return true;
+    return isRecurringDueInMonth(rec, monthKey);
   });
 }
 
@@ -371,15 +367,10 @@ export function getUpcomingCharges(
   todayISO: string,
   limit = 6
 ): UpcomingCharge[] {
-  const currentMonth = todayISO.slice(0, 7);
-  const nextMonth = shiftMonthKey(currentMonth, 1);
-  const todayDay = Number(todayISO.slice(8, 10));
-
   const upcoming: UpcomingCharge[] = [];
   for (const rec of recurringList) {
-    if (!rec.active || (Number(rec.amount) || 0) <= 0) continue;
-    const targetMonth = rec.dayOfMonth >= todayDay ? currentMonth : nextMonth;
-    const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
+    const dueDate = getNextRecurringDueDate(rec, todayISO, 12);
+    if (!dueDate) continue;
     upcoming.push({
       recurringId: rec.id,
       concept: rec.concept,
@@ -420,7 +411,7 @@ export function getUpcomingChargesWithinDays(
   const nextMonth = shiftMonthKey(currentMonth, 1);
   const existingKeys = new Set(
     transactions
-      .filter((t) => Boolean(t.recurringId))
+      .filter((t) => !t.isPrivate && Boolean(t.recurringId))
       .map((t) => `${t.monthKey}::${t.recurringId}`)
   );
 
@@ -429,7 +420,8 @@ export function getUpcomingChargesWithinDays(
     if (!rec.active || (Number(rec.amount) || 0) <= 0) continue;
     const candidates = [currentMonth, nextMonth];
     for (const targetMonth of candidates) {
-      const dueDate = clampDateForMonth(targetMonth, rec.dayOfMonth);
+      if (!isRecurringDueInMonth(rec, targetMonth)) continue;
+      const dueDate = getRecurringDueDateForMonth(rec, targetMonth);
       const diff = localDaysBetween(todayISO, dueDate);
       if (Number.isFinite(diff) && diff >= 0 && diff <= maxDays) {
         if (existingKeys.has(`${targetMonth}::${rec.id}`)) {
@@ -1041,4 +1033,47 @@ export function computeSavingsByMember(
         ]
       : []),
   ];
+}
+
+export interface RecurringHistoricalAverage {
+  average: number;
+  sampleCount: number;
+  lastDate: string;
+}
+
+/**
+ * Calcula la media de las últimas N facturas compartidas registradas para una plantilla recurrente.
+ * Excluye gastos privados y liquidaciones. Pensada solo para sugerencia explícita al usuario.
+ */
+export function computeRecurringHistoricalAverage(
+  transactions: Transaction[],
+  recurringId: string | null | undefined,
+  count = 3
+): RecurringHistoricalAverage | null {
+  if (!recurringId) return null;
+  const maxItems = Math.max(1, Math.floor(count));
+  const deduped = new Map<string, Transaction>();
+  for (const tx of transactions) {
+    if (
+      tx.isPrivate ||
+      tx.isSettlement ||
+      tx.category === 'liquidacion' ||
+      tx.recurringId !== recurringId ||
+      (Number(tx.amount) || 0) <= 0
+    ) {
+      continue;
+    }
+    if (!deduped.has(tx.id)) {
+      deduped.set(tx.id, tx);
+    }
+  }
+  const sorted = Array.from(deduped.values()).sort((a, b) => b.date.localeCompare(a.date));
+  if (sorted.length === 0) return null;
+  const slice = sorted.slice(0, maxItems);
+  const total = slice.reduce((sum, tx) => sum + (Number(tx.amount) || 0), 0);
+  return {
+    average: roundCents(total / slice.length),
+    sampleCount: slice.length,
+    lastDate: slice[0].date,
+  };
 }

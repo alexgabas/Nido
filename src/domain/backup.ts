@@ -1,4 +1,6 @@
 import type { NidoBackupV1 } from '../types/nido';
+import { isValidHexColor } from './categoryPalette';
+import { localDaysBetween } from './finance';
 
 export function formatCSVNumberES(n: number): string {
   return (Math.round((n + Number.EPSILON) * 100) / 100).toFixed(2).replace('.', ',');
@@ -171,6 +173,24 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     csvKeywords = cleanKw as NidoBackupV1['csvKeywords'];
   }
 
+  let categoryColors: NidoBackupV1['categoryColors'] = undefined;
+  if (raw.categoryColors !== undefined) {
+    if (!isObj(raw.categoryColors)) {
+      throw new Error('categoryColors inválido en la copia.');
+    }
+    const cleanColors: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw.categoryColors)) {
+      if (!VALID_TX_CATS.has(k) || k === 'liquidacion') {
+        throw new Error(`Categoría desconocida en categoryColors: ${k}.`);
+      }
+      if (!isValidHexColor(v)) {
+        throw new Error(`Color hexadecimal inválido en categoryColors.${k}: esperado #RRGGBB.`);
+      }
+      cleanColors[k] = v.toUpperCase();
+    }
+    categoryColors = cleanColors as NidoBackupV1['categoryColors'];
+  }
+
   const initialCosts = arr('initialCosts').map((item, idx) => {
     if (!isObj(item)) throw new Error(`initialCosts[${idx}] inválido.`);
     const cat = String(item.category);
@@ -247,6 +267,10 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       if (ov < 0 || ov > 100) throw new Error(`splitOverride fuera de rango en recurring[${idx}].`);
       splitOverride = ov;
     }
+    let startMonth: string | undefined = undefined;
+    if (item.startMonth !== undefined && item.startMonth !== null && item.startMonth !== '') {
+      startMonth = assertMonthKey(item.startMonth, `recurring[${idx}].startMonth`);
+    }
     return {
       id: assertStr(item.id, `recurring[${idx}].id`, 128, 1),
       concept: assertStr(item.concept, `recurring[${idx}].concept`, 120, 1),
@@ -254,6 +278,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       amount: assertNonNegNum(item.amount, `recurring[${idx}].amount`),
       frequency: freq as NidoBackupV1['recurring'][number]['frequency'],
       dayOfMonth: day,
+      ...(startMonth ? { startMonth } : {}),
       splitOverride,
       paidByDefault: normalizePayer(item.paidByDefault, `recurring[${idx}].paidByDefault`),
       active: item.active,
@@ -390,6 +415,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       currency: 'EUR',
     },
     ...(csvKeywords ? { csvKeywords } : {}),
+    ...(categoryColors ? { categoryColors } : {}),
     initialCosts,
     checklist,
     items,
@@ -402,3 +428,47 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     ...(shopping ? { shopping } : {}),
   };
 }
+
+// ─── 30-Day JSON Backup Reminder Helpers (device-local, truthful) ───────────
+
+export function buildLastBackupStorageKey(householdId: string, uid: string): string {
+  return `nido_last_backup_v1_${householdId}_${uid}`;
+}
+
+export function loadLastBackupRequestedAt(storageKey: string): string | null {
+  if (typeof window === 'undefined' || !storageKey) return null;
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLastBackupRequestedAt(storageKey: string, isoDate: string): void {
+  if (typeof window === 'undefined' || !storageKey || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return;
+  try {
+    window.localStorage.setItem(storageKey, isoDate);
+  } catch {
+    // Ignore private mode / quota errors
+  }
+}
+
+export function daysSinceLastBackup(lastISO: string | null, todayISO: string): number | null {
+  if (!lastISO || !/^\d{4}-\d{2}-\d{2}$/.test(lastISO)) return null;
+  const days = localDaysBetween(lastISO, todayISO);
+  return Number.isFinite(days) && days >= 0 ? days : null;
+}
+
+export function shouldShowBackupReminder(
+  lastISO: string | null,
+  todayISO: string,
+  thresholdDays = 30
+): boolean {
+  if (!lastISO) return true;
+  const days = daysSinceLastBackup(lastISO, todayISO);
+  if (days === null) return true;
+  return days >= thresholdDays;
+}
+

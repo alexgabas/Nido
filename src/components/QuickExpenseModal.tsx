@@ -18,11 +18,14 @@ import {
 import { useNido } from '../context/NidoContext';
 import {
   clampSplitPct,
+  computeRecurringHistoricalAverage,
+  formatDateES,
   formatEUR,
   getTodayLocalISO,
   inferSplitChoice,
   resolveSplitPctForChoice,
 } from '../domain/finance';
+import { resolveCategoryColor } from '../domain/categoryPalette';
 import { EXPENSE_CATEGORY_LABELS } from '../domain/presets';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
@@ -94,6 +97,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   onSaved = null,
 }) => {
   const {
+    household,
     householdId,
     currentUserProfile,
     currentMember,
@@ -102,6 +106,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     effectiveSplitPctA,
     selectedMonthKey,
     monthClosures,
+    recentTransactions,
+    monthTransactions,
     uiMode,
     repo,
     showToast,
@@ -153,13 +159,19 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       setNotes(editingTx.notes);
     } else {
       const today = getTodayLocalISO();
+      const validPrefillDate =
+        prefill?.date && /^\d{4}-\d{2}-\d{2}$/.test(prefill.date) ? prefill.date : null;
       const defaultDate =
-        uiMode === 'sencillo'
+        validPrefillDate ??
+        (uiMode === 'sencillo'
           ? today
           : today.startsWith(selectedMonthKey)
             ? today
-            : `${selectedMonthKey}-01`;
-      const defaultSplit = clampSplitPct(effectiveSplitPctA, 50);
+            : `${selectedMonthKey}-01`);
+      const defaultSplit =
+        prefill?.splitPctA !== undefined
+          ? clampSplitPct(prefill.splitPctA, effectiveSplitPctA)
+          : clampSplitPct(effectiveSplitPctA, 50);
       const initialCategory = prefill?.category ?? 'supermercado';
       const initialConcept =
         prefill?.concept ??
@@ -168,9 +180,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       setAmount(prefill?.amount ? prefill.amount.trim().replace('.', ',') : '');
       setConcept(initialConcept);
       setCategory(initialCategory);
-      setPaidBy(currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID);
+      setPaidBy(prefill?.paidBy || currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID);
       setDate(defaultDate);
-      setSplitChoice('segun_reparto');
+      setSplitChoice(inferSplitChoice(defaultSplit, viewerIsMemberA, effectiveSplitPctA));
       setSplitPctInput(String(defaultSplit));
       setIsPrivate(false);
       setNotes(prefill?.notes ?? '');
@@ -235,7 +247,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
 
   if (!open) return null;
 
-  const targetDate = isSimpleWizard ? getTodayLocalISO() : date;
+  const validPrefillDate =
+    prefill?.date && /^\d{4}-\d{2}-\d{2}$/.test(prefill.date) ? prefill.date : null;
+  const targetDate = isSimpleWizard ? (validPrefillDate ?? getTodayLocalISO()) : date;
   const targetMonthKey = targetDate.slice(0, 7);
   const isTargetClosed = monthClosures.some((c) => c.monthKey === targetMonthKey);
   const isOriginClosed = Boolean(
@@ -245,6 +259,14 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
 
   const numericAmount = Number(amount.replace(',', '.'));
   const hasValidAmount = Number.isFinite(numericAmount) && numericAmount > 0;
+  const linkedRecurringId = editingTx?.recurringId ?? prefill?.recurringId ?? null;
+  const recurringHistAvg = linkedRecurringId
+    ? computeRecurringHistoricalAverage(
+        [...recentTransactions, ...monthTransactions],
+        linkedRecurringId,
+        3
+      )
+    : null;
 
   const handleSelectSimpleCategory = (cat: ExpenseCategory) => {
     setCategory(cat);
@@ -307,7 +329,10 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       }
       safeSplitPctA = clampSplitPct(numSplit, effectiveSplitPctA);
     } else if (isSimpleWizard) {
-      safeSplitPctA = clampSplitPct(effectiveSplitPctA, 50);
+      safeSplitPctA =
+        prefill?.splitPctA !== undefined
+          ? clampSplitPct(prefill.splitPctA, effectiveSplitPctA)
+          : clampSplitPct(effectiveSplitPctA, 50);
     } else if (isSimpleEdit && editingTx) {
       safeSplitPctA = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
     } else {
@@ -334,7 +359,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
           amount: Math.round(numericAmount * 100) / 100,
           date: targetDate,
           paidBy: safePaidBy,
-          recurringId: editingTx?.recurringId ?? null,
+          recurringId: editingTx?.recurringId ?? prefill?.recurringId ?? null,
           splitPctA: safeSplitPctA,
           isSettlement: false,
           settlementTo: '',
@@ -470,6 +495,17 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                 >
                   {formattedAmountDisplay}
                 </div>
+                {recurringHistAvg && (
+                  <button
+                    type="button"
+                    onClick={() => setAmount(String(recurringHistAvg.average).replace('.', ','))}
+                    className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/35 bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-bold"
+                  >
+                    {recurringHistAvg.sampleCount === 1
+                      ? `Último recibo: ${formatEUR(recurringHistAvg.average)} · Usar`
+                      : `Media últimas ${recurringHistAvg.sampleCount} facturas: ${formatEUR(recurringHistAvg.average)} · Usar`}
+                  </button>
+                )}
               </div>
 
               <div className="space-y-4 pb-2">
@@ -517,17 +553,23 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                   {SENCILLO_CATEGORIES.map((item) => {
                     const Icon = item.icon;
                     const active = category === item.id;
+                    const dotColor = resolveCategoryColor(item.id, household?.categoryColors);
                     return (
                       <button
                         key={item.id}
                         type="button"
                         onClick={() => handleSelectSimpleCategory(item.id)}
-                        className={`min-h-[82px] p-4 rounded-2xl border flex flex-col items-center justify-center gap-2 transition-all active:scale-[0.98] ${
+                        className={`relative min-h-[82px] p-4 rounded-2xl border flex flex-col items-center justify-center gap-2 transition-all active:scale-[0.98] ${
                           active
                             ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
                             : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-[#0F1F24] dark:text-[#F0F5F6] hover:border-[#0E5A64]/40'
                         }`}
                       >
+                        <span
+                          aria-hidden="true"
+                          className="absolute top-3 right-3 w-2.5 h-2.5 rounded-full"
+                          style={{ backgroundColor: dotColor }}
+                        />
                         <Icon className="w-7 h-7" />
                         <span className="text-sm font-bold">{item.label}</span>
                       </button>
@@ -714,7 +756,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                     </p>
                   )}
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    Se guardará con fecha de hoy.
+                    {targetDate === getTodayLocalISO()
+                      ? 'Se guardará con fecha de hoy.'
+                      : `Se guardará con fecha ${formatDateES(targetDate)}.`}
                   </p>
                 </div>
               </div>
@@ -795,6 +839,22 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                 />
               </div>
             </div>
+            {recurringHistAvg && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs">
+                <span className="text-slate-600 dark:text-slate-300 tabular-nums">
+                  {recurringHistAvg.sampleCount === 1
+                    ? `Último recibo de esta plantilla: ${formatEUR(recurringHistAvg.average)}`
+                    : `Media últimas ${recurringHistAvg.sampleCount} facturas: ${formatEUR(recurringHistAvg.average)}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setAmount(String(recurringHistAvg.average).replace('.', ','))}
+                  className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] font-bold"
+                >
+                  Usar media
+                </button>
+              </div>
+            )}
 
             <div>
               <label htmlFor="simple-edit-cat" className="block text-xs font-medium mb-1">
@@ -993,25 +1053,50 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           </div>
 
+          {recurringHistAvg && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 px-3 py-2 text-xs">
+              <span className="text-slate-600 dark:text-slate-300 tabular-nums">
+                {recurringHistAvg.sampleCount === 1
+                  ? `Último recibo registrado: ${formatEUR(recurringHistAvg.average)}`
+                  : `Media últimas ${recurringHistAvg.sampleCount} facturas: ${formatEUR(recurringHistAvg.average)}`}
+              </span>
+              <button
+                type="button"
+                onClick={() => setAmount(String(recurringHistAvg.average).replace('.', ','))}
+                className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] font-bold hover:bg-[#0E5A64]/20"
+              >
+                Usar media
+              </button>
+            </div>
+          )}
+
           <div>
             <span className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
               Categoría
             </span>
             <div className="flex flex-wrap gap-1.5">
-              {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
-                <button
-                  key={cat}
-                  type="button"
-                  onClick={() => setCategory(cat)}
-                  className={`min-h-[44px] px-3 rounded-xl text-xs font-medium transition-colors whitespace-nowrap ${
-                    category === cat
-                      ? 'bg-[#0E5A64] text-white'
-                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
-                  }`}
-                >
-                  {EXPENSE_CATEGORY_LABELS[cat]}
-                </button>
-              ))}
+              {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => {
+                const dotColor = resolveCategoryColor(cat, household?.categoryColors);
+                return (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setCategory(cat)}
+                    className={`min-h-[44px] px-3 rounded-xl text-xs font-medium transition-colors whitespace-nowrap inline-flex items-center gap-1.5 ${
+                      category === cat
+                        ? 'bg-[#0E5A64] text-white'
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ backgroundColor: dotColor }}
+                    />
+                    <span>{EXPENSE_CATEGORY_LABELS[cat]}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
 

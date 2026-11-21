@@ -1033,5 +1033,200 @@ test('12. seedPending / recurringSeedVersion en households y semillas inactivas 
   );
 });
 
+test('13. recurring.startMonth acepta YYYY-MM o vacío y rechaza formatos inválidos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+
+  // Crear con startMonth válido YYYY-MM
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_bim').set({
+      concept: 'Agua',
+      category: 'agua',
+      amount: 45,
+      frequency: 'bimestral',
+      dayOfMonth: 10,
+      startMonth: '2026-11',
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Actualizar startMonth a vacío ('') y luego a otro mes válido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_bim').update({
+      startMonth: '',
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_bim').update({
+      startMonth: '2027-01',
+      updatedAt: ts,
+    })
+  );
+
+  // Crear sin startMonth (legado / opcional) permitido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_no_start').set({
+      concept: 'Alquiler',
+      category: 'alquiler',
+      amount: 900,
+      frequency: 'mensual',
+      dayOfMonth: 1,
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Rechazar formatos inválidos en create y update
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_bad1').set({
+      concept: 'Luz',
+      category: 'luz',
+      amount: 60,
+      frequency: 'mensual',
+      dayOfMonth: 5,
+      startMonth: '2026-11-01',
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_bad2').set({
+      concept: 'Gas',
+      category: 'gas',
+      amount: 40,
+      frequency: 'bimestral',
+      dayOfMonth: 5,
+      startMonth: '202611',
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_bim').update({
+      startMonth: 'nov-26',
+      updatedAt: ts,
+    })
+  );
+});
+
+test('14. households Action 6: categoryColors compartidos por miembro, hex #RRGGBB estricto y rechazo de claves/campos ajenos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Unir a Marta como segundo miembro
+  const joinBatch = dbMarta.batch();
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: firebase.firestore.FieldValue.arrayUnion('uid_marta'),
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('invites/SNT26A'), { memberCount: 2 });
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.set(dbMarta.doc('users/uid_marta'), { householdId: 'h1', updatedAt: ts });
+  await assertSucceeds(joinBatch.commit());
+
+  // Miembro actualiza categoryColors con hex válido y categorías permitidas
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      categoryColors: {
+        alquiler: '#3A7D5C',
+        supermercado: '#D97706',
+        luz: '#eab308',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Hex inválido rechazado ('red', '#123', '#GGGGGG')
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { alquiler: 'red' },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { alquiler: '#123' },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { alquiler: '#GGGGGG' },
+      updatedAt: ts,
+    })
+  );
+
+  // Clave de categoría desconocida o 'liquidacion' rechazada
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { liquidacion: '#3A7D5C' },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { inventada: '#3A7D5C' },
+      updatedAt: ts,
+    })
+  );
+
+  // No se permite mezclar categoryColors con settings ni inviteCode
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { alquiler: '#3A7D5C' },
+      inviteCode: 'HACK99',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      categoryColors: { alquiler: '#3A7D5C' },
+      settings: {
+        splitMode: 'preset',
+        presetA: 50,
+        presetB: 50,
+        incomeA: 1000,
+        incomeB: 1000,
+        currency: 'EUR',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso no miembro rechazado
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      categoryColors: { alquiler: '#3A7D5C' },
+      updatedAt: ts,
+    })
+  );
+});
+
+
 
 

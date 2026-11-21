@@ -17,10 +17,18 @@ import {
   Users,
   Wallet,
 } from 'lucide-react';
+import { CategoryTag } from '../components/CategoryTag';
 import { DonutChart, MonthlyBarChart } from '../components/Charts';
 import { ONBOARDING_SEEN_KEY, OnboardingWalkthrough } from '../components/OnboardingWalkthrough';
 import { ShoppingListSection } from '../components/ShoppingListSection';
 import { useNido } from '../context/NidoContext';
+import {
+  buildLastBackupStorageKey,
+  daysSinceLastBackup,
+  loadLastBackupRequestedAt,
+  shouldShowBackupReminder,
+} from '../domain/backup';
+import { resolveCategoryColor } from '../domain/categoryPalette';
 import {
   calculateCoupleBalance,
   computeFurnitureSummary,
@@ -43,22 +51,6 @@ import {
 import { EXPENSE_CATEGORY_LABELS } from '../domain/presets';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import type { ExpenseCategory } from '../types/nido';
-
-const CATEGORY_COLORS: Record<ExpenseCategory, string> = {
-  alquiler: '#0E5A64',
-  supermercado: '#15803D',
-  luz: '#D97706',
-  agua: '#0284C7',
-  gas: '#EA580C',
-  internet: '#4F46E5',
-  movil: '#7C3AED',
-  suscripciones: '#DB2777',
-  seguros: '#0F766E',
-  comunidad: '#475569',
-  transporte: '#2563EB',
-  ocio: '#DC4C3E',
-  otros: '#64748B',
-};
 
 export const InicioView: React.FC = () => {
   const {
@@ -88,6 +80,8 @@ export const InicioView: React.FC = () => {
     activity,
     repo,
     showToast,
+    pendingOpenShopping,
+    consumePendingOpenShopping,
   } = useNido();
 
   const [shoppingOpen, setShoppingOpen] = useState(false);
@@ -97,6 +91,12 @@ export const InicioView: React.FC = () => {
   const [savingIncomes, setSavingIncomes] = useState(false);
   const [incomeError, setIncomeError] = useState<string | null>(null);
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
+
+  useEffect(() => {
+    if (!pendingOpenShopping) return;
+    setShoppingOpen(true);
+    consumePendingOpenShopping();
+  }, [pendingOpenShopping, consumePendingOpenShopping]);
 
   useEffect(() => {
     if (isDemoMode || !household?.id) return;
@@ -240,10 +240,10 @@ export const InicioView: React.FC = () => {
       .map(([cat, value]) => ({
         label: EXPENSE_CATEGORY_LABELS[cat] || cat,
         value: roundCents(value),
-        color: CATEGORY_COLORS[cat] || '#64748B',
+        color: resolveCategoryColor(cat, household?.categoryColors),
       }))
       .sort((a, b) => b.value - a.value);
-  }, [currentMonthTx]);
+  }, [currentMonthTx, household?.categoryColors]);
 
   const furnitureSummary = useMemo(
     () => computeFurnitureSummary(furnitureItems),
@@ -995,6 +995,40 @@ export const InicioView: React.FC = () => {
         </section>
       )}
 
+      {/* 30-day JSON backup reminder (Avanzado, truthful device-local check) */}
+      {(() => {
+        if (!householdId || !currentUserProfile?.uid) return null;
+        const lastBackup = loadLastBackupRequestedAt(
+          buildLastBackupStorageKey(householdId, currentUserProfile.uid)
+        );
+        const householdAgeDays = household?.createdAt
+          ? daysSinceLastBackup(household.createdAt.slice(0, 10), todayISO)
+          : null;
+        const shouldRemind = lastBackup
+          ? shouldShowBackupReminder(lastBackup, todayISO, 30)
+          : householdAgeDays !== null && householdAgeDays >= 30;
+        if (!shouldRemind) return null;
+        return (
+          <section
+            aria-label="Recordatorio de copia de seguridad"
+            className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 px-4 py-3.5 flex flex-wrap items-center justify-between gap-3"
+          >
+            <p className="text-xs text-slate-600 dark:text-slate-300">
+              {lastBackup
+                ? `Tu última copia JSON en este dispositivo fue el ${formatDateES(lastBackup)} (hace más de 30 días).`
+                : 'Lleváis más de 30 días sin guardar una copia de seguridad JSON en este dispositivo.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => setActiveTab('ajustes')}
+              className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64] text-[#0E5A64] dark:text-[#5EEAD4] dark:border-[#5EEAD4] text-xs font-semibold hover:bg-[#0E5A64]/5 shrink-0"
+            >
+              Exportar en Ajustes
+            </button>
+          </section>
+        );
+      })()}
+
       {/* Upcoming Charges */}
       <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
         <div className="flex items-center justify-between">
@@ -1026,7 +1060,8 @@ export const InicioView: React.FC = () => {
                   className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-4"
                 >
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <CategoryTag category={charge.category} size="xs" />
                       <p className="text-sm font-semibold truncate">{charge.concept}</p>
                       {isSoon && (
                         <span className="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-800 dark:text-amber-300 text-[11px] font-semibold shrink-0">
@@ -1034,8 +1069,8 @@ export const InicioView: React.FC = () => {
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {formatDateES(charge.dueDate)} · {EXPENSE_CATEGORY_LABELS[charge.category]}
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                      {formatDateES(charge.dueDate)}
                     </p>
                   </div>
                   <span className="font-mono-num text-sm font-bold shrink-0">

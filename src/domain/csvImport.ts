@@ -337,3 +337,70 @@ export function buildParsedBankRows(
     };
   });
 }
+
+const CSV_BOILERPLATE_STOPWORDS = new Set([
+  'pago',
+  'con',
+  'tarjeta',
+  'compra',
+  'recibo',
+  'adeudo',
+  'sepa',
+  'transferencia',
+  'bizum',
+  'domiciliacion',
+  'cargo',
+  'comercio',
+  'tpv',
+  'pos',
+  'eur',
+  'esp',
+  'madrid',
+  'barcelona',
+  'valencia',
+  'sevilla',
+  'online',
+  'sl',
+  'sa',
+  'slu',
+  'sll',
+  'del',
+  'las',
+  'los',
+  'por',
+  'para',
+  'una',
+]);
+
+/**
+ * Extrae un término representativo de comercio para sugerir como palabra clave editable
+ * (eliminando IBANs, fechas, referencias numéricas y palabras genéricas bancarias).
+ */
+export function suggestKeywordTokenFromDescription(description: string): string {
+  const norm = normalizeText(description);
+  if (!norm) return '';
+
+  const stripped = norm
+    // IBANs compactos o en bloques numéricos de 4 dígitos (sin tragarse palabras posteriores)
+    .replace(/\b[a-z]{2}\d{2}(?:\s?\d{4}){3,6}\s?\d{0,4}\b/gi, ' ')
+    .replace(/\b[a-z]{2}\d{2}[a-z0-9]{8,30}\b/gi, ' ')
+    // Fechas dd/mm/yyyy o dd-mm-yy
+    .replace(/\b\d{1,4}[/-]\d{1,2}([/-]\d{2,4})?\b/g, ' ')
+    // Cadenas largas de dígitos o referencias alfanuméricas con >= 3 dígitos
+    .replace(/\b[a-z]*\d{3,}[a-z\d]*\b/g, ' ')
+    .replace(/[*_/|\\.,:;()[\]-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!stripped) return '';
+
+  const meaningfulWords = stripped
+    .split(' ')
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 3 && !/^\d+$/.test(w) && !CSV_BOILERPLATE_STOPWORDS.has(w));
+
+  if (meaningfulWords.length === 0) return '';
+  // Mantener hasta 2 palabras clave del comercio para mayor precisión
+  return meaningfulWords.slice(0, 2).join(' ').slice(0, 40).trim();
+}
+

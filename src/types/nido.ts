@@ -30,6 +30,7 @@ export interface HouseholdSettings {
 }
 
 export type CsvCategoryKeywords = Partial<Record<ExpenseCategory, string>>;
+export type CategoryColorMap = Partial<Record<ExpenseCategory, string>>;
 
 export interface Household {
   id: string;
@@ -38,6 +39,7 @@ export interface Household {
   inviteCode: string;
   settings: HouseholdSettings;
   csvKeywords?: CsvCategoryKeywords;
+  categoryColors?: CategoryColorMap;
   seedPending?: boolean;
   recurringSeedVersion?: number;
   createdAt: string;
@@ -166,6 +168,7 @@ export interface RecurringExpense {
   amount: number;
   frequency: RecurrenceFrequency;
   dayOfMonth: number;
+  startMonth?: string; // '' or 'YYYY-MM'
   splitOverride: number | null;
   paidByDefault: string; // uid | 'cuenta_comun'
   active: boolean;
@@ -265,6 +268,10 @@ export interface ExpensePrefill {
   concept?: string;
   category?: ExpenseCategory;
   notes?: string;
+  date?: string;
+  recurringId?: string | null;
+  paidBy?: string;
+  splitPctA?: number;
 }
 
 export interface NidoBackupV1 {
@@ -274,6 +281,7 @@ export interface NidoBackupV1 {
   householdName: string;
   settings: HouseholdSettings;
   csvKeywords?: CsvCategoryKeywords;
+  categoryColors?: CategoryColorMap;
   initialCosts: Omit<InitialCost, 'createdAt' | 'updatedAt'>[];
   checklist: Omit<ChecklistItem, 'createdAt' | 'updatedAt'>[];
   items: Omit<FurnitureItem, 'createdAt' | 'updatedAt'>[];

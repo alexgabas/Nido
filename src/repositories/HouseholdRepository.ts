@@ -1,6 +1,7 @@
 import type { RecurringCatalogPreset } from '../domain/presets';
 import type {
   ActivityEntry,
+  CategoryColorMap,
   ChecklistItem,
   CsvCategoryKeywords,
   ExpenseCategory,
@@ -166,6 +167,7 @@ export interface HouseholdRepository {
     actor: UserProfileInput
   ): Promise<void>;
   updateCsvKeywords(householdId: string, keywords: CsvCategoryKeywords): Promise<void>;
+  updateCategoryColors(householdId: string, colors: CategoryColorMap): Promise<void>;
   updateMemberUiMode(
     householdId: string,
     uid: string,

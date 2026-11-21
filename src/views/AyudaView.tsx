@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { HelpCircle, Lock, Scale, Share2, Smartphone, UserCheck, WifiOff } from 'lucide-react';
+import { Bell, CalendarPlus, HelpCircle, Lock, Scale, Share2, Smartphone, UserCheck, WifiOff } from 'lucide-react';
 import { OnboardingWalkthrough } from '../components/OnboardingWalkthrough';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import { useNido } from '../context/NidoContext';
@@ -111,6 +111,48 @@ export const AyudaView: React.FC = () => {
               </p>
             </div>
           </div>
+        </div>
+      </section>
+
+      {/* Alertas y recordatorios sin costes */}
+      <section className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-4">
+        <div className="flex items-center gap-2.5">
+          <span className="w-10 h-10 rounded-xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+            <Bell className="w-5 h-5" />
+          </span>
+          <div>
+            <h2 className="font-display text-lg font-bold">Alertas y recordatorios sin costes</h2>
+            <p className="text-xs text-slate-600 dark:text-slate-300">
+              Qué avisos ofrece Nido sin servidores de pago y cómo recibir alertas nativas en el móvil.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-3 text-xs sm:text-sm text-slate-600 dark:text-slate-300">
+          <div className="rounded-2xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200/80 dark:border-amber-800/60 p-4 space-y-1">
+            <p className="font-bold text-amber-950 dark:text-amber-100">
+              Por qué no hay notificaciones automáticas con la app cerrada
+            </p>
+            <p className="text-amber-900 dark:text-amber-200">
+              Enviar avisos push en segundo plano cuando el navegador está cerrado exige un servidor programado y facturación externa. Para garantizar cero costes adicionales, Nido no utiliza servidores de envío en segundo plano.
+            </p>
+          </div>
+
+          <div className="rounded-2xl bg-[#F6F8F8] dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 flex items-start gap-3">
+            <CalendarPlus className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h3 className="text-sm font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+                Alternativa gratuita recomendada: Exportar al calendario (.ics)
+              </h3>
+              <p>
+                En <strong>Mensual → Plantillas periódicas → Exportar (.ics)</strong> puedes descargar tus próximos cobros e importarlos en Google Calendar, Apple Calendar o Outlook para recibir notificaciones del sistema aunque Nido esté cerrada.
+              </p>
+            </div>
+          </div>
+
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Además, en Modo Avanzado → <strong>Ajustes</strong> puedes activar recordatorios locales optativos en este dispositivo para ver un aviso cuando abras Nido si falta algún cobro próximo por apuntar.
+          </p>
         </div>
       </section>
 

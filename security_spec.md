@@ -12,6 +12,8 @@
 9. **Shared Shopping List (`shopping/{id}`)**: Readable/writable only by household members, `qty` in `[1, 999]`, `text` `1..120`, `addedBy == request.auth.uid` on create and immutable on update.
 10. **Strict Schema Keys**: Every `create` validates `keys().hasAll(...) && keys().hasOnly(...)`; every `update` validates `diff().affectedKeys().hasOnly(...)` per named action.
 11. **Seed State Persistence (`seedPending`, `recurringSeedVersion`)**: Optional on `households/{hid}`. `seedPending` must be `bool` and `recurringSeedVersion` must be `int` in `[0, 1000]`. Only existing household members may update `['seedPending', 'recurringSeedVersion', 'updatedAt']` without mixing unrelated fields (`memberUids`, `name`, `inviteCode`, `settings`).
+12. **Recurring Anchor (`startMonth`)**: Optional on `recurring/{recId}`. Must be `''` or a valid `YYYY-MM` month key.
+13. **Shared Category Colors (`categoryColors`)**: Optional on `households/{hid}`. Restricted to the 13 `ExpenseCategory` keys with `#RRGGBB` hex strings. Only existing household members may update `['categoryColors', 'updatedAt']` without mixing unrelated fields.
 
 ## 2. The "Dirty Dozen" + Privacy & Shopping Payloads (Expected: PERMISSION_DENIED)
 1. **Unauthenticated read/write** on `/households/h1` -> Denied (`request.auth == null`).
@@ -31,3 +33,4 @@
 15. **Shopping tampering / non-member access**: Non-member reads/writes `/households/h1/shopping/s1`, member mutates `addedBy` on update, or writes invalid `qty: 0` / `qty: 1000` -> Denied.
 16. **Household csvKeywords shadow key injection**: Member writes an unknown key inside `csvKeywords` (e.g. `adminNote`) -> Denied.
 17. **Household seed state tampering**: Negative/non-int `recurringSeedVersion`, non-bool `seedPending`, non-member updating `seedPending`, or mixing `seedPending` with `memberUids`/`name` -> Denied.
+18. **Household categoryColors tampering**: Non-hex value, unknown category key, or non-member updating `categoryColors` -> Denied.

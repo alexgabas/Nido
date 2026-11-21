@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Bell,
   Check,
   Copy,
   Download,
@@ -7,6 +8,7 @@ import {
   HelpCircle,
   LogOut,
   Moon,
+  Palette,
   RefreshCw,
   Share2,
   Sun,
@@ -14,10 +16,16 @@ import {
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PWAInstallButton } from '../components/PWAInstallButton';
+import { CategoryColorModal } from '../components/mensual/CategoryColorModal';
 import { useNido } from '../context/NidoContext';
 import {
+  buildLastBackupStorageKey,
+  daysSinceLastBackup,
   downloadTextFile,
   generateSpanishCSV,
+  loadLastBackupRequestedAt,
+  saveLastBackupRequestedAt,
+  shouldShowBackupReminder,
   validateAndMigrateBackup,
 } from '../domain/backup';
 import {
@@ -29,6 +37,16 @@ import {
   getTodayLocalISO,
   shiftMonthKey,
 } from '../domain/finance';
+import {
+  buildLocalNoticeStorageKey,
+  DEFAULT_LOCAL_NOTICE_SETTINGS,
+  getBrowserNotificationPermission,
+  loadLocalNoticeSettings,
+  requestBrowserNotificationPermission,
+  saveLocalNoticeSettings,
+  type LocalNoticeDaysAhead,
+  type LocalNoticeSettings,
+} from '../domain/localNotifications';
 import { SPLIT_PRESETS, TRANSACTION_CATEGORY_LABELS } from '../domain/presets';
 import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
@@ -72,6 +90,7 @@ export const AjustesView: React.FC = () => {
   const [switchError, setSwitchError] = useState<string | null>(null);
   const [switchingHousehold, setSwitchingHousehold] = useState(false);
   const [switchConfirm, setSwitchConfirm] = useState<{ code: string; targetName: string } | null>(null);
+  const [colorModalOpen, setColorModalOpen] = useState(false);
 
   // Full report date range
   const todayISO = getTodayLocalISO();
@@ -82,6 +101,39 @@ export const AjustesView: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingBackup, setPendingBackup] = useState<NidoBackupV1 | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+
+  // Device-local foreground reminders (opt-in)
+  const noticeStorageKey =
+    householdId && currentUserProfile?.uid
+      ? buildLocalNoticeStorageKey(householdId, currentUserProfile.uid)
+      : '';
+  const [noticeSettings, setNoticeSettings] = useState<LocalNoticeSettings>(
+    DEFAULT_LOCAL_NOTICE_SETTINGS
+  );
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission | 'unsupported'>(() =>
+    getBrowserNotificationPermission()
+  );
+
+  // Device-local 30-day JSON backup timestamp
+  const backupStorageKey =
+    householdId && currentUserProfile?.uid
+      ? buildLastBackupStorageKey(householdId, currentUserProfile.uid)
+      : '';
+  const [lastBackupDate, setLastBackupDate] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!noticeStorageKey) return;
+    setNoticeSettings(loadLocalNoticeSettings(noticeStorageKey));
+    setNotifPermission(getBrowserNotificationPermission());
+  }, [noticeStorageKey]);
+
+  useEffect(() => {
+    if (!backupStorageKey) {
+      setLastBackupDate(null);
+      return;
+    }
+    setLastBackupDate(loadLastBackupRequestedAt(backupStorageKey));
+  }, [backupStorageKey]);
 
   useEffect(() => {
     if (!household) return;
@@ -198,6 +250,41 @@ export const AjustesView: React.FC = () => {
     await handleCopyInvite();
   };
 
+  const updateNoticeSettings = (patch: Partial<LocalNoticeSettings>) => {
+    if (!noticeStorageKey) return;
+    const next: LocalNoticeSettings = { ...noticeSettings, ...patch };
+    setNoticeSettings(next);
+    saveLocalNoticeSettings(noticeStorageKey, next);
+  };
+
+  const handleToggleDeviceNotices = async () => {
+    if (!noticeStorageKey) return;
+    if (noticeSettings.enabled) {
+      updateNoticeSettings({ enabled: false });
+      showToast('Recordatorios locales desactivados');
+      return;
+    }
+    const currentPerm = getBrowserNotificationPermission();
+    setNotifPermission(currentPerm);
+    if (currentPerm === 'unsupported') {
+      showToast('Este navegador no admite notificaciones locales');
+      return;
+    }
+    if (currentPerm === 'denied') {
+      showToast('Permiso bloqueado en los ajustes del navegador');
+      return;
+    }
+    const finalPerm =
+      currentPerm === 'granted' ? 'granted' : await requestBrowserNotificationPermission();
+    setNotifPermission(finalPerm);
+    if (finalPerm === 'granted') {
+      updateNoticeSettings({ enabled: true, lastNotifiedDate: '' });
+      showToast('Recordatorios activados para este dispositivo');
+    } else {
+      showToast('No se concedió permiso para mostrar avisos');
+    }
+  };
+
   const handleExportJSON = async () => {
     if (!householdId || !currentUserProfile) return;
     const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
@@ -206,6 +293,10 @@ export const AjustesView: React.FC = () => {
       JSON.stringify(backup, null, 2),
       'application/json'
     );
+    if (backupStorageKey) {
+      saveLastBackupRequestedAt(backupStorageKey, todayISO);
+      setLastBackupDate(todayISO);
+    }
     showToast('Copia de seguridad JSON descargada');
   };
 
@@ -488,6 +579,23 @@ export const AjustesView: React.FC = () => {
               </button>
             </div>
 
+            <div className="flex items-center justify-between gap-3 py-1 border-t border-slate-100 dark:border-slate-800 pt-3">
+              <div>
+                <p className="text-sm font-semibold">Colores de categorías</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Paleta compartida del hogar en calendario, etiquetas y gráficos.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setColorModalOpen(true)}
+                className="min-h-[44px] px-4 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-bold flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <Palette className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                <span>Personalizar</span>
+              </button>
+            </div>
+
             <div className="pt-2 space-y-2">
               <PWAInstallButton variant="full" />
               <button
@@ -498,6 +606,85 @@ export const AjustesView: React.FC = () => {
                 <HelpCircle className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
                 <span>Ayuda e instalación en móvil</span>
               </button>
+            </div>
+          </section>
+
+          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3.5">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-0.5">
+                <h2 className="font-display text-base font-bold flex items-center gap-2">
+                  <Bell className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                  <span>Recordatorios en este dispositivo</span>
+                </h2>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  Aviso al abrir Nido si hay un cargo próximo sin apuntar (hasta 1 vez al día).
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={notifPermission === 'unsupported'}
+                onClick={() => void handleToggleDeviceNotices()}
+                className={`min-h-[44px] px-3.5 rounded-xl text-xs font-bold shrink-0 transition-colors ${
+                  noticeSettings.enabled && notifPermission === 'granted'
+                    ? 'bg-[#0E5A64] text-white'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
+                }`}
+              >
+                {noticeSettings.enabled && notifPermission === 'granted' ? 'Activados' : 'Activar'}
+              </button>
+            </div>
+
+            {notifPermission === 'denied' && (
+              <p className="text-xs text-[#B42318] dark:text-[#FCA5A5]">
+                Las notificaciones están bloqueadas para esta web en la configuración del navegador.
+              </p>
+            )}
+            {notifPermission === 'unsupported' && (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Este navegador no admite notificaciones web. Usa «Exportar al calendario (.ics)» en Mensual.
+              </p>
+            )}
+
+            <div className="space-y-2.5 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Antelación del aviso
+                </span>
+                <div className="flex items-center gap-1">
+                  {([1, 2, 3] as LocalNoticeDaysAhead[]).map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => updateNoticeSettings({ daysAhead: d })}
+                      className={`min-h-[44px] px-2.5 rounded-lg text-xs font-semibold border ${
+                        noticeSettings.daysAhead === d
+                          ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {d} {d === 1 ? 'día' : 'días'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <label className="flex items-center justify-between gap-3 min-h-[44px] cursor-pointer">
+                <span className="text-xs text-slate-600 dark:text-slate-300">
+                  Mostrar importes exactos en el texto del aviso
+                </span>
+                <input
+                  type="checkbox"
+                  checked={noticeSettings.showAmountsInNotification}
+                  onChange={(e) =>
+                    updateNoticeSettings({ showAmountsInNotification: e.target.checked })
+                  }
+                  className="w-4 h-4 accent-[#0E5A64]"
+                />
+              </label>
+
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Nota gratuita sin servidor: solo se muestran cuando abres Nido. Para avisos con la app cerrada, exporta vuestros cobros a Google o Apple Calendar (.ics) en Mensual.
+              </p>
             </div>
           </section>
 
@@ -685,9 +872,34 @@ export const AjustesView: React.FC = () => {
           <div className="space-y-1">
             <h2 className="font-display text-base font-bold">Copia de seguridad (JSON)</h2>
             <p className="text-xs text-slate-600 dark:text-slate-400">
-              Exporta todo vuestro historial o restaura una copia validada contra esquema.
+              Exporta todo vuestro historial o restaura una copia validada contra esquema. Cada miembro exporta los datos compartidos y solo sus propios gastos privados.
+            </p>
+            <p className="text-xs font-medium text-slate-700 dark:text-slate-300 pt-1">
+              {(() => {
+                const days = daysSinceLastBackup(lastBackupDate, todayISO);
+                if (!lastBackupDate) {
+                  return 'Última exportación solicitada desde este dispositivo: ninguna registrada aún.';
+                }
+                const suffix =
+                  days === 0
+                    ? ' (hoy)'
+                    : days === 1
+                      ? ' (hace 1 día)'
+                      : days !== null
+                        ? ` (hace ${days} días)`
+                        : '';
+                return `Última exportación solicitada desde este dispositivo: ${formatDateES(lastBackupDate)}${suffix}.`;
+              })()}
             </p>
           </div>
+
+          {shouldShowBackupReminder(lastBackupDate, todayISO, 30) && (
+            <div className="rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 px-3.5 py-2.5 text-xs text-amber-900 dark:text-amber-200">
+              {lastBackupDate
+                ? 'Han pasado más de 30 días desde la última exportación en este dispositivo. Conviene guardar una copia actualizada.'
+                : 'Aún no has descargado ninguna copia JSON desde este dispositivo. Te recomendamos guardar una al menos una vez al mes.'}
+            </div>
+          )}
 
           {importError && (
             <div role="alert" className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs">
@@ -762,6 +974,8 @@ export const AjustesView: React.FC = () => {
         }}
         onCancel={() => setSwitchConfirm(null)}
       />
+
+      <CategoryColorModal open={colorModalOpen} onClose={() => setColorModalOpen(false)} />
     </div>
   );
 };

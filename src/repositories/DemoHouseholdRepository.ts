@@ -6,6 +6,12 @@ import {
   normalizeSplitPair,
   shiftMonthKey,
 } from '../domain/finance';
+import { sanitizeCategoryColors } from '../domain/categoryPalette';
+import {
+  buildDeterministicRecurringTxId,
+  isRecurringDueInMonth,
+  isValidMonthKey,
+} from '../domain/recurrence';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -20,6 +26,7 @@ import { COMMON_ACCOUNT_ID } from '../types/nido';
 import type {
   ActivityAction,
   ActivityEntry,
+  CategoryColorMap,
   ChecklistItem,
   CsvCategoryKeywords,
   FurnitureItem,
@@ -141,8 +148,8 @@ function buildInitialDemoState(): DemoState {
     { id: 'rec_rent', concept: 'Alquiler piso', category: 'alquiler', amount: 850, frequency: 'mensual', dayOfMonth: 1, splitOverride: null, paidByDefault: 'cuenta_comun', active: true, createdAt: ts, updatedAt: ts },
     { id: 'rec_fiber', concept: 'Fibra y móviles', category: 'internet', amount: 48, frequency: 'mensual', dayOfMonth: 5, splitOverride: null, paidByDefault: uidA, active: true, createdAt: ts, updatedAt: ts },
     { id: 'rec_light', concept: 'Electricidad', category: 'luz', amount: 68, frequency: 'mensual', dayOfMonth: 12, splitOverride: null, paidByDefault: 'cuenta_comun', active: true, createdAt: ts, updatedAt: ts },
-    { id: 'rec_water', concept: 'Agua (bimestral)', category: 'agua', amount: 52, frequency: 'bimestral', dayOfMonth: 24, splitOverride: null, paidByDefault: uidB, active: true, createdAt: ts, updatedAt: ts },
-    { id: 'rec_ins', concept: 'Seguro de hogar', category: 'seguros', amount: 168, frequency: 'anual', dayOfMonth: 28, splitOverride: null, paidByDefault: 'cuenta_comun', active: true, createdAt: ts, updatedAt: ts },
+    { id: 'rec_water', concept: 'Agua (bimestral)', category: 'agua', amount: 52, frequency: 'bimestral', dayOfMonth: 24, startMonth: currentMonth, splitOverride: null, paidByDefault: uidB, active: true, createdAt: ts, updatedAt: ts },
+    { id: 'rec_ins', concept: 'Seguro de hogar', category: 'seguros', amount: 168, frequency: 'anual', dayOfMonth: 28, startMonth: currentMonth, splitOverride: null, paidByDefault: 'cuenta_comun', active: true, createdAt: ts, updatedAt: ts },
   ];
 
   const transactions: Transaction[] = [
@@ -647,6 +654,13 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async updateCategoryColors(_hid: string, colors: CategoryColorMap): Promise<void> {
+    const clean = sanitizeCategoryColors(colors);
+    this.state.household.categoryColors = clean ?? {};
+    this.state.household.updatedAt = new Date().toISOString();
+    this.emit();
+  }
+
   async updateMemberUiMode(_hid: string, uid: string, uiMode: UiMode): Promise<void> {
     this.state.members = this.state.members.map((m) => (m.uid === uid ? { ...m, uiMode } : m));
     this.emit();
@@ -814,13 +828,18 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   ): Promise<string> {
     const now = new Date().toISOString();
     const id = rec.id || `rec_${Date.now()}`;
+    const startMonth = isValidMonthKey(rec.startMonth) ? rec.startMonth : '';
+    const cleanRec = {
+      ...rec,
+      ...(startMonth ? { startMonth } : { startMonth: '' }),
+    };
     if (rec.id) {
       this.state.recurring = this.state.recurring.map((r) =>
-        r.id === id ? { ...r, ...rec, id, updatedAt: now } : r
+        r.id === id ? { ...r, ...cleanRec, id, updatedAt: now } : r
       );
       this.logActivity(actor, 'update', 'recurrente', id, `Editó plantilla "${rec.concept}"`);
     } else {
-      this.state.recurring.push({ ...rec, id, createdAt: now, updatedAt: now });
+      this.state.recurring.push({ ...cleanRec, id, createdAt: now, updatedAt: now });
       this.logActivity(actor, 'create', 'recurrente', id, `Creó plantilla "${rec.concept}"`);
     }
     this.emit();
@@ -883,11 +902,22 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     defaultSplitPctA: number,
     actor: UserProfileInput
   ): Promise<number> {
-    if (missing.length === 0) return 0;
+    if (missing.length === 0 || !isValidMonthKey(monthKey)) return 0;
     const now = new Date().toISOString();
+    let createdCount = 0;
+
     for (const rec of missing) {
+      if (!isRecurringDueInMonth(rec, monthKey)) continue;
+      const detId = buildDeterministicRecurringTxId(monthKey, rec.id);
+      const alreadyExists = this.state.transactions.some(
+        (t) =>
+          t.id === detId ||
+          (t.monthKey === monthKey && t.recurringId === rec.id && !t.isPrivate)
+      );
+      if (alreadyExists) continue;
+
       this.state.transactions.push({
-        id: `tx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: detId,
         monthKey,
         concept: rec.concept,
         category: rec.category,
@@ -907,16 +937,19 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         createdAt: now,
         updatedAt: now,
       });
+      createdCount++;
     }
+
+    if (createdCount === 0) return 0;
     this.logActivity(
       actor,
       'create',
       'gastos_mes',
       monthKey,
-      `Generó ${missing.length} gastos recurrentes para ${monthKey}`
+      `Generó ${createdCount} gastos recurrentes para ${monthKey}`
     );
     this.emit();
-    return missing.length;
+    return createdCount;
   }
 
   async upsertTransaction(
@@ -1226,6 +1259,9 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       householdName: this.state.household.name,
       settings: this.state.household.settings,
       ...(this.state.household.csvKeywords ? { csvKeywords: this.state.household.csvKeywords } : {}),
+      ...(this.state.household.categoryColors && Object.keys(this.state.household.categoryColors).length > 0
+        ? { categoryColors: this.state.household.categoryColors }
+        : {}),
       initialCosts: this.state.initialCosts.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       checklist: this.state.checklist.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       items: this.state.items.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
@@ -1247,6 +1283,9 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.state.household.settings = backup.settings;
     if (backup.csvKeywords) {
       this.state.household.csvKeywords = { ...backup.csvKeywords };
+    }
+    if (backup.categoryColors) {
+      this.state.household.categoryColors = { ...backup.categoryColors };
     }
     this.state.initialCosts = backup.initialCosts.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.checklist = backup.checklist.map((c) => ({ ...c, createdAt: now, updatedAt: now }));

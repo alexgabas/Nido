@@ -16,6 +16,7 @@ import {
   guessCsvColumns,
   parseCsvMatrix,
   resolveKeywordsMap,
+  suggestKeywordTokenFromDescription,
   type CsvColumnMapping,
   type CsvDelimiter,
 } from '../domain/csvImport';
@@ -79,6 +80,12 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
     resolveKeywordsMap(household?.csvKeywords)
   );
   const [savingKeywords, setSavingKeywords] = useState(false);
+  const [keywordPrompt, setKeywordPrompt] = useState<{
+    rowIndex: number;
+    keyword: string;
+    targetCategory: ExpenseCategory;
+  } | null>(null);
+  const [savingQuickKeyword, setSavingQuickKeyword] = useState(false);
 
   // Full history for accurate duplicate detection
   const [historyTx, setHistoryTx] = useState<Transaction[]>(recentTransactions);
@@ -92,6 +99,7 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
     setError(null);
     setDraftKeywords(resolveKeywordsMap(household?.csvKeywords));
     setRowOverrides({});
+    setKeywordPrompt(null);
     setDefaultPaidBy(COMMON_ACCOUNT_ID);
   }, [open, household?.csvKeywords]);
 
@@ -218,6 +226,42 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
       setError(toUserFriendlyErrorMessage(err, 'No se pudieron guardar las reglas.'));
     } finally {
       setSavingKeywords(false);
+    }
+  };
+
+  const handleConfirmQuickKeyword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!householdId || !keywordPrompt) return;
+    const cleanKw = keywordPrompt.keyword.trim().toLowerCase();
+    if (cleanKw.length < 2) {
+      setError('Escribe una palabra clave de al menos 2 caracteres.');
+      return;
+    }
+    const cat = keywordPrompt.targetCategory;
+    const existingList = (draftKeywords[cat] || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const alreadyExists = existingList.some((item) => item.toLowerCase() === cleanKw);
+    const nextList = alreadyExists ? existingList : [...existingList, cleanKw];
+    const nextKeywords: Record<ExpenseCategory, string> = {
+      ...draftKeywords,
+      [cat]: nextList.join(', '),
+    };
+
+    setSavingQuickKeyword(true);
+    setError(null);
+    try {
+      await repo.updateCsvKeywords(householdId, nextKeywords);
+      setDraftKeywords(nextKeywords);
+      setKeywordPrompt(null);
+      showToast(
+        `Palabra clave «${cleanKw}» guardada para ${EXPENSE_CATEGORY_LABELS[cat]}`
+      );
+    } catch (err) {
+      setError(toUserFriendlyErrorMessage(err, 'No se pudo guardar la palabra clave.'));
+    } finally {
+      setSavingQuickKeyword(false);
     }
   };
 
@@ -533,6 +577,51 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
                 )}
               </div>
 
+              {keywordPrompt && (
+                <form
+                  onSubmit={handleConfirmQuickKeyword}
+                  className="rounded-2xl border border-[#0E5A64]/35 bg-[#0E5A64]/6 dark:bg-[#2AA1AE]/10 p-3.5 space-y-2.5"
+                >
+                  <p className="text-xs font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+                    Recordar palabra clave para «{EXPENSE_CATEGORY_LABELS[keywordPrompt.targetCategory]}»
+                  </p>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-300">
+                    Revisa o acorta el término antes de guardarlo en las reglas del hogar (evita fechas o referencias variables):
+                  </p>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      type="text"
+                      aria-label="Palabra clave a recordar"
+                      maxLength={40}
+                      value={keywordPrompt.keyword}
+                      onChange={(e) =>
+                        setKeywordPrompt((prev) =>
+                          prev ? { ...prev, keyword: e.target.value } : null
+                        )
+                      }
+                      placeholder="Ej. mercadona, endesa..."
+                      className="flex-1 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="submit"
+                        disabled={savingQuickKeyword}
+                        className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs font-semibold disabled:opacity-50"
+                      >
+                        {savingQuickKeyword ? 'Guardando...' : 'Guardar regla'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setKeywordPrompt(null)}
+                        className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              )}
+
               <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-2xl">
                 <table className="w-full text-left text-xs border-collapse">
                   <thead>
@@ -598,27 +687,52 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
                               : row.rawAmount || '—'}
                           </td>
                           <td className="py-2 px-2">
-                            <select
-                              aria-label={`Categoría fila ${idx + 1}`}
-                              disabled={status.disabled}
-                              value={cat}
-                              onChange={(e) =>
-                                setRowOverrides((prev) => ({
-                                  ...prev,
-                                  [idx]: {
-                                    ...prev[idx],
-                                    category: e.target.value as ExpenseCategory,
-                                  },
-                                }))
-                              }
-                              className="min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
-                            >
-                              {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((c) => (
-                                <option key={c} value={c}>
-                                  {EXPENSE_CATEGORY_LABELS[c]}
-                                </option>
-                              ))}
-                            </select>
+                            <div className="flex flex-col gap-1 items-start">
+                              <select
+                                aria-label={`Categoría fila ${idx + 1}`}
+                                disabled={status.disabled}
+                                value={cat}
+                                onChange={(e) => {
+                                  const nextCat = e.target.value as ExpenseCategory;
+                                  setRowOverrides((prev) => ({
+                                    ...prev,
+                                    [idx]: {
+                                      ...prev[idx],
+                                      category: nextCat,
+                                    },
+                                  }));
+                                  if (nextCat === row.suggestedCategory || nextCat === 'otros') {
+                                    if (keywordPrompt?.rowIndex === idx) setKeywordPrompt(null);
+                                  }
+                                }}
+                                className="min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                              >
+                                {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((c) => (
+                                  <option key={c} value={c}>
+                                    {EXPENSE_CATEGORY_LABELS[c]}
+                                  </option>
+                                ))}
+                              </select>
+                              {!status.disabled &&
+                                cat !== 'otros' &&
+                                cat !== row.suggestedCategory && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setKeywordPrompt({
+                                        rowIndex: idx,
+                                        keyword:
+                                          suggestKeywordTokenFromDescription(row.concept) ||
+                                          row.concept.toLowerCase().slice(0, 30).trim(),
+                                        targetCategory: cat,
+                                      })
+                                    }
+                                    className="min-h-[44px] px-2 text-[11px] font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:underline text-left"
+                                  >
+                                    Recordar palabra clave
+                                  </button>
+                                )}
+                            </div>
                           </td>
                           <td className="py-2 px-3 text-center">
                             <label className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center gap-1 cursor-pointer">
