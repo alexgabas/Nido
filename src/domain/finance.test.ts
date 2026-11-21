@@ -1628,5 +1628,52 @@ test('12. Catálogo de gastos habituales: siembra en hogar nuevo, idempotencia, 
   uT();
 });
 
+test('13. Presupuesto vs real (computeBudgetProgress): fijos dentro de límite en verde, superados en rojo y mixtos/variables en ámbar', () => {
+  const txs: Transaction[] = [
+    makeTx({ id: 'p_rent', category: 'alquiler', amount: 850, recurringId: 'rec_rent' }),
+    makeTx({ id: 'p_net', category: 'internet', amount: 48, recurringId: 'rec_net' }),
+    makeTx({ id: 'p_ins', category: 'seguros', amount: 105, recurringId: 'rec_ins' }),
+    makeTx({ id: 'p_luz_r', category: 'luz', amount: 60, recurringId: 'rec_luz' }),
+    makeTx({ id: 'p_luz_m', category: 'luz', amount: 25, recurringId: null }),
+    makeTx({ id: 'p_super', category: 'supermercado', amount: 340, recurringId: null }),
+    makeTx({ id: 'p_priv_rent', category: 'alquiler', amount: 200, isPrivate: true, createdBy: 'uid_alex' }),
+  ];
 
+  const progress = computeBudgetProgress(txs, {
+    monthKey: '2026-11',
+    limits: {
+      alquiler: 850,
+      internet: 50,
+      seguros: 100,
+      luz: 100,
+      supermercado: 400,
+    },
+    updatedAt: '',
+  });
 
+  const byCat = Object.fromEntries(progress.map((row) => [row.category, row]));
+  assert.equal(byCat.alquiler.spent, 850);
+  assert.equal(byCat.alquiler.pct, 100);
+  assert.equal(byCat.alquiler.isRecurringOnly, true);
+  assert.equal(byCat.alquiler.status, 'verde');
+
+  assert.equal(byCat.internet.spent, 48);
+  assert.equal(byCat.internet.pct, 96);
+  assert.equal(byCat.internet.isRecurringOnly, true);
+  assert.equal(byCat.internet.status, 'verde');
+
+  assert.equal(byCat.seguros.spent, 105);
+  assert.equal(byCat.seguros.pct, 105);
+  assert.equal(byCat.seguros.isRecurringOnly, true);
+  assert.equal(byCat.seguros.status, 'rojo');
+
+  assert.equal(byCat.luz.spent, 85);
+  assert.equal(byCat.luz.pct, 85);
+  assert.equal(byCat.luz.isRecurringOnly, false);
+  assert.equal(byCat.luz.status, 'ambar');
+
+  assert.equal(byCat.supermercado.spent, 340);
+  assert.equal(byCat.supermercado.pct, 85);
+  assert.equal(byCat.supermercado.isRecurringOnly, false);
+  assert.equal(byCat.supermercado.status, 'ambar');
+});

@@ -462,6 +462,7 @@ export interface CategoryBudgetProgress {
   limit: number;
   pct: number;
   status: BudgetTrafficLight;
+  isRecurringOnly: boolean;
 }
 
 export function computeBudgetProgress(
@@ -469,9 +470,20 @@ export function computeBudgetProgress(
   budget: MonthlyBudget | null
 ): CategoryBudgetProgress[] {
   const spentMap = new Map<ExpenseCategory, number>();
+  const hasRecurringByCat = new Set<ExpenseCategory>();
+  const hasNonRecurringByCat = new Set<ExpenseCategory>();
+
   for (const tx of transactions) {
     if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
-    spentMap.set(tx.category, (spentMap.get(tx.category) ?? 0) + tx.amount);
+    const amt = Number(tx.amount) || 0;
+    spentMap.set(tx.category, (spentMap.get(tx.category) ?? 0) + amt);
+    if (amt > 0) {
+      if (tx.recurringId && String(tx.recurringId).trim() !== '') {
+        hasRecurringByCat.add(tx.category);
+      } else {
+        hasNonRecurringByCat.add(tx.category);
+      }
+    }
   }
 
   const limits = budget?.limits ?? {};
@@ -485,15 +497,18 @@ export function computeBudgetProgress(
     const spent = roundCents(spentMap.get(category) ?? 0);
     const limit = roundCents(Number(limits[category]) || 0);
     if (spent === 0 && limit === 0) continue;
+    const isRecurringOnly =
+      hasRecurringByCat.has(category) && !hasNonRecurringByCat.has(category);
     let status: BudgetTrafficLight = 'sin_limite';
     let pct = 0;
     if (limit > 0) {
       pct = Math.round((spent / limit) * 100);
-      if (pct < 80) status = 'verde';
-      else if (pct <= 100) status = 'ambar';
-      else status = 'rojo';
+      if (spent > limit) status = 'rojo';
+      else if (isRecurringOnly) status = 'verde';
+      else if (pct < 80) status = 'verde';
+      else status = 'ambar';
     }
-    result.push({ category, spent, limit, pct, status });
+    result.push({ category, spent, limit, pct, status, isRecurringOnly });
   }
 
   return result.sort((a, b) => b.spent - a.spent);
@@ -514,28 +529,13 @@ export function getBudgetThresholdAlerts(
   budget: MonthlyBudget | null,
   thresholdPct = 80
 ): BudgetThresholdAlert[] {
-  const hasRecurringByCat = new Set<ExpenseCategory>();
-  const hasNonRecurringByCat = new Set<ExpenseCategory>();
-
-  for (const tx of transactions) {
-    if (tx.isPrivate || tx.isSettlement || tx.category === 'liquidacion') continue;
-    if ((Number(tx.amount) || 0) <= 0) continue;
-    if (tx.recurringId && String(tx.recurringId).trim() !== '') {
-      hasRecurringByCat.add(tx.category);
-    } else {
-      hasNonRecurringByCat.add(tx.category);
-    }
-  }
-
   const progress = computeBudgetProgress(transactions, budget);
   return progress
     .filter((bp) => {
       if (bp.limit <= 0) return false;
       const ratioPct = (bp.spent / bp.limit) * 100;
       if (ratioPct < thresholdPct) return false;
-      const isRecurringOnly =
-        hasRecurringByCat.has(bp.category) && !hasNonRecurringByCat.has(bp.category);
-      if (isRecurringOnly && bp.spent <= bp.limit) {
+      if (bp.isRecurringOnly && bp.spent <= bp.limit) {
         return false;
       }
       return true;

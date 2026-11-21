@@ -48,6 +48,7 @@ import {
   resolveSplitPctForChoice,
   roundCents,
   shiftMonthKey,
+  type CategoryBudgetProgress,
   type ComparisonDirection,
 } from '../domain/finance';
 import {
@@ -158,6 +159,8 @@ export const MensualView: React.FC = () => {
   // Budget modal
   const [budgetModalOpen, setBudgetModalOpen] = useState(false);
   const [draftLimits, setDraftLimits] = useState<Record<string, string>>({});
+  const [budgetModalError, setBudgetModalError] = useState<string | null>(null);
+  const [savingBudget, setSavingBudget] = useState(false);
 
   // Confirm dialogs
   const [deleteTarget, setDeleteTarget] = useState<
@@ -222,6 +225,16 @@ export const MensualView: React.FC = () => {
     () => computeBudgetProgress(monthTransactions, budget),
     [monthTransactions, budget]
   );
+
+  const activeFixedByCategory = useMemo(() => {
+    const map: Partial<Record<ExpenseCategory, number>> = {};
+    for (const rec of recurring) {
+      if (!rec.active || (Number(rec.amount) || 0) <= 0) continue;
+      const eq = monthlyEquivalent(rec.amount, rec.frequency);
+      map[rec.category] = roundCents((map[rec.category] ?? 0) + eq);
+    }
+    return map;
+  }, [recurring]);
 
   const missingRecurring = useMemo(
     () => findMissingRecurringForMonth(recurring, monthTransactions, selectedMonthKey),
@@ -644,9 +657,10 @@ export const MensualView: React.FC = () => {
     const draft: Record<string, string> = {};
     for (const cat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
       const val = budget?.limits?.[cat];
-      draft[cat] = val !== undefined ? String(val) : '';
+      draft[cat] = val !== undefined && val > 0 ? String(val) : '';
     }
     setDraftLimits(draft);
+    setBudgetModalError(null);
     setBudgetModalOpen(true);
   };
 
@@ -655,14 +669,32 @@ export const MensualView: React.FC = () => {
     if (!householdId || !currentUserProfile) return;
     const limits: MonthlyBudget['limits'] = {};
     for (const [k, raw] of Object.entries(draftLimits)) {
-      const n = Number(raw.replace(',', '.'));
-      if (Number.isFinite(n) && n > 0) {
+      const trimmed = raw.trim();
+      if (trimmed === '') continue;
+      const n = Number(trimmed.replace(',', '.'));
+      if (!Number.isFinite(n) || n < 0) {
+        setBudgetModalError(
+          `El límite de ${EXPENSE_CATEGORY_LABELS[k as ExpenseCategory]} debe ser un número válido igual o mayor que 0.`
+        );
+        return;
+      }
+      if (n > 0) {
         limits[k as ExpenseCategory] = Math.round(n * 100) / 100;
       }
     }
-    await repo.saveBudget(householdId, selectedMonthKey, limits, currentUserProfile);
-    setBudgetModalOpen(false);
-    showToast('Presupuesto mensual actualizado');
+    setSavingBudget(true);
+    setBudgetModalError(null);
+    try {
+      await repo.saveBudget(householdId, selectedMonthKey, limits, currentUserProfile);
+      setBudgetModalOpen(false);
+      showToast('Presupuesto mensual actualizado');
+    } catch (err) {
+      setBudgetModalError(
+        toUserFriendlyErrorMessage(err, 'No se pudieron guardar los límites mensuales.')
+      );
+    } finally {
+      setSavingBudget(false);
+    }
   };
 
   const handleConfirmDelete = async () => {
@@ -731,14 +763,37 @@ export const MensualView: React.FC = () => {
     showToast('PDF mensual descargado');
   };
 
-  const statusBadge = (status: 'sin_limite' | 'verde' | 'ambar' | 'rojo') => {
-    switch (status) {
+  const statusBadge = (bp: CategoryBudgetProgress) => {
+    const remaining = roundCents(bp.limit - bp.spent);
+    switch (bp.status) {
       case 'verde':
-        return { bar: 'bg-[#15803D]', text: 'text-[#15803D] dark:text-[#4ADE80]', label: 'En presupuesto' };
+        if (bp.isRecurringOnly) {
+          return {
+            bar: 'bg-[#15803D]',
+            text: 'text-[#15803D] dark:text-[#4ADE80]',
+            label: 'Gasto fijo previsto',
+          };
+        }
+        return {
+          bar: 'bg-[#15803D]',
+          text: 'text-[#15803D] dark:text-[#4ADE80]',
+          label: remaining > 0 ? `En presupuesto · quedan ${formatEUR(remaining)}` : 'En presupuesto',
+        };
       case 'ambar':
-        return { bar: 'bg-amber-500', text: 'text-amber-800 dark:text-amber-300', label: 'Cerca del límite' };
+        return {
+          bar: 'bg-amber-500',
+          text: 'text-amber-800 dark:text-amber-300',
+          label:
+            Math.abs(remaining) < 0.005
+              ? 'En el límite'
+              : `Cerca del límite · quedan ${formatEUR(remaining)}`,
+        };
       case 'rojo':
-        return { bar: 'bg-[#B42318]', text: 'text-[#B42318] dark:text-[#FCA5A5]', label: 'Superado' };
+        return {
+          bar: 'bg-[#B42318]',
+          text: 'text-[#B42318] dark:text-[#FCA5A5]',
+          label: `Superado por ${formatEUR(roundCents(bp.spent - bp.limit))}`,
+        };
       default:
         return { bar: 'bg-slate-400', text: 'text-slate-500 dark:text-slate-400', label: 'Sin límite' };
     }
@@ -1673,7 +1728,7 @@ export const MensualView: React.FC = () => {
           ) : (
             <div className="space-y-3.5">
               {budgetProgress.map((bp) => {
-                const badge = statusBadge(bp.status);
+                const badge = statusBadge(bp);
                 const barWidth = bp.limit > 0 ? Math.min(100, bp.pct) : 0;
                 return (
                   <div key={bp.category} className="space-y-1.5">
@@ -2219,8 +2274,8 @@ export const MensualView: React.FC = () => {
                   >
                     <option value="segun_reparto">Según reparto del hogar ({effectiveSplitPctA}% / {Math.round((100 - effectiveSplitPctA) * 10) / 10}%)</option>
                     <option value="a_medias">A medias (50% / 50%)</option>
-                    <option value="solo_yo">Solo yo (100% mío)</option>
-                    <option value="solo_pareja">Solo mi pareja (100% pareja)</option>
+                    <option value="solo_yo">Lo asumo yo ({viewerIsMemberA ? shortNameA : shortNameB} · 100%)</option>
+                    <option value="solo_pareja">Lo asume {viewerIsMemberA ? shortNameB : shortNameA} (100%)</option>
                     <option value="personalizado">Personalizado</option>
                   </select>
                   {recSplitChoice === 'personalizado' && (
@@ -2573,30 +2628,111 @@ export const MensualView: React.FC = () => {
           aria-modal="true"
           aria-labelledby="budget-modal-title"
         >
-          <div className="w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4 max-h-[85vh] overflow-y-auto">
-            <h2 id="budget-modal-title" className="font-display text-lg font-bold">
-              Presupuestos de {formatMonthLabelES(selectedMonthKey)}
-            </h2>
-            <form onSubmit={handleSaveBudgets} className="space-y-3">
-              {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
-                <div key={cat} className="flex items-center justify-between gap-3">
-                  <label htmlFor={`bud-${cat}`} className="text-sm">
-                    {EXPENSE_CATEGORY_LABELS[cat]}
-                  </label>
-                  <input
-                    id={`bud-${cat}`}
-                    type="text"
-                    inputMode="decimal"
-                    placeholder="Sin límite"
-                    value={draftLimits[cat] ?? ''}
-                    onChange={(e) =>
-                      setDraftLimits((prev) => ({ ...prev, [cat]: e.target.value }))
-                    }
-                    className="w-32 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm text-right"
-                  />
-                </div>
-              ))}
-              <div className="flex justify-end gap-2 pt-3">
+          <div className="w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-6 space-y-4 max-h-[88vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="budget-modal-title" className="font-display text-lg font-bold">
+                  Presupuestos de {formatMonthLabelES(selectedMonthKey)}
+                </h2>
+                <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
+                  Pon límites sobre todo en gastos variables. Las categorías cubiertas solo por plantillas fijas no dan avisos salvo que se superen.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Cerrar editor de presupuestos"
+                onClick={() => setBudgetModalOpen(false)}
+                className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {budgetModalError && (
+              <div
+                role="alert"
+                className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs font-medium"
+              >
+                {budgetModalError}
+              </div>
+            )}
+
+            <form onSubmit={handleSaveBudgets} className="space-y-5">
+              {(() => {
+                const variableCats: ExpenseCategory[] = ['supermercado', 'transporte', 'ocio', 'otros'];
+                const fixedCats = (Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).filter(
+                  (c) => !variableCats.includes(c)
+                );
+                const fixedCatsWithDraft = fixedCats.filter((c) => {
+                  const raw = (draftLimits[c] ?? '').trim();
+                  return raw !== '' && Number(raw.replace(',', '.')) > 0;
+                });
+
+                const renderCatRow = (cat: ExpenseCategory) => {
+                  const fixedMonthly = activeFixedByCategory[cat] ?? 0;
+                  return (
+                    <div key={cat} className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <label htmlFor={`bud-${cat}`} className="text-sm font-medium block">
+                          {EXPENSE_CATEGORY_LABELS[cat]}
+                        </label>
+                        {fixedMonthly > 0 && (
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Fijo activo: {formatEUR(fixedMonthly)}/mes
+                          </p>
+                        )}
+                      </div>
+                      <input
+                        id={`bud-${cat}`}
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="Sin límite"
+                        value={draftLimits[cat] ?? ''}
+                        onChange={(e) =>
+                          setDraftLimits((prev) => ({ ...prev, [cat]: e.target.value }))
+                        }
+                        className="w-32 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm text-right shrink-0"
+                      />
+                    </div>
+                  );
+                };
+
+                return (
+                  <>
+                    <div className="space-y-2.5">
+                      <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                        Gastos variables (recomendado)
+                      </h3>
+                      <div className="space-y-2.5">{variableCats.map(renderCatRow)}</div>
+                    </div>
+
+                    <div className="space-y-2.5 pt-3 border-t border-slate-200 dark:border-slate-800">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                          Suministros y gastos fijos (opcional)
+                        </h3>
+                        {fixedCatsWithDraft.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDraftLimits((prev) => {
+                                const next = { ...prev };
+                                for (const c of fixedCats) next[c] = '';
+                                return next;
+                              });
+                            }}
+                            className="min-h-[44px] px-2.5 rounded-lg text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-[#0E5A64]/10"
+                          >
+                            Quitar límites de fijos
+                          </button>
+                        )}
+                      </div>
+                      <div className="space-y-2.5">{fixedCats.map(renderCatRow)}</div>
+                    </div>
+                  </>
+                );
+              })()}
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
                 <button
                   type="button"
                   onClick={() => setBudgetModalOpen(false)}
@@ -2606,9 +2742,10 @@ export const MensualView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold"
+                  disabled={savingBudget}
+                  className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] text-white text-sm font-semibold disabled:opacity-50"
                 >
-                  Guardar límites
+                  {savingBudget ? 'Guardando...' : 'Guardar límites'}
                 </button>
               </div>
             </form>
