@@ -17,7 +17,15 @@ export const MAX_LENGTHS = {
   movementNote: 240,
   activitySummary: 240,
   shoppingText: 120,
+  shoppingUnit: 20,
+  shoppingCatalogId: 48,
+  shoppingBrand: 60,
+  shoppingFormat: 40,
+  shoppingSection: 48,
   csvKeywordString: 300,
+  categoryName: 40,
+  categoryIcon: 32,
+  checkoutId: 48,
 } as const;
 
 export interface HouseholdSettings {
@@ -29,8 +37,50 @@ export interface HouseholdSettings {
   currency: 'EUR';
 }
 
-export type CsvCategoryKeywords = Partial<Record<ExpenseCategory, string>>;
-export type CategoryColorMap = Partial<Record<ExpenseCategory, string>>;
+export const SYSTEM_EXPENSE_CATEGORIES = [
+  'alquiler',
+  'luz',
+  'agua',
+  'gas',
+  'internet',
+  'movil',
+  'suscripciones',
+  'seguros',
+  'comunidad',
+  'supermercado',
+  'transporte',
+  'ocio',
+  'otros',
+] as const;
+
+export type SystemExpenseCategory = (typeof SYSTEM_EXPENSE_CATEGORIES)[number];
+export type ExpenseCategory = string;
+export type TransactionCategory = ExpenseCategory | 'liquidacion';
+
+export type CsvCategoryKeywords = Partial<Record<SystemExpenseCategory, string>> &
+  Record<string, string | undefined>;
+export type CategoryColorMap = Partial<Record<SystemExpenseCategory, string>> &
+  Record<string, string | undefined>;
+
+export interface CustomCategory {
+  id: string; // cat_<slug>
+  name: string;
+  color: string; // #RRGGBB
+  icon: string; // icon key from allowlist
+  order: number;
+  archived: boolean;
+  csvKeywords: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CategoryBudgetLimit {
+  id: string; // `${monthKey}__${categoryId}`
+  monthKey: string; // YYYY-MM
+  categoryId: string; // cat_...
+  limit: number;
+  updatedAt: string;
+}
 
 export interface Household {
   id: string;
@@ -76,15 +126,19 @@ export interface ActivityEntry {
   timestamp: string;
 }
 
-export type InitialCostCategory =
-  | 'alquiler'
-  | 'fianza'
-  | 'garantia_adicional'
-  | 'suministros'
-  | 'cerrajeria'
-  | 'mudanza'
-  | 'mobiliario'
-  | 'otros';
+export const SYSTEM_INITIAL_COST_CATEGORIES = [
+  'alquiler',
+  'fianza',
+  'garantia_adicional',
+  'suministros',
+  'cerrajeria',
+  'mudanza',
+  'mobiliario',
+  'otros',
+] as const;
+
+export type SystemInitialCostCategory = (typeof SYSTEM_INITIAL_COST_CATEGORIES)[number];
+export type InitialCostCategory = SystemInitialCostCategory | string;
 
 export type InitialCostStatus = 'pendiente' | 'pagado';
 
@@ -143,22 +197,6 @@ export interface FurnitureItem {
   updatedAt: string;
 }
 
-export type ExpenseCategory =
-  | 'alquiler'
-  | 'luz'
-  | 'agua'
-  | 'gas'
-  | 'internet'
-  | 'movil'
-  | 'suscripciones'
-  | 'seguros'
-  | 'comunidad'
-  | 'supermercado'
-  | 'transporte'
-  | 'ocio'
-  | 'otros';
-
-export type TransactionCategory = ExpenseCategory | 'liquidacion';
 export type RecurrenceFrequency = 'mensual' | 'bimestral' | 'trimestral' | 'anual';
 
 export interface RecurringExpense {
@@ -204,7 +242,7 @@ export interface Transaction {
 
 export interface MonthlyBudget {
   monthKey: string;
-  limits: Partial<Record<ExpenseCategory, number>>;
+  limits: Partial<Record<SystemExpenseCategory, number>> & Record<string, number | undefined>;
   updatedAt: string;
 }
 
@@ -253,12 +291,69 @@ export interface GoalMovement {
   createdAt: string;
 }
 
+export const SHOPPING_SECTIONS = [
+  'Fruta y verdura',
+  'Carne, charcutería y huevos',
+  'Pescado y marisco',
+  'Lácteos, quesos y bebidas vegetales',
+  'Panadería y bollería',
+  'Despensa, arroz, pasta y conservas',
+  'Desayuno, café y dulces',
+  'Congelados',
+  'Platos preparados y refrigerados',
+  'Bebidas',
+  'Limpieza y hogar',
+  'Cuidado personal e higiene',
+  'Bebé y mascotas',
+  'Otros de supermercado',
+] as const;
+
+export type ShoppingSection = (typeof SHOPPING_SECTIONS)[number];
+export type ShoppingSourceType = 'mercadona' | 'custom' | 'generic';
+
 export interface ShoppingItem {
   id: string;
   text: string;
   qty: number;
+  unit?: string;
   done: boolean;
+  catalogId?: string;
+  brand?: string;
+  format?: string;
+  section?: ShoppingSection;
+  sourceType?: ShoppingSourceType;
   addedBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShoppingCatalogItem {
+  id: string; // prod_<hash_slug>
+  text: string;
+  defaultUnit: string;
+  usageCount: number;
+  lastUsedAt: string;
+  favorite?: boolean;
+  catalogId?: string;
+  brand?: string;
+  format?: string;
+  section?: ShoppingSection;
+  sourceType?: ShoppingSourceType;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PendingShoppingCheckout {
+  id: string; // chk_<ts>_<rand>
+  expenseId: string; // tx_chk_<ts>_<rand>
+  monthKey: string; // YYYY-MM
+  amount: number; // 0 when isPrivate
+  concept: string; // 'Compra privada' when isPrivate
+  pendingItemIds: string[]; // remaining shopping item IDs to clean up
+  totalItemCount: number;
+  isPrivate: boolean;
+  createdBy: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -282,6 +377,8 @@ export interface NidoBackupV1 {
   settings: HouseholdSettings;
   csvKeywords?: CsvCategoryKeywords;
   categoryColors?: CategoryColorMap;
+  customCategories?: Omit<CustomCategory, 'createdAt' | 'updatedAt'>[];
+  categoryBudgets?: Omit<CategoryBudgetLimit, 'updatedAt'>[];
   initialCosts: Omit<InitialCost, 'createdAt' | 'updatedAt'>[];
   checklist: Omit<ChecklistItem, 'createdAt' | 'updatedAt'>[];
   items: Omit<FurnitureItem, 'createdAt' | 'updatedAt'>[];
@@ -292,4 +389,5 @@ export interface NidoBackupV1 {
   goals: Omit<SavingsGoal, 'createdAt' | 'updatedAt'>[];
   goalMovements: Omit<GoalMovement, 'createdAt'>[];
   shopping?: Omit<ShoppingItem, 'createdAt' | 'updatedAt'>[];
+  shoppingCatalog?: Omit<ShoppingCatalogItem, 'createdAt' | 'updatedAt'>[];
 }

@@ -31,7 +31,7 @@ import {
 } from '../domain/finance';
 import { GOAL_TYPE_LABELS } from '../domain/presets';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
-import { exportNidoPDF } from '../services/pdfExport';
+import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
 import type { GoalType, SavingsGoal } from '../types/nido';
 
 export const AhorrosView: React.FC = () => {
@@ -75,6 +75,8 @@ export const AhorrosView: React.FC = () => {
   const [celebratedGoalName, setCelebratedGoalName] = useState<string | null>(null);
   const [deleteGoalTarget, setDeleteGoalTarget] = useState<SavingsGoal | null>(null);
   const [deletingGoal, setDeletingGoal] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [pdfExportError, setPdfExportError] = useState<string | null>(null);
 
   const activeGoals = useMemo(() => goals.filter((g) => !g.archived), [goals]);
   const archivedGoals = useMemo(() => goals.filter((g) => g.archived), [goals]);
@@ -174,26 +176,30 @@ export const AhorrosView: React.FC = () => {
       moveGoal.targetAmount > 0 &&
       currentProg.savedAmount + signed >= moveGoal.targetAmount;
 
-    await repo.addGoalMovement(
-      householdId,
-      {
-        goalId: moveGoal.id,
-        amount: signed,
-        by: moveBy || currentUserProfile.uid,
-        date: todayISO,
-        note: moveNote.trim(),
-      },
-      moveGoal.name,
-      currentUserProfile
-    );
+    try {
+      await repo.addGoalMovement(
+        householdId,
+        {
+          goalId: moveGoal.id,
+          amount: signed,
+          by: moveBy || currentUserProfile.uid,
+          date: todayISO,
+          note: moveNote.trim(),
+        },
+        moveGoal.name,
+        currentUserProfile
+      );
 
-    const completedName = moveGoal.name;
-    setMoveGoal(null);
-    if (willComplete) {
-      setCelebratedGoalName(completedName);
-      window.setTimeout(() => setCelebratedGoalName(null), 5000);
-    } else {
-      showToast(signed > 0 ? 'Aportación guardada' : 'Retirada guardada');
+      const completedName = moveGoal.name;
+      setMoveGoal(null);
+      if (willComplete) {
+        setCelebratedGoalName(completedName);
+        window.setTimeout(() => setCelebratedGoalName(null), 5000);
+      } else {
+        showToast(signed > 0 ? 'Aportación guardada' : 'Retirada guardada');
+      }
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo registrar el movimiento de ahorro.'));
     }
   };
 
@@ -211,35 +217,43 @@ export const AhorrosView: React.FC = () => {
     e.preventDefault();
     if (!householdId || !currentUserProfile) return;
     const target = Math.max(0, Number(goalTarget.replace(',', '.')) || 0);
-    await repo.upsertGoal(
-      householdId,
-      {
-        id: editingGoal?.id,
-        name: goalName.trim(),
-        icon: editingGoal?.icon ?? 'piggy-bank',
-        color: goalColor,
-        targetAmount: Math.round(target * 100) / 100,
-        targetDate: goalDate,
-        type: goalType,
-        archived: false,
-      },
-      currentUserProfile
-    );
-    setGoalModalOpen(false);
-    showToast('Meta de ahorro guardada');
+    try {
+      await repo.upsertGoal(
+        householdId,
+        {
+          id: editingGoal?.id,
+          name: goalName.trim(),
+          icon: editingGoal?.icon ?? 'piggy-bank',
+          color: goalColor,
+          targetAmount: Math.round(target * 100) / 100,
+          targetDate: goalDate,
+          type: goalType,
+          archived: false,
+        },
+        currentUserProfile
+      );
+      setGoalModalOpen(false);
+      showToast('Meta de ahorro guardada');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar la meta de ahorro.'));
+    }
   };
 
   const applyEmergencyTarget = async (amount: number) => {
     if (!householdId || !currentUserProfile || !emergencyGoal) return;
-    await repo.upsertGoal(
-      householdId,
-      {
-        ...emergencyGoal,
-        targetAmount: amount,
-      },
-      currentUserProfile
-    );
-    showToast(`Colchón de emergencia actualizado a ${formatEUR(amount)}`);
+    try {
+      await repo.upsertGoal(
+        householdId,
+        {
+          ...emergencyGoal,
+          targetAmount: amount,
+        },
+        currentUserProfile
+      );
+      showToast(`Colchón de emergencia actualizado a ${formatEUR(amount)}`);
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el colchón de emergencia.'));
+    }
   };
 
   const handleExportCSV = () => {
@@ -257,21 +271,34 @@ export const AhorrosView: React.FC = () => {
     showToast('CSV de ahorros descargado');
   };
 
-  const handleExportPDF = () => {
-    if (!household) return;
-    exportNidoPDF({
-      scope: 'ahorros',
-      household,
-      members,
-      fromDate: todayISO.slice(0, 4) + '-01-01',
-      toDate: todayISO,
-      transactions: [],
-      initialCosts: [],
-      items: [],
-      goals,
-      goalMovements,
-    });
-    showToast('PDF de ahorros descargado');
+  const handleExportPDF = async () => {
+    if (!household || exportingPdf) return;
+    setExportingPdf(true);
+    setPdfExportError(null);
+    try {
+      await loadAndExportNidoPDF({
+        scope: 'ahorros',
+        household,
+        members,
+        fromDate: todayISO.slice(0, 4) + '-01-01',
+        toDate: todayISO,
+        transactions: [],
+        initialCosts: [],
+        items: [],
+        goals,
+        goalMovements,
+      });
+      showToast('PDF de ahorros descargado');
+    } catch (err) {
+      setPdfExportError(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudo cargar el módulo PDF. Comprueba tu conexión e inténtalo de nuevo.'
+        )
+      );
+    } finally {
+      setExportingPdf(false);
+    }
   };
 
   const movementModal = moveGoal && (
@@ -575,11 +602,12 @@ export const AhorrosView: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={handleExportPDF}
-            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5"
+            disabled={exportingPdf}
+            onClick={() => void handleExportPDF()}
+            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
           >
             <Download className="w-4 h-4" />
-            <span>PDF</span>
+            <span>{exportingPdf ? 'Generando PDF...' : 'PDF'}</span>
           </button>
           <button
             type="button"
@@ -591,6 +619,32 @@ export const AhorrosView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {pdfExportError && (
+        <div
+          role="alert"
+          className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] px-4 py-3 text-xs font-medium flex flex-wrap items-center justify-between gap-2"
+        >
+          <span>{pdfExportError}</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={exportingPdf}
+              onClick={() => void handleExportPDF()}
+              className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64] text-white font-semibold disabled:opacity-50"
+            >
+              Reintentar
+            </button>
+            <button
+              type="button"
+              onClick={() => setPdfExportError(null)}
+              className="min-h-[44px] px-2.5 rounded-lg border border-current/30 font-semibold"
+            >
+              Cerrar
+            </button>
+          </div>
+        </div>
+      )}
 
       {celebratedGoalName && (
         <div
@@ -855,15 +909,19 @@ export const AhorrosView: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() =>
-                        householdId &&
-                        currentUserProfile &&
-                        void repo.upsertGoal(
-                          householdId,
-                          { ...ag, archived: false },
-                          currentUserProfile
-                        )
-                      }
+                      onClick={async () => {
+                        if (!householdId || !currentUserProfile) return;
+                        try {
+                          await repo.upsertGoal(
+                            householdId,
+                            { ...ag, archived: false },
+                            currentUserProfile
+                          );
+                          showToast(`Meta "${ag.name}" reactivada`);
+                        } catch (err) {
+                          showToast(toUserFriendlyErrorMessage(err, 'No se pudo reactivar la meta.'));
+                        }
+                      }}
                       className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
                     >
                       <RotateCcw className="w-3.5 h-3.5" />
@@ -933,16 +991,20 @@ export const AhorrosView: React.FC = () => {
                         <button
                           type="button"
                           aria-label={`Eliminar movimiento de ${goalNameForMov}`}
-                          onClick={() =>
-                            householdId &&
-                            currentUserProfile &&
-                            void repo.deleteGoalMovement(
-                              householdId,
-                              m.id,
-                              goalNameForMov,
-                              currentUserProfile
-                            )
-                          }
+                          onClick={async () => {
+                            if (!householdId || !currentUserProfile) return;
+                            try {
+                              await repo.deleteGoalMovement(
+                                householdId,
+                                m.id,
+                                goalNameForMov,
+                                currentUserProfile
+                              );
+                              showToast('Movimiento eliminado');
+                            } catch (err) {
+                              showToast(toUserFriendlyErrorMessage(err, 'No se pudo eliminar el movimiento.'));
+                            }
+                          }}
                           className="min-h-[44px] min-w-[44px] rounded-lg inline-flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
                         >
                           <Trash2 className="w-4 h-4" />

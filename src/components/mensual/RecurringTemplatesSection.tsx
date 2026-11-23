@@ -6,7 +6,7 @@ import {
   isRecurringTemplatePending,
   monthlyEquivalent,
 } from '../../domain/finance';
-import { EXPENSE_CATEGORY_LABELS, FREQUENCY_LABELS } from '../../domain/presets';
+import { FREQUENCY_LABELS } from '../../domain/presets';
 import {
   isRecurringMissingStartMonth,
   isValidMonthKey,

@@ -24,8 +24,23 @@ import {
   computeEffectiveSplitPctA,
   getTodayLocalISO,
   normalizeSplitPair,
+  roundCents,
 } from '../domain/finance';
-import { sanitizeCategoryColors } from '../domain/categoryPalette';
+import { isValidHexColor, sanitizeCategoryColors } from '../domain/categoryPalette';
+import {
+  buildCategoryBudgetDocId,
+  canSafelyDeleteCustomCategory,
+  generateCustomCategoryId,
+  isCustomCategoryId,
+  isSystemExpenseCategory,
+  isValidCategoryIcon,
+} from '../domain/categories';
+import {
+  buildShoppingCatalogId,
+  normalizeShoppingSection,
+  normalizeShoppingSourceType,
+  normalizeShoppingUnit,
+} from '../domain/shoppingCatalog';
 import {
   buildDeterministicRecurringTxId,
   isRecurringDueInMonth,
@@ -44,13 +59,28 @@ import {
 } from '../domain/presets';
 import { db, handleFirestoreError, OperationType } from '../services/firebase';
 import {
+  buildCheckoutExpenseId,
+  isShoppingItemSafeForCrossDeviceCleanup,
+  isShoppingItemUnchangedForCheckout,
+  isValidShoppingCheckoutId,
+  MAX_CHECKOUT_BATCH_ITEMS,
+  MAX_CHECKOUT_PENDING_ITEMS,
+  sortSnapshotsDeterministically,
+  type ShoppingCheckoutBatchCleanupResult,
+  type ShoppingCheckoutItemSnapshot,
+  type ShoppingCheckoutPhase1Input,
+  type ShoppingCheckoutPhase1Result,
+} from '../domain/shoppingCheckout';
+import {
   COMMON_ACCOUNT_ID,
   MAX_LENGTHS,
   type ActivityAction,
   type ActivityEntry,
+  type CategoryBudgetLimit,
   type CategoryColorMap,
   type ChecklistItem,
   type CsvCategoryKeywords,
+  type CustomCategory,
   type ExpenseCategory,
   type FurnitureItem,
   type FurnitureStatus,
@@ -62,9 +92,13 @@ import {
   type MonthClosure,
   type MonthlyBudget,
   type NidoBackupV1,
+  type PendingShoppingCheckout,
   type RecurringExpense,
   type SavingsGoal,
+  type ShoppingCatalogItem,
   type ShoppingItem,
+  type ShoppingSection,
+  type ShoppingSourceType,
   type Transaction,
   type UiMode,
 } from '../types/nido';
@@ -307,12 +341,95 @@ function mapGoalMovement(id: string, d: DocumentData): GoalMovement {
 }
 
 function mapShoppingItem(id: string, d: DocumentData): ShoppingItem {
+  const unit = normalizeShoppingUnit(typeof d.unit === 'string' ? d.unit : '');
+  const rawQty = Number(d.qty ?? 1);
+  const catalogId = typeof d.catalogId === 'string' && d.catalogId.trim() ? d.catalogId.trim() : undefined;
+  const brand = typeof d.brand === 'string' && d.brand.trim() ? d.brand.trim() : undefined;
+  const format = typeof d.format === 'string' && d.format.trim() ? d.format.trim() : undefined;
+  const section = normalizeShoppingSection(typeof d.section === 'string' ? d.section : undefined);
+  const sourceType = normalizeShoppingSourceType(
+    typeof d.sourceType === 'string' ? d.sourceType : undefined
+  );
   return {
     id,
     text: String(d.text ?? ''),
-    qty: Math.max(1, Math.min(999, Math.round(Number(d.qty ?? 1)))),
+    qty: roundCents(Math.max(0.01, Math.min(999, Number.isFinite(rawQty) ? rawQty : 1))),
+    ...(unit ? { unit } : {}),
     done: Boolean(d.done),
+    ...(catalogId ? { catalogId } : {}),
+    ...(brand ? { brand } : {}),
+    ...(format ? { format } : {}),
+    ...(section ? { section } : {}),
+    ...(sourceType ? { sourceType } : {}),
     addedBy: String(d.addedBy ?? ''),
+    createdAt: tsToIso(d.createdAt),
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapShoppingCatalogItem(id: string, d: DocumentData): ShoppingCatalogItem {
+  const catalogId = typeof d.catalogId === 'string' && d.catalogId.trim() ? d.catalogId.trim() : undefined;
+  const brand = typeof d.brand === 'string' && d.brand.trim() ? d.brand.trim() : undefined;
+  const format = typeof d.format === 'string' && d.format.trim() ? d.format.trim() : undefined;
+  const section = normalizeShoppingSection(typeof d.section === 'string' ? d.section : undefined);
+  const sourceType = normalizeShoppingSourceType(
+    typeof d.sourceType === 'string' ? d.sourceType : undefined
+  );
+  return {
+    id,
+    text: String(d.text ?? ''),
+    defaultUnit: normalizeShoppingUnit(typeof d.defaultUnit === 'string' ? d.defaultUnit : ''),
+    usageCount: Math.max(1, Math.round(Number(d.usageCount ?? 1) || 1)),
+    lastUsedAt: String(d.lastUsedAt ?? tsToIso(d.updatedAt)),
+    ...(typeof d.favorite === 'boolean' ? { favorite: d.favorite } : {}),
+    ...(catalogId ? { catalogId } : {}),
+    ...(brand ? { brand } : {}),
+    ...(format ? { format } : {}),
+    ...(section ? { section } : {}),
+    ...(sourceType ? { sourceType } : {}),
+    createdBy: String(d.createdBy ?? ''),
+    createdAt: tsToIso(d.createdAt),
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapCustomCategory(id: string, d: DocumentData): CustomCategory {
+  return {
+    id,
+    name: String(d.name ?? ''),
+    color: isValidHexColor(d.color) ? String(d.color).toUpperCase() : '#0F766E',
+    icon: isValidCategoryIcon(d.icon) ? d.icon : 'tag',
+    order: Number.isFinite(Number(d.order)) ? Number(d.order) : 0,
+    archived: Boolean(d.archived),
+    csvKeywords: String(d.csvKeywords ?? ''),
+    createdAt: tsToIso(d.createdAt),
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapCategoryBudget(id: string, d: DocumentData): CategoryBudgetLimit {
+  return {
+    id,
+    monthKey: String(d.monthKey ?? ''),
+    categoryId: String(d.categoryId ?? ''),
+    limit: Math.max(0, Number(d.limit ?? 0) || 0),
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapPendingShoppingCheckout(id: string, d: DocumentData): PendingShoppingCheckout {
+  return {
+    id,
+    expenseId: String(d.expenseId ?? buildCheckoutExpenseId(id)),
+    monthKey: String(d.monthKey ?? ''),
+    amount: Math.max(0, Number(d.amount ?? 0) || 0),
+    concept: String(d.concept ?? 'Compra supermercado'),
+    pendingItemIds: Array.isArray(d.pendingItemIds)
+      ? d.pendingItemIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
+      : [],
+    totalItemCount: Math.max(1, Math.round(Number(d.totalItemCount ?? 1) || 1)),
+    isPrivate: Boolean(d.isPrivate),
+    createdBy: String(d.createdBy ?? ''),
     createdAt: tsToIso(d.createdAt),
     updatedAt: tsToIso(d.updatedAt),
   };
@@ -816,6 +933,77 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribePendingShoppingCheckouts(
+    householdId: string,
+    viewerUid: string,
+    onData: (items: PendingShoppingCheckout[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/shoppingCheckouts`;
+    const colRef = collection(db, 'households', householdId, 'shoppingCheckouts');
+    const sharedMap = new Map<string, PendingShoppingCheckout>();
+    const ownMap = new Map<string, PendingShoppingCheckout>();
+    let readyShared = false;
+    let readyOwn = !viewerUid;
+
+    const emit = () => {
+      if (!readyShared || !readyOwn) return;
+      const merged = new Map<string, PendingShoppingCheckout>();
+      for (const [k, v] of sharedMap) merged.set(k, v);
+      for (const [k, v] of ownMap) merged.set(k, v);
+      onData(
+        Array.from(merged.values())
+          .filter((item) => (!item.isPrivate || item.createdBy === viewerUid) && item.pendingItemIds.length > 0)
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      );
+    };
+
+    const unsubShared = onSnapshot(
+      query(colRef, where('isPrivate', '==', false)),
+      (snap) => {
+        sharedMap.clear();
+        for (const d of snap.docs) {
+          sharedMap.set(d.id, mapPendingShoppingCheckout(d.id, d.data()));
+        }
+        readyShared = true;
+        emit();
+      },
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+
+    const unsubOwn = viewerUid
+      ? onSnapshot(
+          query(colRef, where('createdBy', '==', viewerUid)),
+          (snap) => {
+            ownMap.clear();
+            for (const d of snap.docs) {
+              ownMap.set(d.id, mapPendingShoppingCheckout(d.id, d.data()));
+            }
+            readyOwn = true;
+            emit();
+          },
+          (err) => {
+            try {
+              handleFirestoreError(err, OperationType.LIST, path);
+            } catch (wrapped) {
+              onError(wrapped as Error);
+            }
+          }
+        )
+      : () => {};
+
+    return () => {
+      unsubShared();
+      unsubOwn();
+    };
+  }
+
   subscribeMembers(
     householdId: string,
     onData: (m: HouseholdMember[]) => void,
@@ -897,6 +1085,18 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         }
       }
     );
+  }
+
+  async fetchAllInitialCosts(householdId: string): Promise<InitialCost[]> {
+    const path = `households/${householdId}/initialCosts`;
+    try {
+      const snap = await getDocs(collection(db, 'households', householdId, 'initialCosts'));
+      return snap.docs
+        .map((d) => mapInitialCost(d.id, d.data()))
+        .sort((a, b) => (b.dueDate || b.createdAt || '').localeCompare(a.dueDate || a.createdAt || ''));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
   }
 
   subscribeChecklist(
@@ -1215,6 +1415,122 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeShoppingCatalog(
+    householdId: string,
+    onData: (items: ShoppingCatalogItem[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/shoppingCatalog`;
+    return onSnapshot(
+      collection(db, 'households', householdId, 'shoppingCatalog'),
+      (snap) =>
+        onData(
+          snap.docs
+            .map((d) => mapShoppingCatalogItem(d.id, d.data()))
+            .sort(
+              (a, b) =>
+                Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) ||
+                b.usageCount - a.usageCount ||
+                b.lastUsedAt.localeCompare(a.lastUsedAt)
+            )
+        ),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
+  subscribeCustomCategories(
+    householdId: string,
+    onData: (items: CustomCategory[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/categories`;
+    return onSnapshot(
+      collection(db, 'households', householdId, 'categories'),
+      (snap) =>
+        onData(
+          snap.docs
+            .map((d) => mapCustomCategory(d.id, d.data()))
+            .sort((a, b) => (a.order ?? 999) - (b.order ?? 999) || a.name.localeCompare(b.name, 'es'))
+        ),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
+  subscribeCategoryBudgets(
+    householdId: string,
+    monthKey: string,
+    onData: (items: CategoryBudgetLimit[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/categoryBudgets`;
+    return onSnapshot(
+      query(collection(db, 'households', householdId, 'categoryBudgets'), where('monthKey', '==', monthKey)),
+      (snap) => onData(snap.docs.map((d) => mapCategoryBudget(d.id, d.data()))),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
+  async fetchAllCategoryBudgets(householdId: string): Promise<CategoryBudgetLimit[]> {
+    const path = `households/${householdId}/categoryBudgets`;
+    try {
+      const snap = await getDocs(collection(db, 'households', householdId, 'categoryBudgets'));
+      return snap.docs.map((d) => mapCategoryBudget(d.id, d.data()));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  }
+
+  async fetchMonthBudgets(
+    householdId: string,
+    monthKey: string
+  ): Promise<{ systemBudget: MonthlyBudget | null; categoryBudgets: CategoryBudgetLimit[] }> {
+    const budgetPath = `households/${householdId}/budgets/${monthKey}`;
+    const customPath = `households/${householdId}/categoryBudgets`;
+    try {
+      const [budgetSnap, customSnap] = await Promise.all([
+        getDoc(doc(db, 'households', householdId, 'budgets', monthKey)),
+        getDocs(
+          query(
+            collection(db, 'households', householdId, 'categoryBudgets'),
+            where('monthKey', '==', monthKey)
+          )
+        ),
+      ]);
+
+      let systemBudget: MonthlyBudget | null = null;
+      if (budgetSnap.exists()) {
+        const d = budgetSnap.data();
+        systemBudget = {
+          monthKey: String(d.monthKey ?? monthKey),
+          limits: (d.limits ?? {}) as MonthlyBudget['limits'],
+          updatedAt: tsToIso(d.updatedAt),
+        };
+      }
+      const categoryBudgets = customSnap.docs.map((d) => mapCategoryBudget(d.id, d.data()));
+      return { systemBudget, categoryBudgets };
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, `${budgetPath} | ${customPath}`);
+    }
+  }
+
   // ─── Mutations ─────────────────────────────────────────────────────────────
 
   async updateSettings(
@@ -1301,6 +1617,144 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, path);
     }
+  }
+
+  async upsertCustomCategory(
+    householdId: string,
+    cat: Omit<CustomCategory, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const colRef = collection(db, 'households', householdId, 'categories');
+    let id = cat.id || '';
+    if (!id) {
+      try {
+        const snap = await getDocs(colRef);
+        id = generateCustomCategoryId(
+          cat.name,
+          snap.docs.map((d) => d.id)
+        );
+      } catch (error) {
+        handleFirestoreError(error, OperationType.LIST, `households/${householdId}/categories`);
+      }
+    }
+    if (!isCustomCategoryId(id)) {
+      throw new Error('Identificador de categoría personalizada no válido.');
+    }
+
+    const path = `households/${householdId}/categories/${id}`;
+    const cleanName = clampStr(cat.name, MAX_LENGTHS.categoryName);
+    const cleanColor = isValidHexColor(cat.color) ? cat.color.toUpperCase() : '#0F766E';
+    const cleanIcon = isValidCategoryIcon(cat.icon) ? cat.icon : 'tag';
+    const cleanOrder = Math.max(0, Math.min(999, Math.round(Number(cat.order) || 0)));
+    const cleanKeywords = clampStr(cat.csvKeywords || '', MAX_LENGTHS.csvKeywordString);
+
+    const payload = {
+      name: cleanName,
+      color: cleanColor,
+      icon: cleanIcon,
+      order: cleanOrder,
+      archived: Boolean(cat.archived),
+      csvKeywords: cleanKeywords,
+      updatedAt: serverTimestamp(),
+    };
+
+    try {
+      const batch = writeBatch(db);
+      const ref = doc(db, 'households', householdId, 'categories', id);
+      if (cat.id) {
+        batch.update(ref, payload);
+        this.addActivityToBatch(batch, householdId, actor, 'update', 'categoria', id, `Editó categoría "${cleanName}"`);
+      } else {
+        batch.set(ref, { ...payload, createdAt: serverTimestamp() });
+        this.addActivityToBatch(batch, householdId, actor, 'create', 'categoria', id, `Creó categoría "${cleanName}"`);
+      }
+      await batch.commit();
+      return id;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async reorderCustomCategories(
+    householdId: string,
+    ordered: Array<{ id: string; order: number }>
+  ): Promise<void> {
+    if (ordered.length === 0) return;
+    const ops = ordered.map(({ id, order }) => ({
+      path: `households/${householdId}/categories/${id}`,
+      apply: (batch: ReturnType<typeof writeBatch>) =>
+        batch.update(doc(db, 'households', householdId, 'categories', id), {
+          order: Math.max(0, Math.min(999, Math.round(order))),
+          updatedAt: serverTimestamp(),
+        }),
+    }));
+    await this.commitBatchOps(
+      ops,
+      OperationType.UPDATE,
+      `households/${householdId}/categories`,
+      'No se pudo guardar el orden de categorías.'
+    );
+  }
+
+  async deleteUnusedCustomCategory(
+    householdId: string,
+    id: string,
+    name: string,
+    actor: UserProfileInput
+  ): Promise<void> {
+    try {
+      const [hSnap, cbSnap, visibleTxMap, recSnap, icSnap] = await Promise.all([
+        getDoc(doc(db, 'households', householdId)),
+        getDocs(query(collection(db, 'households', householdId, 'categoryBudgets'), where('categoryId', '==', id))),
+        this.fetchVisibleTransactionsMap(householdId, actor.uid),
+        getDocs(query(collection(db, 'households', householdId, 'recurring'), where('category', '==', id), limit(1))),
+        getDocs(query(collection(db, 'households', householdId, 'initialCosts'), where('category', '==', id), limit(1))),
+      ]);
+      const memberCount =
+        hSnap.exists() && Array.isArray(hSnap.data().memberUids) ? hSnap.data().memberUids.length : 1;
+      const hasVisibleTxWithCategory = Array.from(visibleTxMap.values()).some(
+        (d) => d.category === id
+      );
+
+      const check = canSafelyDeleteCustomCategory(id, {
+        memberCount,
+        transactions: hasVisibleTxWithCategory ? [{ category: id }] : [],
+        recurring: !recSnap.empty ? [{ category: id }] : [],
+        initialCosts: !icSnap.empty ? [{ category: id }] : [],
+        categoryBudgets: cbSnap.docs.map((d) => mapCategoryBudget(d.id, d.data())),
+      });
+      if (!check.canDelete) {
+        throw new Error(
+          check.reason === 'multi_member_privacy'
+            ? 'En un hogar compartido no se eliminan categorías personalizadas de forma definitiva porque podría haber gastos privados de tu pareja. Archívala para ocultarla sin perder historial.'
+            : 'Esta categoría tiene gastos, plantillas o presupuestos asociados. Archívala en lugar de borrarla.'
+        );
+      }
+    } catch (error) {
+      if (error instanceof Error && (error.message.includes('Archívala') || error.message.includes('hogar compartido'))) {
+        throw error;
+      }
+      handleFirestoreError(error, OperationType.LIST, `households/${householdId}/categories/${id}`);
+    }
+
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [
+      {
+        path: `households/${householdId}/categories/${id}`,
+        apply: (batch) => batch.delete(doc(db, 'households', householdId, 'categories', id)),
+      },
+      {
+        path: `households/${householdId}/activity`,
+        apply: (batch) =>
+          this.addActivityToBatch(batch, householdId, actor, 'delete', 'categoria', id, `Eliminó categoría "${name}"`),
+      },
+    ];
+
+    await this.commitBatchOps(
+      ops,
+      OperationType.DELETE,
+      `households/${householdId}/categories/${id}`,
+      'No se pudo eliminar la categoría.'
+    );
   }
 
   async upsertInitialCost(
@@ -2063,11 +2517,17 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     actor: UserProfileInput
   ): Promise<void> {
     const path = `households/${householdId}/budgets/${monthKey}`;
+    const sysLimits: MonthlyBudget['limits'] = {};
+    for (const [k, v] of Object.entries(limits ?? {})) {
+      if (isSystemExpenseCategory(k) && typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+        sysLimits[k] = roundCents(v);
+      }
+    }
     try {
       const batch = writeBatch(db);
       batch.set(doc(db, 'households', householdId, 'budgets', monthKey), {
         monthKey,
-        limits,
+        limits: sysLimits,
         updatedAt: serverTimestamp(),
       });
       this.addActivityToBatch(batch, householdId, actor, 'update', 'presupuesto', monthKey, `Actualizó presupuestos de ${monthKey}`);
@@ -2075,6 +2535,89 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
     }
+  }
+
+  async saveAllBudgets(
+    householdId: string,
+    monthKey: string,
+    limits: Record<string, number>,
+    customCategoryIds: string[],
+    actor: UserProfileInput
+  ): Promise<void> {
+    const sysLimits: MonthlyBudget['limits'] = {};
+    for (const [k, v] of Object.entries(limits)) {
+      if (isSystemExpenseCategory(k) && Number.isFinite(v) && v >= 0) {
+        sysLimits[k] = roundCents(v);
+      }
+    }
+
+    let existingCustomIds = new Set<string>();
+    try {
+      const cbSnap = await getDocs(
+        query(collection(db, 'households', householdId, 'categoryBudgets'), where('monthKey', '==', monthKey))
+      );
+      existingCustomIds = new Set(cbSnap.docs.map((d) => d.id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, `households/${householdId}/categoryBudgets`);
+    }
+
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+    ops.push({
+      path: `households/${householdId}/budgets/${monthKey}`,
+      apply: (batch) =>
+        batch.set(doc(db, 'households', householdId, 'budgets', monthKey), {
+          monthKey,
+          limits: sysLimits,
+          updatedAt: serverTimestamp(),
+        }),
+    });
+
+    for (const catId of customCategoryIds) {
+      if (!isCustomCategoryId(catId)) continue;
+      const docId = buildCategoryBudgetDocId(monthKey, catId);
+      const hasExplicit = Object.prototype.hasOwnProperty.call(limits, catId);
+      const rawVal = hasExplicit ? limits[catId] : undefined;
+      const val = typeof rawVal === 'number' ? rawVal : NaN;
+      const ref = doc(db, 'households', householdId, 'categoryBudgets', docId);
+      if (hasExplicit && Number.isFinite(val) && val >= 0) {
+        ops.push({
+          path: `households/${householdId}/categoryBudgets/${docId}`,
+          apply: (batch) =>
+            batch.set(ref, {
+              monthKey,
+              categoryId: catId,
+              limit: roundCents(val),
+              updatedAt: serverTimestamp(),
+            }),
+        });
+      } else if (existingCustomIds.has(docId)) {
+        ops.push({
+          path: `households/${householdId}/categoryBudgets/${docId}`,
+          apply: (batch) => batch.delete(ref),
+        });
+      }
+    }
+
+    ops.push({
+      path: `households/${householdId}/activity`,
+      apply: (batch) =>
+        this.addActivityToBatch(
+          batch,
+          householdId,
+          actor,
+          'update',
+          'presupuesto',
+          monthKey,
+          `Actualizó presupuestos de ${monthKey}`
+        ),
+    });
+
+    await this.commitBatchOps(
+      ops,
+      OperationType.WRITE,
+      `households/${householdId}/budgets/${monthKey}`,
+      'No se pudieron guardar los presupuestos del mes.'
+    );
   }
 
   async closeMonth(
@@ -2285,27 +2828,55 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
   async upsertShoppingItem(
     householdId: string,
-    item: { id?: string; text: string; qty: number; done: boolean },
+    item: {
+      id?: string;
+      text: string;
+      qty: number;
+      unit?: string;
+      done: boolean;
+      catalogId?: string;
+      brand?: string;
+      format?: string;
+      section?: ShoppingSection;
+      sourceType?: ShoppingSourceType;
+    },
     actor: UserProfileInput
   ): Promise<string> {
     const id = item.id || doc(collection(db, 'households', householdId, 'shopping')).id;
     const path = `households/${householdId}/shopping/${id}`;
     const cleanText = clampStr(item.text, MAX_LENGTHS.shoppingText);
-    const cleanQty = Math.max(1, Math.min(999, Math.round(Number(item.qty) || 1)));
+    const cleanQty = roundCents(Math.max(0.01, Math.min(999, Number(item.qty) || 1)));
+    const cleanUnit = normalizeShoppingUnit(item.unit);
+    const cleanCatalogId = clampStr(item.catalogId || '', MAX_LENGTHS.shoppingCatalogId);
+    const cleanBrand = clampStr(item.brand || '', MAX_LENGTHS.shoppingBrand);
+    const cleanFormat = clampStr(item.format || '', MAX_LENGTHS.shoppingFormat);
+    const cleanSection = normalizeShoppingSection(item.section);
+    const cleanSourceType = normalizeShoppingSourceType(item.sourceType);
+    const optionalMeta: Record<string, unknown> = {
+      ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+      ...(cleanBrand ? { brand: cleanBrand } : {}),
+      ...(cleanFormat ? { format: cleanFormat } : {}),
+      ...(cleanSection ? { section: cleanSection } : {}),
+      ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+    };
     try {
       const ref = doc(db, 'households', householdId, 'shopping', id);
       if (item.id) {
         await updateDoc(ref, {
           text: cleanText,
           qty: cleanQty,
+          unit: cleanUnit,
           done: Boolean(item.done),
+          ...optionalMeta,
           updatedAt: serverTimestamp(),
         });
       } else {
         await setDoc(ref, {
           text: cleanText,
           qty: cleanQty,
+          unit: cleanUnit,
           done: Boolean(item.done),
+          ...optionalMeta,
           addedBy: actor.uid,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -2341,6 +2912,364 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  async commitShoppingCheckoutPhase1(
+    householdId: string,
+    input: ShoppingCheckoutPhase1Input,
+    actor: UserProfileInput
+  ): Promise<ShoppingCheckoutPhase1Result> {
+    if (!isValidShoppingCheckoutId(input.checkoutId)) {
+      throw new Error('Identificador de cierre de compra inválido.');
+    }
+    const cleanAmount = roundCents(Number(input.amount));
+    if (!Number.isFinite(cleanAmount) || cleanAmount <= 0) {
+      throw new Error('Introduce un importe válido mayor que 0 €.');
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.date) || !isValidMonthKey(input.monthKey)) {
+      throw new Error('Fecha de compra inválida.');
+    }
+
+    const ordered = sortSnapshotsDeterministically(input.snapshots);
+    if (ordered.length === 0) {
+      return { status: 'all_modified_or_gone', skippedConcurrentIds: [], alreadyGoneIds: [] };
+    }
+    if (ordered.length > MAX_CHECKOUT_PENDING_ITEMS) {
+      throw new Error(`El carro supera el máximo de ${MAX_CHECKOUT_PENDING_ITEMS} artículos por cierre.`);
+    }
+
+    const expenseId = buildCheckoutExpenseId(input.checkoutId);
+    const batch1 = ordered.slice(0, MAX_CHECKOUT_BATCH_ITEMS);
+    const remainingIds = ordered.slice(MAX_CHECKOUT_BATCH_ITEMS).map((s) => s.id);
+    const isPrivate = Boolean(input.isPrivate);
+    const cleanConcept = clampStr(input.concept || 'Compra supermercado', MAX_LENGTHS.concept) || 'Compra supermercado';
+    const cleanNotes = clampStr(input.notes || '', MAX_LENGTHS.notes);
+    const safePaidBy = isPrivate ? actor.uid : normalizePayerValue(input.paidBy);
+    const safeSplitPctA = clampSplitPct(input.splitPctA, 50);
+
+    const monthClosureRef = doc(db, 'households', householdId, 'monthClosures', input.monthKey);
+    const txRef = doc(db, 'households', householdId, 'transactions', expenseId);
+    const checkoutRef = doc(db, 'households', householdId, 'shoppingCheckouts', input.checkoutId);
+    const path = `households/${householdId}/transactions/${expenseId}`;
+
+    try {
+      return await runTransaction(db, async (trx) => {
+        const [closureSnap, txSnap, checkoutSnap, ...batch1Snaps] = await Promise.all([
+          trx.get(monthClosureRef),
+          trx.get(txRef),
+          trx.get(checkoutRef),
+          ...batch1.map((snap) => trx.get(doc(db, 'households', householdId, 'shopping', snap.id))),
+        ]);
+
+        // Idempotencia duradera: si el gasto ya existe para este checkoutId, NO duplicar.
+        if (txSnap.exists()) {
+          const pendingItemIds = checkoutSnap.exists()
+            ? mapPendingShoppingCheckout(checkoutSnap.id, checkoutSnap.data()).pendingItemIds
+            : [];
+          return {
+            status: 'already_committed',
+            expenseId,
+            pendingItemIds,
+          };
+        }
+
+        if (closureSnap.exists()) {
+          throw new Error(
+            'El mes de la fecha elegida está cerrado. Desbloquéalo en Avanzado o elige una fecha en un mes abierto.'
+          );
+        }
+
+        const alreadyGoneIds: string[] = [];
+        const deletedIds: string[] = [];
+        const skippedConcurrentIds: string[] = [];
+
+        for (let i = 0; i < batch1.length; i++) {
+          const expected = batch1[i];
+          const liveSnap = batch1Snaps[i];
+          if (!liveSnap.exists()) {
+            alreadyGoneIds.push(expected.id);
+            continue;
+          }
+          const liveItem = mapShoppingItem(liveSnap.id, liveSnap.data());
+          if (isShoppingItemUnchangedForCheckout(expected, liveItem)) {
+            deletedIds.push(expected.id);
+          } else {
+            skippedConcurrentIds.push(expected.id);
+          }
+        }
+
+        // Protección frente a cierre simultáneo de dos dispositivos sobre los mismos productos.
+        if (alreadyGoneIds.length > 0) {
+          return {
+            status: 'overlap_conflict',
+            alreadyGoneIds,
+          };
+        }
+
+        if (deletedIds.length === 0 && remainingIds.length === 0) {
+          return {
+            status: 'all_modified_or_gone',
+            skippedConcurrentIds,
+            alreadyGoneIds: [],
+          };
+        }
+
+        // Escritura atómica (≤ 13 escrituras en total: tx + activity? + ≤10 deletes + checkout?).
+        trx.set(txRef, {
+          monthKey: input.monthKey,
+          concept: cleanConcept,
+          category: 'supermercado',
+          amount: cleanAmount,
+          date: input.date,
+          paidBy: safePaidBy,
+          recurringId: null,
+          splitPctA: safeSplitPctA,
+          isSettlement: false,
+          settlementTo: '',
+          isPrivate,
+          createdBy: actor.uid,
+          notes: cleanNotes,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        if (!isPrivate) {
+          const actRef = doc(collection(db, 'households', householdId, 'activity'));
+          trx.set(actRef, {
+            uid: actor.uid,
+            actorName: clampStr(actor.displayName || 'Usuario', MAX_LENGTHS.displayName) || 'Usuario',
+            action: 'create',
+            entity: 'gasto',
+            entityId: clampStr(expenseId, 128),
+            summary: clampStr(`Añadió gasto "${cleanConcept}" (${cleanAmount} €)`, MAX_LENGTHS.activitySummary),
+            timestamp: serverTimestamp(),
+          });
+        }
+
+        for (const itemId of deletedIds) {
+          trx.delete(doc(db, 'households', householdId, 'shopping', itemId));
+        }
+
+        if (remainingIds.length > 0) {
+          trx.set(checkoutRef, {
+            expenseId,
+            monthKey: input.monthKey,
+            amount: isPrivate ? 0 : cleanAmount,
+            concept: isPrivate ? 'Compra privada' : cleanConcept,
+            pendingItemIds: remainingIds,
+            totalItemCount: ordered.length,
+            isPrivate,
+            createdBy: actor.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        return {
+          status: 'committed',
+          expenseId,
+          deletedIds,
+          skippedConcurrentIds,
+          pendingItemIds: remainingIds,
+        };
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('mes de la fecha elegida está cerrado')) {
+        throw error;
+      }
+      handleFirestoreError(
+        error,
+        OperationType.WRITE,
+        path,
+        'No se pudo confirmar la compra en el servidor. Comprueba tu conexión e inténtalo de nuevo.'
+      );
+    }
+  }
+
+  async cleanupShoppingCheckoutBatch(
+    householdId: string,
+    checkoutId: string,
+    snapshotsById?: Record<string, ShoppingCheckoutItemSnapshot>
+  ): Promise<ShoppingCheckoutBatchCleanupResult> {
+    if (!isValidShoppingCheckoutId(checkoutId)) {
+      throw new Error('Identificador de limpieza inválido.');
+    }
+    const checkoutRef = doc(db, 'households', householdId, 'shoppingCheckouts', checkoutId);
+    const path = `households/${householdId}/shoppingCheckouts/${checkoutId}`;
+
+    try {
+      return await runTransaction(db, async (trx) => {
+        const checkoutSnap = await trx.get(checkoutRef);
+        if (!checkoutSnap.exists()) {
+          return {
+            checkoutId,
+            deletedIds: [],
+            skippedConcurrentIds: [],
+            alreadyGoneIds: [],
+            remainingItemIds: [],
+            completed: true,
+          };
+        }
+
+        const checkout = mapPendingShoppingCheckout(checkoutSnap.id, checkoutSnap.data());
+        const batchIds = checkout.pendingItemIds.slice(0, MAX_CHECKOUT_BATCH_ITEMS);
+        const remainingItemIds = checkout.pendingItemIds.slice(batchIds.length);
+
+        const itemSnaps = await Promise.all(
+          batchIds.map((id) => trx.get(doc(db, 'households', householdId, 'shopping', id)))
+        );
+
+        const deletedIds: string[] = [];
+        const skippedConcurrentIds: string[] = [];
+        const alreadyGoneIds: string[] = [];
+
+        for (let i = 0; i < batchIds.length; i++) {
+          const itemId = batchIds[i];
+          const liveSnap = itemSnaps[i];
+          if (!liveSnap.exists()) {
+            alreadyGoneIds.push(itemId);
+            continue;
+          }
+          const liveItem = mapShoppingItem(liveSnap.id, liveSnap.data());
+          const localSnap = snapshotsById?.[itemId];
+          const safeToDelete = localSnap
+            ? isShoppingItemUnchangedForCheckout(localSnap, liveItem)
+            : isShoppingItemSafeForCrossDeviceCleanup(liveItem, checkout.createdAt);
+
+          if (safeToDelete) {
+            deletedIds.push(itemId);
+          } else {
+            skippedConcurrentIds.push(itemId);
+          }
+        }
+
+        for (const itemId of deletedIds) {
+          trx.delete(doc(db, 'households', householdId, 'shopping', itemId));
+        }
+
+        if (remainingItemIds.length === 0) {
+          trx.delete(checkoutRef);
+        } else {
+          trx.update(checkoutRef, {
+            pendingItemIds: remainingItemIds,
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        return {
+          checkoutId,
+          deletedIds,
+          skippedConcurrentIds,
+          alreadyGoneIds,
+          remainingItemIds,
+          completed: remainingItemIds.length === 0,
+        };
+      });
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.WRITE,
+        path,
+        'El gasto ya está guardado, pero no se pudo completar este lote de limpieza.'
+      );
+    }
+  }
+
+  async dismissPendingShoppingCheckout(householdId: string, checkoutId: string): Promise<void> {
+    if (!isValidShoppingCheckoutId(checkoutId)) return;
+    const path = `households/${householdId}/shoppingCheckouts/${checkoutId}`;
+    try {
+      await deleteDoc(doc(db, 'households', householdId, 'shoppingCheckouts', checkoutId));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
+  async upsertShoppingCatalogItem(
+    householdId: string,
+    input: {
+      text: string;
+      defaultUnit?: string;
+      favorite?: boolean;
+      catalogId?: string;
+      brand?: string;
+      format?: string;
+      section?: ShoppingSection;
+      sourceType?: ShoppingSourceType;
+    },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const cleanText = clampStr(input.text, MAX_LENGTHS.shoppingText);
+    if (!cleanText) return '';
+    const cleanCatalogId = clampStr(input.catalogId || '', MAX_LENGTHS.shoppingCatalogId);
+    const cleanBrand = clampStr(input.brand || '', MAX_LENGTHS.shoppingBrand);
+    const cleanFormat = clampStr(input.format || '', MAX_LENGTHS.shoppingFormat);
+    const cleanSection = normalizeShoppingSection(input.section);
+    const cleanSourceType = normalizeShoppingSourceType(input.sourceType);
+    const id = buildShoppingCatalogId(cleanText, {
+      catalogId: cleanCatalogId,
+      brand: cleanBrand,
+      format: cleanFormat,
+    });
+    const cleanUnit = normalizeShoppingUnit(input.defaultUnit);
+    const nowIso = new Date().toISOString().slice(0, 32);
+    const ref = doc(db, 'households', householdId, 'shoppingCatalog', id);
+    const path = `households/${householdId}/shoppingCatalog/${id}`;
+    const optionalMeta: Record<string, unknown> = {
+      ...(typeof input.favorite === 'boolean' ? { favorite: input.favorite } : {}),
+      ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+      ...(cleanBrand ? { brand: cleanBrand } : {}),
+      ...(cleanFormat ? { format: cleanFormat } : {}),
+      ...(cleanSection ? { section: cleanSection } : {}),
+      ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+    };
+    try {
+      await runTransaction(db, async (trx) => {
+        const snap = await trx.get(ref);
+        if (snap.exists()) {
+          const prev = snap.data();
+          const prevCount = Number(prev.usageCount ?? 0);
+          trx.update(ref, {
+            text: cleanText,
+            defaultUnit: cleanUnit || normalizeShoppingUnit(typeof prev.defaultUnit === 'string' ? prev.defaultUnit : ''),
+            usageCount: Math.min(100000, Math.max(1, Math.round(prevCount) + 1)),
+            lastUsedAt: nowIso,
+            ...optionalMeta,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          trx.set(ref, {
+            text: cleanText,
+            defaultUnit: cleanUnit,
+            usageCount: 1,
+            lastUsedAt: nowIso,
+            ...optionalMeta,
+            createdBy: actor.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+      return id;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async toggleShoppingCatalogFavorite(
+    householdId: string,
+    id: string,
+    favorite: boolean
+  ): Promise<void> {
+    const path = `households/${householdId}/shoppingCatalog/${id}`;
+    try {
+      await updateDoc(doc(db, 'households', householdId, 'shoppingCatalog', id), {
+        favorite: Boolean(favorite),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
   private async fetchVisibleTransactionsMap(
     householdId: string,
     viewerUid: string
@@ -2358,22 +3287,52 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
   async exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1> {
     try {
-      const [hSnap, icSnap, clSnap, itSnap, recSnap, txMap, budSnap, mcSnap, gSnap, gmSnap, shopSnap] =
-        await Promise.all([
-          getDoc(doc(db, 'households', householdId)),
-          getDocs(collection(db, 'households', householdId, 'initialCosts')),
-          getDocs(collection(db, 'households', householdId, 'checklist')),
-          getDocs(collection(db, 'households', householdId, 'items')),
-          getDocs(collection(db, 'households', householdId, 'recurring')),
-          this.fetchVisibleTransactionsMap(householdId, viewerUid),
-          getDocs(collection(db, 'households', householdId, 'budgets')),
-          getDocs(collection(db, 'households', householdId, 'monthClosures')),
-          getDocs(collection(db, 'households', householdId, 'goals')),
-          getDocs(collection(db, 'households', householdId, 'goalMovements')),
-          getDocs(collection(db, 'households', householdId, 'shopping')),
-        ]);
+      const [
+        hSnap,
+        catSnap,
+        cbSnap,
+        icSnap,
+        clSnap,
+        itSnap,
+        recSnap,
+        txMap,
+        budSnap,
+        mcSnap,
+        gSnap,
+        gmSnap,
+        shopSnap,
+        catalogSnap,
+      ] = await Promise.all([
+        getDoc(doc(db, 'households', householdId)),
+        getDocs(collection(db, 'households', householdId, 'categories')),
+        getDocs(collection(db, 'households', householdId, 'categoryBudgets')),
+        getDocs(collection(db, 'households', householdId, 'initialCosts')),
+        getDocs(collection(db, 'households', householdId, 'checklist')),
+        getDocs(collection(db, 'households', householdId, 'items')),
+        getDocs(collection(db, 'households', householdId, 'recurring')),
+        this.fetchVisibleTransactionsMap(householdId, viewerUid),
+        getDocs(collection(db, 'households', householdId, 'budgets')),
+        getDocs(collection(db, 'households', householdId, 'monthClosures')),
+        getDocs(collection(db, 'households', householdId, 'goals')),
+        getDocs(collection(db, 'households', householdId, 'goalMovements')),
+        getDocs(collection(db, 'households', householdId, 'shopping')),
+        getDocs(collection(db, 'households', householdId, 'shoppingCatalog')),
+      ]);
 
       const hData = hSnap.exists() ? mapHousehold(hSnap.id, hSnap.data()) : null;
+      const customCategories = catSnap.docs.map((d) => {
+        const { createdAt: _c, updatedAt: _u, ...rest } = mapCustomCategory(d.id, d.data());
+        return rest;
+      });
+      const categoryBudgets = cbSnap.docs.map((d) => {
+        const { updatedAt: _u, ...rest } = mapCategoryBudget(d.id, d.data());
+        return rest;
+      });
+      const shoppingCatalog = catalogSnap.docs.map((d) => {
+        const { createdAt: _c, updatedAt: _u, ...rest } = mapShoppingCatalogItem(d.id, d.data());
+        return rest;
+      });
+
       return {
         schemaVersion: 1,
         app: 'nido',
@@ -2389,6 +3348,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         },
         ...(hData?.csvKeywords ? { csvKeywords: hData.csvKeywords } : {}),
         ...(hData?.categoryColors ? { categoryColors: hData.categoryColors } : {}),
+        ...(customCategories.length > 0 ? { customCategories } : {}),
+        ...(categoryBudgets.length > 0 ? { categoryBudgets } : {}),
         initialCosts: icSnap.docs.map((d) => {
           const { createdAt: _c, updatedAt: _u, ...rest } = mapInitialCost(d.id, d.data());
           return rest;
@@ -2439,6 +3400,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           const { createdAt: _c, updatedAt: _u, ...rest } = mapShoppingItem(d.id, d.data());
           return rest;
         }),
+        ...(shoppingCatalog.length > 0 ? { shoppingCatalog } : {}),
       };
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
@@ -2450,23 +3412,28 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     backup: NidoBackupV1,
     actor: UserProfileInput
   ): Promise<void> {
+    const categoryOps: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
     const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
 
-    let hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx;
+    let hSnap, catEx, cbEx, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx, catalogEx;
     try {
-      [hSnap, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx] = await Promise.all([
-        getDoc(doc(db, 'households', householdId)),
-        getDocs(collection(db, 'households', householdId, 'initialCosts')),
-        getDocs(collection(db, 'households', householdId, 'checklist')),
-        getDocs(collection(db, 'households', householdId, 'items')),
-        getDocs(collection(db, 'households', householdId, 'recurring')),
-        this.fetchVisibleTransactionsMap(householdId, actor.uid),
-        getDocs(collection(db, 'households', householdId, 'budgets')),
-        getDocs(collection(db, 'households', householdId, 'monthClosures')),
-        getDocs(collection(db, 'households', householdId, 'goals')),
-        getDocs(collection(db, 'households', householdId, 'goalMovements')),
-        getDocs(collection(db, 'households', householdId, 'shopping')),
-      ]);
+      [hSnap, catEx, cbEx, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx, catalogEx] =
+        await Promise.all([
+          getDoc(doc(db, 'households', householdId)),
+          getDocs(collection(db, 'households', householdId, 'categories')),
+          getDocs(collection(db, 'households', householdId, 'categoryBudgets')),
+          getDocs(collection(db, 'households', householdId, 'initialCosts')),
+          getDocs(collection(db, 'households', householdId, 'checklist')),
+          getDocs(collection(db, 'households', householdId, 'items')),
+          getDocs(collection(db, 'households', householdId, 'recurring')),
+          this.fetchVisibleTransactionsMap(householdId, actor.uid),
+          getDocs(collection(db, 'households', householdId, 'budgets')),
+          getDocs(collection(db, 'households', householdId, 'monthClosures')),
+          getDocs(collection(db, 'households', householdId, 'goals')),
+          getDocs(collection(db, 'households', householdId, 'goalMovements')),
+          getDocs(collection(db, 'households', householdId, 'shopping')),
+          getDocs(collection(db, 'households', householdId, 'shoppingCatalog')),
+        ]);
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
     }
@@ -2488,6 +3455,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     const existsSet = (snap: Awaited<ReturnType<typeof getDocs>>) =>
       new Set(snap.docs.map((d) => d.id));
+    const catSet = existsSet(catEx);
+    const cbSet = existsSet(cbEx);
     const icSet = existsSet(icEx);
     const clSet = existsSet(clEx);
     const itSet = existsSet(itEx);
@@ -2497,6 +3466,29 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const gSet = existsSet(gEx);
     const gmSet = existsSet(gmEx);
     const shopSet = existsSet(shopEx);
+    const catalogSet = existsSet(catalogEx);
+
+    if (Array.isArray(backup.customCategories)) {
+      for (const cat of backup.customCategories) {
+        const ref = doc(db, 'households', householdId, 'categories', cat.id);
+        const payload = {
+          name: clampStr(cat.name, MAX_LENGTHS.categoryName),
+          color: isValidHexColor(cat.color) ? cat.color.toUpperCase() : '#0F766E',
+          icon: isValidCategoryIcon(cat.icon) ? cat.icon : 'tag',
+          order: Math.max(0, Math.min(999, Math.round(Number(cat.order) || 0))),
+          archived: Boolean(cat.archived),
+          csvKeywords: clampStr(cat.csvKeywords || '', MAX_LENGTHS.csvKeywordString),
+          updatedAt: serverTimestamp(),
+        };
+        categoryOps.push({
+          path: `households/${householdId}/categories/${cat.id}`,
+          apply: (b) =>
+            catSet.has(cat.id)
+              ? b.update(ref, payload)
+              : b.set(ref, { ...payload, createdAt: serverTimestamp() }),
+        });
+      }
+    }
 
     const { presetA, presetB } = normalizeSplitPair(backup.settings.presetA);
     ops.push({
@@ -2591,8 +3583,12 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
 
     for (const item of backup.transactions) {
+      if (mcSet.has(item.monthKey)) continue;
       const { id, ...fields } = item;
       const existingDoc = txExistingMap.get(id);
+      if (existingDoc && typeof existingDoc.monthKey === 'string' && mcSet.has(existingDoc.monthKey)) {
+        continue;
+      }
       const safeSplitPctA = clampSplitPct(fields.splitPctA, 50);
       const ref = doc(db, 'households', householdId, 'transactions', id);
       if (existingDoc) {
@@ -2654,14 +3650,40 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
 
     for (const item of backup.budgets) {
+      if (mcSet.has(item.monthKey)) continue;
       const ref = doc(db, 'households', householdId, 'budgets', item.monthKey);
+      const sysLimits: MonthlyBudget['limits'] = {};
+      for (const [k, v] of Object.entries(item.limits ?? {})) {
+        if (isSystemExpenseCategory(k) && typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+          sysLimits[k] = roundCents(v);
+        }
+      }
       ops.push({
         path: `households/${householdId}/budgets/${item.monthKey}`,
         apply: (b) =>
           budSet.has(item.monthKey)
-            ? b.update(ref, { limits: item.limits, updatedAt: serverTimestamp() })
-            : b.set(ref, { monthKey: item.monthKey, limits: item.limits, updatedAt: serverTimestamp() }),
+            ? b.update(ref, { limits: sysLimits, updatedAt: serverTimestamp() })
+            : b.set(ref, { monthKey: item.monthKey, limits: sysLimits, updatedAt: serverTimestamp() }),
       });
+    }
+
+    if (Array.isArray(backup.categoryBudgets)) {
+      for (const cb of backup.categoryBudgets) {
+        if (mcSet.has(cb.monthKey)) continue;
+        const ref = doc(db, 'households', householdId, 'categoryBudgets', cb.id);
+        ops.push({
+          path: `households/${householdId}/categoryBudgets/${cb.id}`,
+          apply: (b) =>
+            cbSet.has(cb.id)
+              ? b.update(ref, { limit: roundCents(cb.limit), updatedAt: serverTimestamp() })
+              : b.set(ref, {
+                  monthKey: cb.monthKey,
+                  categoryId: cb.categoryId,
+                  limit: roundCents(cb.limit),
+                  updatedAt: serverTimestamp(),
+                }),
+        });
+      }
     }
 
     for (const item of backup.monthClosures) {
@@ -2701,9 +3723,22 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     if (Array.isArray(backup.shopping)) {
       for (const item of backup.shopping) {
-        const { id, text, qty, done, addedBy } = item;
+        const { id, text, qty, unit, done, addedBy } = item;
         const safeAddedBy = resolveMemberUid(addedBy);
-        const cleanQty = Math.max(1, Math.min(999, Math.round(Number(qty) || 1)));
+        const cleanQty = roundCents(Math.max(0.01, Math.min(999, Number(qty) || 1)));
+        const cleanUnit = normalizeShoppingUnit(unit);
+        const cleanCatalogId = clampStr(item.catalogId || '', MAX_LENGTHS.shoppingCatalogId);
+        const cleanBrand = clampStr(item.brand || '', MAX_LENGTHS.shoppingBrand);
+        const cleanFormat = clampStr(item.format || '', MAX_LENGTHS.shoppingFormat);
+        const cleanSection = normalizeShoppingSection(item.section);
+        const cleanSourceType = normalizeShoppingSourceType(item.sourceType);
+        const optMeta: Record<string, unknown> = {
+          ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+          ...(cleanBrand ? { brand: cleanBrand } : {}),
+          ...(cleanFormat ? { format: cleanFormat } : {}),
+          ...(cleanSection ? { section: cleanSection } : {}),
+          ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+        };
         const ref = doc(db, 'households', householdId, 'shopping', id);
         ops.push({
           path: `households/${householdId}/shopping/${id}`,
@@ -2712,14 +3747,65 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
               ? b.update(ref, {
                   text: clampStr(text, MAX_LENGTHS.shoppingText) || 'Producto',
                   qty: cleanQty,
+                  unit: cleanUnit,
                   done: Boolean(done),
+                  ...optMeta,
                   updatedAt: serverTimestamp(),
                 })
               : b.set(ref, {
                   text: clampStr(text, MAX_LENGTHS.shoppingText) || 'Producto',
                   qty: cleanQty,
+                  unit: cleanUnit,
                   done: Boolean(done),
+                  ...optMeta,
                   addedBy: safeAddedBy,
+                  createdAt: serverTimestamp(),
+                  updatedAt: serverTimestamp(),
+                }),
+        });
+      }
+    }
+
+    if (Array.isArray(backup.shoppingCatalog)) {
+      for (const item of backup.shoppingCatalog) {
+        const ref = doc(db, 'households', householdId, 'shoppingCatalog', item.id);
+        const cleanText = clampStr(item.text, MAX_LENGTHS.shoppingText) || 'Producto';
+        const cleanUnit = normalizeShoppingUnit(item.defaultUnit);
+        const safeUsage = Math.max(1, Math.min(100000, Math.round(Number(item.usageCount) || 1)));
+        const safeLastUsed = (item.lastUsedAt || new Date().toISOString()).slice(0, 32);
+        const safeCreator = resolveMemberUid(item.createdBy);
+        const cleanCatalogId = clampStr(item.catalogId || '', MAX_LENGTHS.shoppingCatalogId);
+        const cleanBrand = clampStr(item.brand || '', MAX_LENGTHS.shoppingBrand);
+        const cleanFormat = clampStr(item.format || '', MAX_LENGTHS.shoppingFormat);
+        const cleanSection = normalizeShoppingSection(item.section);
+        const cleanSourceType = normalizeShoppingSourceType(item.sourceType);
+        const optMeta: Record<string, unknown> = {
+          ...(typeof item.favorite === 'boolean' ? { favorite: item.favorite } : {}),
+          ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+          ...(cleanBrand ? { brand: cleanBrand } : {}),
+          ...(cleanFormat ? { format: cleanFormat } : {}),
+          ...(cleanSection ? { section: cleanSection } : {}),
+          ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+        };
+        ops.push({
+          path: `households/${householdId}/shoppingCatalog/${item.id}`,
+          apply: (b) =>
+            catalogSet.has(item.id)
+              ? b.update(ref, {
+                  text: cleanText,
+                  defaultUnit: cleanUnit,
+                  usageCount: safeUsage,
+                  lastUsedAt: safeLastUsed,
+                  ...optMeta,
+                  updatedAt: serverTimestamp(),
+                })
+              : b.set(ref, {
+                  text: cleanText,
+                  defaultUnit: cleanUnit,
+                  usageCount: safeUsage,
+                  lastUsedAt: safeLastUsed,
+                  ...optMeta,
+                  createdBy: safeCreator,
                   createdAt: serverTimestamp(),
                   updatedAt: serverTimestamp(),
                 }),
@@ -2740,6 +3826,15 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           `Importó copia de seguridad (${backup.transactions.length} gastos, ${backup.items.length} muebles)`
         ),
     });
+
+    // Primero confirmamos categorías personalizadas para que las reglas exists(...) de las colecciones dependientes siempre pasen.
+    if (categoryOps.length > 0) {
+      await this.commitBatchOps(
+        categoryOps,
+        OperationType.WRITE,
+        `households/${householdId}/categories`
+      );
+    }
 
     await this.commitBatchOps(ops, OperationType.WRITE, `households/${householdId}`);
   }

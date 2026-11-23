@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { AlertCircle, CalendarPlus, Download, X } from 'lucide-react';
+import { useNido } from '../../context/NidoContext';
 import { downloadTextFile } from '../../domain/backup';
 import { formatMonthLabelES } from '../../domain/finance';
 import {
@@ -26,6 +27,7 @@ export const RecurringIcsModal: React.FC<RecurringIcsModalProps> = ({
   recurring,
   onDownloaded,
 }) => {
+  const { categoryRegistry } = useNido();
   const [horizon, setHorizon] = useState<IcsHorizonMonths>(3);
   const [alarmDays, setAlarmDays] = useState<IcsAlarmDaysBefore>(1);
 
@@ -37,8 +39,9 @@ export const RecurringIcsModal: React.FC<RecurringIcsModalProps> = ({
         fromMonthKey,
         monthsHorizon: horizon,
         alarmDaysBefore: alarmDays,
+        categoryLabels: categoryRegistry.labelsMap,
       }),
-    [householdName, recurring, fromMonthKey, horizon, alarmDays]
+    [householdName, recurring, fromMonthKey, horizon, alarmDays, categoryRegistry.labelsMap]
   );
 
   if (!open) return null;

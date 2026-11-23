@@ -4,9 +4,24 @@ import {
   getCurrentMonthKeyLocal,
   getTodayLocalISO,
   normalizeSplitPair,
+  roundCents,
   shiftMonthKey,
 } from '../domain/finance';
-import { sanitizeCategoryColors } from '../domain/categoryPalette';
+import { isValidHexColor, sanitizeCategoryColors } from '../domain/categoryPalette';
+import {
+  buildCategoryBudgetDocId,
+  canSafelyDeleteCustomCategory,
+  generateCustomCategoryId,
+  isCustomCategoryId,
+  isSystemExpenseCategory,
+  isValidCategoryIcon,
+} from '../domain/categories';
+import {
+  buildShoppingCatalogId,
+  normalizeShoppingSection,
+  normalizeShoppingSourceType,
+  normalizeShoppingUnit,
+} from '../domain/shoppingCatalog';
 import {
   buildDeterministicRecurringTxId,
   isRecurringDueInMonth,
@@ -22,13 +37,28 @@ import {
   RECURRING_CATALOG_SEED_VERSION,
   type RecurringCatalogPreset,
 } from '../domain/presets';
-import { COMMON_ACCOUNT_ID } from '../types/nido';
+import {
+  buildCheckoutExpenseId,
+  isShoppingItemSafeForCrossDeviceCleanup,
+  isShoppingItemUnchangedForCheckout,
+  isValidShoppingCheckoutId,
+  MAX_CHECKOUT_BATCH_ITEMS,
+  MAX_CHECKOUT_PENDING_ITEMS,
+  sortSnapshotsDeterministically,
+  type ShoppingCheckoutBatchCleanupResult,
+  type ShoppingCheckoutItemSnapshot,
+  type ShoppingCheckoutPhase1Input,
+  type ShoppingCheckoutPhase1Result,
+} from '../domain/shoppingCheckout';
+import { COMMON_ACCOUNT_ID, MAX_LENGTHS } from '../types/nido';
 import type {
   ActivityAction,
   ActivityEntry,
+  CategoryBudgetLimit,
   CategoryColorMap,
   ChecklistItem,
   CsvCategoryKeywords,
+  CustomCategory,
   FurnitureItem,
   FurnitureStatus,
   GoalMovement,
@@ -39,9 +69,13 @@ import type {
   MonthClosure,
   MonthlyBudget,
   NidoBackupV1,
+  PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  ShoppingCatalogItem,
   ShoppingItem,
+  ShoppingSection,
+  ShoppingSourceType,
   Transaction,
   UiMode,
 } from '../types/nido';
@@ -62,10 +96,14 @@ interface DemoState {
   recurring: RecurringExpense[];
   transactions: Transaction[];
   budgets: Record<string, MonthlyBudget>;
+  categoryBudgets: CategoryBudgetLimit[];
+  customCategories: CustomCategory[];
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
   shopping: ShoppingItem[];
+  shoppingCatalog: ShoppingCatalogItem[];
+  pendingShoppingCheckouts: PendingShoppingCheckout[];
 }
 
 const STORAGE_KEY = 'nido_demo_state_v1';
@@ -229,14 +267,18 @@ function buildInitialDemoState(): DemoState {
         updatedAt: ts,
       },
     },
+    categoryBudgets: [],
+    customCategories: [],
     monthClosures: [],
     goals,
     goalMovements,
     shopping: [
-      { id: 'shop_1', text: 'Leche semidesnatada', qty: 6, done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
-      { id: 'shop_2', text: 'Aceite de oliva virgen extra', qty: 1, done: true, addedBy: uidB, createdAt: ts, updatedAt: ts },
-      { id: 'shop_3', text: 'Papel higiénico', qty: 2, done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
+      { id: 'shop_1', text: 'Leche semidesnatada', qty: 6, unit: 'L', done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
+      { id: 'shop_2', text: 'Aceite de oliva virgen extra', qty: 1, unit: 'botella', done: true, addedBy: uidB, createdAt: ts, updatedAt: ts },
+      { id: 'shop_3', text: 'Papel higiénico', qty: 2, unit: 'paq', done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
     ],
+    shoppingCatalog: [],
+    pendingShoppingCheckouts: [],
   };
 }
 
@@ -272,11 +314,31 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         if (loaded && !Array.isArray(loaded.shopping)) {
           loaded.shopping = [];
         }
+        if (loaded && !Array.isArray(loaded.customCategories)) {
+          loaded.customCategories = [];
+        }
+        if (loaded && !Array.isArray(loaded.categoryBudgets)) {
+          loaded.categoryBudgets = [];
+        }
+        if (loaded && !Array.isArray(loaded.shoppingCatalog)) {
+          loaded.shoppingCatalog = [];
+        }
+        if (loaded && !Array.isArray(loaded.pendingShoppingCheckouts)) {
+          loaded.pendingShoppingCheckouts = [];
+        }
       }
     } catch {
       loaded = null;
     }
     this.state = loaded ?? buildInitialDemoState();
+  }
+
+  private assertMonthNotClosed(monthKey: string): void {
+    if (this.state.monthClosures.some((c) => c.monthKey === monthKey)) {
+      throw new Error(
+        `El mes ${monthKey} está cerrado. Reábrelo en Avanzado si necesitas modificarlo.`
+      );
+    }
   }
 
   private emit() {
@@ -376,10 +438,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       recurring: [],
       transactions: [],
       budgets: {},
+      categoryBudgets: [],
+      customCategories: [],
       monthClosures: [],
       goals: [],
       goalMovements: [],
       shopping: [],
+      shoppingCatalog: [],
+      pendingShoppingCheckouts: [],
     };
     this.emit();
 
@@ -551,6 +617,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     return this.subscribe(() => onData([...this.state.initialCosts]));
   }
 
+  async fetchAllInitialCosts(_hid: string): Promise<InitialCost[]> {
+    return [...this.state.initialCosts].sort((a, b) =>
+      (b.dueDate || b.createdAt || '').localeCompare(a.dueDate || a.createdAt || '')
+    );
+  }
+
   subscribeChecklist(_hid: string, onData: (items: ChecklistItem[]) => void): Unsubscribe {
     return this.subscribe(() => onData([...this.state.checklist].sort((a, b) => a.order - b.order)));
   }
@@ -576,6 +648,24 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         this.state.transactions
           .filter((t) => t.monthKey === monthKey && (!t.isPrivate || t.createdBy === viewerUid))
           .sort((a, b) => b.date.localeCompare(a.date))
+      )
+    );
+  }
+
+  subscribePendingShoppingCheckouts(
+    _hid: string,
+    viewerUid: string,
+    onData: (items: PendingShoppingCheckout[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        this.state.pendingShoppingCheckouts
+          .filter(
+            (item) =>
+              (!item.isPrivate || item.createdBy === viewerUid) &&
+              item.pendingItemIds.length > 0
+          )
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       )
     );
   }
@@ -629,6 +719,67 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeShoppingCatalog(
+    _hid: string,
+    onData: (items: ShoppingCatalogItem[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        [...this.state.shoppingCatalog].sort(
+          (a, b) =>
+            Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) ||
+            b.usageCount - a.usageCount ||
+            b.lastUsedAt.localeCompare(a.lastUsedAt)
+        )
+      )
+    );
+  }
+
+  subscribeCustomCategories(
+    _hid: string,
+    onData: (items: CustomCategory[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        [...this.state.customCategories].sort(
+          (a, b) => (a.order ?? 999) - (b.order ?? 999) || a.name.localeCompare(b.name, 'es')
+        )
+      )
+    );
+  }
+
+  subscribeCategoryBudgets(
+    _hid: string,
+    monthKey: string,
+    onData: (items: CategoryBudgetLimit[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(this.state.categoryBudgets.filter((b) => b.monthKey === monthKey))
+    );
+  }
+
+  async fetchAllCategoryBudgets(_hid: string): Promise<CategoryBudgetLimit[]> {
+    return [...this.state.categoryBudgets];
+  }
+
+  async fetchMonthBudgets(
+    _hid: string,
+    monthKey: string
+  ): Promise<{ systemBudget: MonthlyBudget | null; categoryBudgets: CategoryBudgetLimit[] }> {
+    const sys = this.state.budgets[monthKey] ?? null;
+    return {
+      systemBudget: sys
+        ? {
+            ...sys,
+            limits: { ...sys.limits },
+          }
+        : null,
+      categoryBudgets: this.state.categoryBudgets
+        .filter((b) => b.monthKey === monthKey)
+        .map((b) => ({ ...b })),
+    };
+  }
+
   async updateSettings(
     hid: string,
     settings: HouseholdSettings,
@@ -663,6 +814,96 @@ export class DemoHouseholdRepository implements HouseholdRepository {
 
   async updateMemberUiMode(_hid: string, uid: string, uiMode: UiMode): Promise<void> {
     this.state.members = this.state.members.map((m) => (m.uid === uid ? { ...m, uiMode } : m));
+    this.emit();
+  }
+
+  async upsertCustomCategory(
+    _hid: string,
+    cat: Omit<CustomCategory, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const now = new Date().toISOString();
+    const id =
+      cat.id && isCustomCategoryId(cat.id)
+        ? cat.id
+        : generateCustomCategoryId(
+            cat.name,
+            this.state.customCategories.map((c) => c.id)
+          );
+    const cleanName = cat.name.trim().slice(0, MAX_LENGTHS.categoryName);
+    const cleanColor = isValidHexColor(cat.color) ? cat.color.toUpperCase() : '#0F766E';
+    const cleanIcon = isValidCategoryIcon(cat.icon) ? cat.icon : 'tag';
+    const cleanOrder = Math.max(0, Math.min(999, Math.round(Number(cat.order) || 0)));
+    const cleanKeywords = (cat.csvKeywords || '').trim().slice(0, MAX_LENGTHS.csvKeywordString);
+
+    if (cat.id && this.state.customCategories.some((c) => c.id === id)) {
+      this.state.customCategories = this.state.customCategories.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              name: cleanName,
+              color: cleanColor,
+              icon: cleanIcon,
+              order: cleanOrder,
+              archived: Boolean(cat.archived),
+              csvKeywords: cleanKeywords,
+              updatedAt: now,
+            }
+          : c
+      );
+      this.logActivity(actor, 'update', 'categoria', id, `Editó categoría "${cleanName}"`);
+    } else {
+      this.state.customCategories.push({
+        id,
+        name: cleanName,
+        color: cleanColor,
+        icon: cleanIcon,
+        order: cleanOrder,
+        archived: Boolean(cat.archived),
+        csvKeywords: cleanKeywords,
+        createdAt: now,
+        updatedAt: now,
+      });
+      this.logActivity(actor, 'create', 'categoria', id, `Creó categoría "${cleanName}"`);
+    }
+    this.emit();
+    return id;
+  }
+
+  async reorderCustomCategories(
+    _hid: string,
+    ordered: Array<{ id: string; order: number }>
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const orderMap = new Map(ordered.map((o) => [o.id, o.order]));
+    this.state.customCategories = this.state.customCategories.map((c) =>
+      orderMap.has(c.id) ? { ...c, order: orderMap.get(c.id) ?? c.order, updatedAt: now } : c
+    );
+    this.emit();
+  }
+
+  async deleteUnusedCustomCategory(
+    _hid: string,
+    id: string,
+    name: string,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const check = canSafelyDeleteCustomCategory(id, {
+      memberCount: this.state.members.length,
+      transactions: this.state.transactions,
+      recurring: this.state.recurring,
+      initialCosts: this.state.initialCosts,
+      categoryBudgets: this.state.categoryBudgets,
+    });
+    if (!check.canDelete) {
+      throw new Error(
+        check.reason === 'multi_member_privacy'
+          ? 'En un hogar compartido no se eliminan categorías personalizadas de forma definitiva porque podría haber gastos privados de tu pareja. Archívala para ocultarla sin perder historial.'
+          : 'Esta categoría tiene gastos, plantillas o presupuestos asociados. Archívala en lugar de borrarla.'
+      );
+    }
+    this.state.customCategories = this.state.customCategories.filter((c) => c.id !== id);
+    this.logActivity(actor, 'delete', 'categoria', id, `Eliminó categoría "${name}"`);
     this.emit();
   }
 
@@ -957,6 +1198,11 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     tx: Omit<Transaction, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
     actor: UserProfileInput
   ): Promise<string> {
+    this.assertMonthNotClosed(tx.monthKey);
+    const existingPrev = tx.id ? this.state.transactions.find((t) => t.id === tx.id) : undefined;
+    if (existingPrev && existingPrev.monthKey !== tx.monthKey) {
+      this.assertMonthNotClosed(existingPrev.monthKey);
+    }
     const now = new Date().toISOString();
     const id = tx.id || `tx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
@@ -997,6 +1243,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   }
 
   async restoreTransaction(_hid: string, tx: Transaction, actor: UserProfileInput): Promise<void> {
+    this.assertMonthNotClosed(tx.monthKey);
     const isPrivate = Boolean(tx.isPrivate) && !tx.isSettlement;
     const originalCreator = tx.createdBy || actor.uid;
     const restored: Transaction = {
@@ -1027,6 +1274,9 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     options?: { isPrivate?: boolean }
   ): Promise<void> {
     const existing = this.state.transactions.find((t) => t.id === id);
+    if (existing) {
+      this.assertMonthNotClosed(existing.monthKey);
+    }
     const wasPrivate = options?.isPrivate ?? Boolean(existing?.isPrivate);
     this.state.transactions = this.state.transactions.filter((t) => t.id !== id);
     if (!wasPrivate) {
@@ -1042,6 +1292,11 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   ): Promise<void> {
     if (items.length === 0) return;
     const ids = new Set(items.map((tx) => tx.id));
+    for (const existing of this.state.transactions) {
+      if (ids.has(existing.id)) {
+        this.assertMonthNotClosed(existing.monthKey);
+      }
+    }
     const publicItems = items.filter((item) => {
       const existing = this.state.transactions.find((t) => t.id === item.id);
       return !(item.isPrivate ?? existing?.isPrivate);
@@ -1108,11 +1363,62 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     limits: MonthlyBudget['limits'],
     actor: UserProfileInput
   ): Promise<void> {
+    this.assertMonthNotClosed(monthKey);
+    const sysLimits: MonthlyBudget['limits'] = {};
+    for (const [k, v] of Object.entries(limits ?? {})) {
+      if (isSystemExpenseCategory(k) && typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+        sysLimits[k] = roundCents(v);
+      }
+    }
     this.state.budgets[monthKey] = {
       monthKey,
-      limits: { ...limits },
+      limits: sysLimits,
       updatedAt: new Date().toISOString(),
     };
+    this.logActivity(actor, 'update', 'presupuesto', monthKey, `Actualizó presupuestos de ${monthKey}`);
+    this.emit();
+  }
+
+  async saveAllBudgets(
+    _hid: string,
+    monthKey: string,
+    limits: Record<string, number>,
+    customCategoryIds: string[],
+    actor: UserProfileInput
+  ): Promise<void> {
+    this.assertMonthNotClosed(monthKey);
+    const now = new Date().toISOString();
+    const sysLimits: MonthlyBudget['limits'] = {};
+    for (const [key, val] of Object.entries(limits)) {
+      if (isSystemExpenseCategory(key) && Number.isFinite(val) && val >= 0) {
+        sysLimits[key] = roundCents(val);
+      }
+    }
+    this.state.budgets[monthKey] = {
+      monthKey,
+      limits: sysLimits,
+      updatedAt: now,
+    };
+
+    const nextCustom: CategoryBudgetLimit[] = this.state.categoryBudgets.filter(
+      (b) => !(b.monthKey === monthKey && customCategoryIds.includes(b.categoryId))
+    );
+    for (const catId of customCategoryIds) {
+      if (!isCustomCategoryId(catId)) continue;
+      const hasExplicit = Object.prototype.hasOwnProperty.call(limits, catId);
+      const rawVal = hasExplicit ? limits[catId] : undefined;
+      const val = typeof rawVal === 'number' ? rawVal : NaN;
+      if (hasExplicit && Number.isFinite(val) && val >= 0) {
+        nextCustom.push({
+          id: buildCategoryBudgetDocId(monthKey, catId),
+          monthKey,
+          categoryId: catId,
+          limit: roundCents(val),
+          updatedAt: now,
+        });
+      }
+    }
+    this.state.categoryBudgets = nextCustom;
     this.logActivity(actor, 'update', 'presupuesto', monthKey, `Actualizó presupuestos de ${monthKey}`);
     this.emit();
   }
@@ -1213,23 +1519,60 @@ export class DemoHouseholdRepository implements HouseholdRepository {
 
   async upsertShoppingItem(
     _hid: string,
-    item: { id?: string; text: string; qty: number; done: boolean },
+    item: {
+      id?: string;
+      text: string;
+      qty: number;
+      unit?: string;
+      done: boolean;
+      catalogId?: string;
+      brand?: string;
+      format?: string;
+      section?: ShoppingSection;
+      sourceType?: ShoppingSourceType;
+    },
     actor: UserProfileInput
   ): Promise<string> {
     const now = new Date().toISOString();
     const id = item.id || `shop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const cleanText = item.text.trim().slice(0, 120);
-    const cleanQty = Math.max(1, Math.min(999, Math.round(Number(item.qty) || 1)));
+    const cleanText = item.text.trim().slice(0, MAX_LENGTHS.shoppingText);
+    const cleanQty = roundCents(Math.max(0.01, Math.min(999, Number(item.qty) || 1)));
+    const cleanUnit = normalizeShoppingUnit(item.unit);
+    const cleanCatalogId = (item.catalogId || '').trim().slice(0, MAX_LENGTHS.shoppingCatalogId);
+    const cleanBrand = (item.brand || '').trim().slice(0, MAX_LENGTHS.shoppingBrand);
+    const cleanFormat = (item.format || '').trim().slice(0, MAX_LENGTHS.shoppingFormat);
+    const cleanSection = normalizeShoppingSection(item.section);
+    const cleanSourceType = normalizeShoppingSourceType(item.sourceType);
     if (item.id && this.state.shopping.some((s) => s.id === item.id)) {
       this.state.shopping = this.state.shopping.map((s) =>
-        s.id === id ? { ...s, text: cleanText, qty: cleanQty, done: Boolean(item.done), updatedAt: now } : s
+        s.id === id
+          ? {
+              ...s,
+              text: cleanText,
+              qty: cleanQty,
+              ...(cleanUnit ? { unit: cleanUnit } : { unit: '' }),
+              done: Boolean(item.done),
+              ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+              ...(cleanBrand ? { brand: cleanBrand } : {}),
+              ...(cleanFormat ? { format: cleanFormat } : {}),
+              ...(cleanSection ? { section: cleanSection } : {}),
+              ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+              updatedAt: now,
+            }
+          : s
       );
     } else {
       this.state.shopping.push({
         id,
         text: cleanText,
         qty: cleanQty,
+        ...(cleanUnit ? { unit: cleanUnit } : {}),
         done: Boolean(item.done),
+        ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+        ...(cleanBrand ? { brand: cleanBrand } : {}),
+        ...(cleanFormat ? { format: cleanFormat } : {}),
+        ...(cleanSection ? { section: cleanSection } : {}),
+        ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
         addedBy: actor.uid,
         createdAt: now,
         updatedAt: now,
@@ -1251,6 +1594,308 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async commitShoppingCheckoutPhase1(
+    _hid: string,
+    input: ShoppingCheckoutPhase1Input,
+    actor: UserProfileInput
+  ): Promise<ShoppingCheckoutPhase1Result> {
+    if (!isValidShoppingCheckoutId(input.checkoutId)) {
+      throw new Error('Identificador de cierre de compra inválido.');
+    }
+    const cleanAmount = roundCents(Number(input.amount));
+    if (!Number.isFinite(cleanAmount) || cleanAmount <= 0) {
+      throw new Error('Introduce un importe válido mayor que 0 €.');
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.date) || !isValidMonthKey(input.monthKey)) {
+      throw new Error('Fecha de compra inválida.');
+    }
+
+    const ordered = sortSnapshotsDeterministically(input.snapshots);
+    if (ordered.length === 0) {
+      return { status: 'all_modified_or_gone', skippedConcurrentIds: [], alreadyGoneIds: [] };
+    }
+    if (ordered.length > MAX_CHECKOUT_PENDING_ITEMS) {
+      throw new Error(`El carro supera el máximo de ${MAX_CHECKOUT_PENDING_ITEMS} artículos por cierre.`);
+    }
+
+    const expenseId = buildCheckoutExpenseId(input.checkoutId);
+    const existingTx = this.state.transactions.find((t) => t.id === expenseId);
+    if (existingTx) {
+      const existingCheckout = this.state.pendingShoppingCheckouts.find(
+        (c) => c.id === input.checkoutId
+      );
+      return {
+        status: 'already_committed',
+        expenseId,
+        pendingItemIds: existingCheckout ? [...existingCheckout.pendingItemIds] : [],
+      };
+    }
+
+    this.assertMonthNotClosed(input.monthKey);
+
+    const batch1 = ordered.slice(0, MAX_CHECKOUT_BATCH_ITEMS);
+    const remainingIds = ordered.slice(MAX_CHECKOUT_BATCH_ITEMS).map((s) => s.id);
+    const liveById = new Map(this.state.shopping.map((item) => [item.id, item]));
+
+    const alreadyGoneIds: string[] = [];
+    const deletedIds: string[] = [];
+    const skippedConcurrentIds: string[] = [];
+
+    for (const expected of batch1) {
+      const liveItem = liveById.get(expected.id);
+      if (!liveItem) {
+        alreadyGoneIds.push(expected.id);
+        continue;
+      }
+      if (isShoppingItemUnchangedForCheckout(expected, liveItem)) {
+        deletedIds.push(expected.id);
+      } else {
+        skippedConcurrentIds.push(expected.id);
+      }
+    }
+
+    if (alreadyGoneIds.length > 0) {
+      return { status: 'overlap_conflict', alreadyGoneIds };
+    }
+
+    if (deletedIds.length === 0 && remainingIds.length === 0) {
+      return {
+        status: 'all_modified_or_gone',
+        skippedConcurrentIds,
+        alreadyGoneIds: [],
+      };
+    }
+
+    const now = new Date().toISOString();
+    const isPrivate = Boolean(input.isPrivate);
+    const cleanConcept = (input.concept || 'Compra supermercado').trim().slice(0, MAX_LENGTHS.concept) || 'Compra supermercado';
+    const cleanNotes = (input.notes || '').trim().slice(0, MAX_LENGTHS.notes);
+    const safePaidBy = isPrivate
+      ? actor.uid
+      : input.paidBy === 'comun' || !input.paidBy
+        ? COMMON_ACCOUNT_ID
+        : input.paidBy;
+
+    this.state.transactions.push({
+      id: expenseId,
+      monthKey: input.monthKey,
+      concept: cleanConcept,
+      category: 'supermercado',
+      amount: cleanAmount,
+      date: input.date,
+      paidBy: safePaidBy,
+      recurringId: null,
+      splitPctA: clampSplitPct(input.splitPctA, 50),
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate,
+      createdBy: actor.uid,
+      notes: cleanNotes,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    if (!isPrivate) {
+      this.logActivity(
+        actor,
+        'create',
+        'gasto',
+        expenseId,
+        `Añadió gasto "${cleanConcept}" (${cleanAmount} €)`
+      );
+    }
+
+    if (deletedIds.length > 0) {
+      const delSet = new Set(deletedIds);
+      this.state.shopping = this.state.shopping.filter((s) => !delSet.has(s.id));
+    }
+
+    if (remainingIds.length > 0) {
+      this.state.pendingShoppingCheckouts = [
+        ...this.state.pendingShoppingCheckouts.filter((c) => c.id !== input.checkoutId),
+        {
+          id: input.checkoutId,
+          expenseId,
+          monthKey: input.monthKey,
+          amount: isPrivate ? 0 : cleanAmount,
+          concept: isPrivate ? 'Compra privada' : cleanConcept,
+          pendingItemIds: remainingIds,
+          totalItemCount: ordered.length,
+          isPrivate,
+          createdBy: actor.uid,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ];
+    }
+
+    this.emit();
+    return {
+      status: 'committed',
+      expenseId,
+      deletedIds,
+      skippedConcurrentIds,
+      pendingItemIds: remainingIds,
+    };
+  }
+
+  async cleanupShoppingCheckoutBatch(
+    _hid: string,
+    checkoutId: string,
+    snapshotsById?: Record<string, ShoppingCheckoutItemSnapshot>
+  ): Promise<ShoppingCheckoutBatchCleanupResult> {
+    if (!isValidShoppingCheckoutId(checkoutId)) {
+      throw new Error('Identificador de limpieza inválido.');
+    }
+    const checkout = this.state.pendingShoppingCheckouts.find((c) => c.id === checkoutId);
+    if (!checkout) {
+      return {
+        checkoutId,
+        deletedIds: [],
+        skippedConcurrentIds: [],
+        alreadyGoneIds: [],
+        remainingItemIds: [],
+        completed: true,
+      };
+    }
+
+    const batchIds = checkout.pendingItemIds.slice(0, MAX_CHECKOUT_BATCH_ITEMS);
+    const remainingItemIds = checkout.pendingItemIds.slice(batchIds.length);
+    const liveById = new Map(this.state.shopping.map((item) => [item.id, item]));
+
+    const deletedIds: string[] = [];
+    const skippedConcurrentIds: string[] = [];
+    const alreadyGoneIds: string[] = [];
+
+    for (const itemId of batchIds) {
+      const liveItem = liveById.get(itemId);
+      if (!liveItem) {
+        alreadyGoneIds.push(itemId);
+        continue;
+      }
+      const localSnap = snapshotsById?.[itemId];
+      const safeToDelete = localSnap
+        ? isShoppingItemUnchangedForCheckout(localSnap, liveItem)
+        : isShoppingItemSafeForCrossDeviceCleanup(liveItem, checkout.createdAt);
+      if (safeToDelete) {
+        deletedIds.push(itemId);
+      } else {
+        skippedConcurrentIds.push(itemId);
+      }
+    }
+
+    if (deletedIds.length > 0) {
+      const delSet = new Set(deletedIds);
+      this.state.shopping = this.state.shopping.filter((s) => !delSet.has(s.id));
+    }
+
+    const now = new Date().toISOString();
+    if (remainingItemIds.length === 0) {
+      this.state.pendingShoppingCheckouts = this.state.pendingShoppingCheckouts.filter(
+        (c) => c.id !== checkoutId
+      );
+    } else {
+      this.state.pendingShoppingCheckouts = this.state.pendingShoppingCheckouts.map((c) =>
+        c.id === checkoutId ? { ...c, pendingItemIds: remainingItemIds, updatedAt: now } : c
+      );
+    }
+
+    this.emit();
+    return {
+      checkoutId,
+      deletedIds,
+      skippedConcurrentIds,
+      alreadyGoneIds,
+      remainingItemIds,
+      completed: remainingItemIds.length === 0,
+    };
+  }
+
+  async dismissPendingShoppingCheckout(_hid: string, checkoutId: string): Promise<void> {
+    this.state.pendingShoppingCheckouts = this.state.pendingShoppingCheckouts.filter(
+      (c) => c.id !== checkoutId
+    );
+    this.emit();
+  }
+
+  async upsertShoppingCatalogItem(
+    _hid: string,
+    input: {
+      text: string;
+      defaultUnit?: string;
+      favorite?: boolean;
+      catalogId?: string;
+      brand?: string;
+      format?: string;
+      section?: ShoppingSection;
+      sourceType?: ShoppingSourceType;
+    },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const cleanText = input.text.trim().slice(0, MAX_LENGTHS.shoppingText);
+    if (!cleanText) return '';
+    const cleanCatalogId = (input.catalogId || '').trim().slice(0, MAX_LENGTHS.shoppingCatalogId);
+    const cleanBrand = (input.brand || '').trim().slice(0, MAX_LENGTHS.shoppingBrand);
+    const cleanFormat = (input.format || '').trim().slice(0, MAX_LENGTHS.shoppingFormat);
+    const cleanSection = normalizeShoppingSection(input.section);
+    const cleanSourceType = normalizeShoppingSourceType(input.sourceType);
+    const id = buildShoppingCatalogId(cleanText, {
+      catalogId: cleanCatalogId,
+      brand: cleanBrand,
+      format: cleanFormat,
+    });
+    const cleanUnit = normalizeShoppingUnit(input.defaultUnit);
+    const now = new Date().toISOString();
+    const existing = this.state.shoppingCatalog.find((c) => c.id === id);
+    if (existing) {
+      this.state.shoppingCatalog = this.state.shoppingCatalog.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              text: cleanText,
+              defaultUnit: cleanUnit || c.defaultUnit,
+              usageCount: Math.min(100000, c.usageCount + 1),
+              lastUsedAt: now,
+              ...(typeof input.favorite === 'boolean' ? { favorite: input.favorite } : {}),
+              ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+              ...(cleanBrand ? { brand: cleanBrand } : {}),
+              ...(cleanFormat ? { format: cleanFormat } : {}),
+              ...(cleanSection ? { section: cleanSection } : {}),
+              ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+              updatedAt: now,
+            }
+          : c
+      );
+    } else {
+      this.state.shoppingCatalog.push({
+        id,
+        text: cleanText,
+        defaultUnit: cleanUnit,
+        usageCount: 1,
+        lastUsedAt: now,
+        ...(typeof input.favorite === 'boolean' ? { favorite: input.favorite } : {}),
+        ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
+        ...(cleanBrand ? { brand: cleanBrand } : {}),
+        ...(cleanFormat ? { format: cleanFormat } : {}),
+        ...(cleanSection ? { section: cleanSection } : {}),
+        ...(cleanSourceType ? { sourceType: cleanSourceType } : {}),
+        createdBy: actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    this.emit();
+    return id;
+  }
+
+  async toggleShoppingCatalogFavorite(_hid: string, id: string, favorite: boolean): Promise<void> {
+    const now = new Date().toISOString();
+    this.state.shoppingCatalog = this.state.shoppingCatalog.map((c) =>
+      c.id === id ? { ...c, favorite: Boolean(favorite), updatedAt: now } : c
+    );
+    this.emit();
+  }
+
   async exportBackup(_hid: string, viewerUid: string): Promise<NidoBackupV1> {
     return {
       schemaVersion: 1,
@@ -1261,6 +1906,18 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       ...(this.state.household.csvKeywords ? { csvKeywords: this.state.household.csvKeywords } : {}),
       ...(this.state.household.categoryColors && Object.keys(this.state.household.categoryColors).length > 0
         ? { categoryColors: this.state.household.categoryColors }
+        : {}),
+      ...(this.state.customCategories.length > 0
+        ? {
+            customCategories: this.state.customCategories.map(
+              ({ createdAt: _c, updatedAt: _u, ...r }) => r
+            ),
+          }
+        : {}),
+      ...(this.state.categoryBudgets.length > 0
+        ? {
+            categoryBudgets: this.state.categoryBudgets.map(({ updatedAt: _u, ...r }) => r),
+          }
         : {}),
       initialCosts: this.state.initialCosts.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       checklist: this.state.checklist.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
@@ -1274,6 +1931,13 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       goals: this.state.goals.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       goalMovements: this.state.goalMovements.map(({ createdAt: _c, ...r }) => r),
       shopping: this.state.shopping.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
+      ...(this.state.shoppingCatalog.length > 0
+        ? {
+            shoppingCatalog: this.state.shoppingCatalog.map(
+              ({ createdAt: _c, updatedAt: _u, ...r }) => r
+            ),
+          }
+        : {}),
     };
   }
 
@@ -1287,6 +1951,26 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     if (backup.categoryColors) {
       this.state.household.categoryColors = { ...backup.categoryColors };
     }
+    if (Array.isArray(backup.customCategories)) {
+      this.state.customCategories = backup.customCategories.map((c) => ({
+        ...c,
+        createdAt: now,
+        updatedAt: now,
+      }));
+    }
+    const alreadyClosedMonths = new Set(this.state.monthClosures.map((c) => c.monthKey));
+    if (Array.isArray(backup.categoryBudgets)) {
+      const preservedClosedCatBudgets = this.state.categoryBudgets.filter((b) =>
+        alreadyClosedMonths.has(b.monthKey)
+      );
+      const importedCatBudgets = backup.categoryBudgets
+        .filter((b) => !alreadyClosedMonths.has(b.monthKey))
+        .map((b) => ({
+          ...b,
+          updatedAt: now,
+        }));
+      this.state.categoryBudgets = [...preservedClosedCatBudgets, ...importedCatBudgets];
+    }
     this.state.initialCosts = backup.initialCosts.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.checklist = backup.checklist.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.items = backup.items.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
@@ -1294,28 +1978,68 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     const preservedPrivateFromPartner = this.state.transactions.filter(
       (t) => t.isPrivate && t.createdBy !== actor.uid
     );
-    const importedTxs = backup.transactions.map((c) => ({
-      ...c,
-      isPrivate: Boolean(c.isPrivate),
-      createdBy: c.createdBy || actor.uid,
-      createdAt: now,
-      updatedAt: now,
-    }));
-    const importedIds = new Set(importedTxs.map((t) => t.id));
-    this.state.transactions = [
-      ...preservedPrivateFromPartner.filter((t) => !importedIds.has(t.id)),
-      ...importedTxs,
-    ];
-    this.state.budgets = Object.fromEntries(
-      backup.budgets.map((b) => [b.monthKey, { ...b, updatedAt: now }])
+    const preservedClosedTxs = this.state.transactions.filter((t) =>
+      alreadyClosedMonths.has(t.monthKey)
     );
-    this.state.monthClosures = backup.monthClosures.map((c) => ({ ...c, closedAt: now }));
+    const importedTxs = backup.transactions
+      .filter((c) => !alreadyClosedMonths.has(c.monthKey))
+      .map((c) => ({
+        ...c,
+        isPrivate: Boolean(c.isPrivate),
+        createdBy: c.createdBy || actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      }));
+    const preservedById = new Map<string, Transaction>();
+    for (const t of preservedClosedTxs) preservedById.set(t.id, t);
+    for (const t of preservedPrivateFromPartner) {
+      if (!preservedById.has(t.id)) preservedById.set(t.id, t);
+    }
+    for (const t of importedTxs) {
+      if (!preservedById.has(t.id)) preservedById.set(t.id, t);
+    }
+    this.state.transactions = Array.from(preservedById.values());
+
+    const nextBudgets: Record<string, MonthlyBudget> = {};
+    for (const [mk, existingB] of Object.entries(this.state.budgets)) {
+      if (alreadyClosedMonths.has(mk)) {
+        nextBudgets[mk] = existingB;
+      }
+    }
+    for (const b of backup.budgets) {
+      if (alreadyClosedMonths.has(b.monthKey)) continue;
+      const sysLimits: MonthlyBudget['limits'] = {};
+      for (const [k, v] of Object.entries(b.limits ?? {})) {
+        if (isSystemExpenseCategory(k) && typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+          sysLimits[k] = roundCents(v);
+        }
+      }
+      nextBudgets[b.monthKey] = { monthKey: b.monthKey, limits: sysLimits, updatedAt: now };
+    }
+    this.state.budgets = nextBudgets;
+
+    const closuresByMonth = new Map<string, MonthClosure>();
+    for (const c of this.state.monthClosures) closuresByMonth.set(c.monthKey, c);
+    for (const c of backup.monthClosures) {
+      if (!closuresByMonth.has(c.monthKey)) {
+        closuresByMonth.set(c.monthKey, { ...c, closedAt: now });
+      }
+    }
+    this.state.monthClosures = Array.from(closuresByMonth.values());
     this.state.goals = backup.goals.map((g) => ({ ...g, createdAt: now, updatedAt: now }));
     this.state.goalMovements = backup.goalMovements.map((m) => ({ ...m, createdAt: now }));
     if (Array.isArray(backup.shopping)) {
       this.state.shopping = backup.shopping.map((s) => ({
         ...s,
         addedBy: s.addedBy || actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      }));
+    }
+    if (Array.isArray(backup.shoppingCatalog)) {
+      this.state.shoppingCatalog = backup.shoppingCatalog.map((c) => ({
+        ...c,
+        createdBy: c.createdBy || actor.uid,
         createdAt: now,
         updatedAt: now,
       }));

@@ -8,12 +8,29 @@ import {
   shiftMonthKey,
 } from '../domain/finance';
 import {
+  buildCategoryRegistry,
+  mergeMonthlyAndCustomBudgetLimits,
+  type CategoryRegistry,
+} from '../domain/categories';
+import {
   buildLocalNoticeStorageKey,
   LOCAL_NOTICE_UPDATED_EVENT,
   loadLocalNoticeSettings,
   syncAppBadge,
   triggerForegroundNotificationCheck,
 } from '../domain/localNotifications';
+import {
+  clearAllLocalPendingCheckouts,
+  clearLocalPendingCheckout,
+  executeDurableShoppingCheckout,
+  loadLocalPendingCheckout,
+  reconcileShoppingItemsForCleanup,
+  saveLocalPendingCheckout,
+  type LocalPendingShoppingCheckout,
+  type ShoppingCheckoutItemSnapshot,
+} from '../domain/shoppingCheckout';
+import { usePwaUpdateBlock } from '../services/pwaUpdateGuard';
+import { globalSearchSessionCache } from '../domain/globalSearch';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import { FirestoreHouseholdRepository } from '../repositories/FirestoreHouseholdRepository';
 import type {
@@ -24,7 +41,9 @@ import type {
 import { auth, googleProvider, toUserFriendlyErrorMessage } from '../services/firebase';
 import type {
   ActivityEntry,
+  CategoryBudgetLimit,
   ChecklistItem,
+  CustomCategory,
   ExpensePrefill,
   FurnitureItem,
   GoalMovement,
@@ -34,8 +53,10 @@ import type {
   MonthClosure,
   MonthlyBudget,
   NavTab,
+  PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  ShoppingCatalogItem,
   ShoppingItem,
   ThemeMode,
   Transaction,
@@ -98,8 +119,26 @@ interface NidoContextValue {
     onSaved?: () => Promise<void> | void
   ) => void;
   clearQuickExpensePrefill: () => void;
+  shoppingOpen: boolean;
+  setShoppingOpen: (open: boolean) => void;
+  openShoppingList: () => void;
+  pendingShoppingCleanupIds: string[];
+  pendingShoppingCheckouts: PendingShoppingCheckout[];
+  localPendingCheckout: LocalPendingShoppingCheckout | null;
+  resumingShoppingCheckout: boolean;
+  refreshLocalPendingCheckout: () => void;
+  registerPendingShoppingCleanup: (snapshots: ShoppingCheckoutItemSnapshot[]) => void;
+  openConvertShoppingToExpense: (itemIds: string[], prefill: ExpensePrefill) => void;
+  retryShoppingCleanup: () => Promise<void>;
+  dismissShoppingCleanup: () => void;
+  resumePendingShoppingCheckout: (checkoutId?: string) => Promise<void>;
+  dismissPendingCheckoutRecovery: (checkoutId?: string) => Promise<void>;
   pendingOpenShopping: boolean;
   consumePendingOpenShopping: () => void;
+
+  // Categories Registry
+  customCategories: CustomCategory[];
+  categoryRegistry: CategoryRegistry;
 
   // Real-time Collections
   activity: ActivityEntry[];
@@ -112,10 +151,12 @@ interface NidoContextValue {
   recentTransactions: Transaction[];
   budget: MonthlyBudget | null;
   currentMonthBudget: MonthlyBudget | null;
+  categoryBudgets: CategoryBudgetLimit[];
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
   shoppingItems: ShoppingItem[];
+  shoppingCatalog: ShoppingCatalogItem[];
 
   // Repository & Feedback
   repo: HouseholdRepository;
@@ -164,12 +205,22 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [recurring, setRecurring] = useState<RecurringExpense[]>([]);
   const [rawMonthTransactions, setRawMonthTransactions] = useState<Transaction[]>([]);
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
-  const [budget, setBudget] = useState<MonthlyBudget | null>(null);
-  const [currentMonthBudget, setCurrentMonthBudget] = useState<MonthlyBudget | null>(null);
+  const [rawBudget, setRawBudget] = useState<MonthlyBudget | null>(null);
+  const [rawCurrentMonthBudget, setRawCurrentMonthBudget] = useState<MonthlyBudget | null>(null);
+  const [selectedCategoryBudgets, setSelectedCategoryBudgets] = useState<CategoryBudgetLimit[]>([]);
+  const [currentCategoryBudgets, setCurrentCategoryBudgets] = useState<CategoryBudgetLimit[]>([]);
+  const [customCategories, setCustomCategories] = useState<CustomCategory[]>([]);
   const [monthClosures, setMonthClosures] = useState<MonthClosure[]>([]);
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
   const [goalMovements, setGoalMovements] = useState<GoalMovement[]>([]);
   const [shoppingItems, setShoppingItems] = useState<ShoppingItem[]>([]);
+  const [shoppingCatalog, setShoppingCatalog] = useState<ShoppingCatalogItem[]>([]);
+  const [pendingShoppingCheckouts, setPendingShoppingCheckouts] = useState<
+    PendingShoppingCheckout[]
+  >([]);
+  const [localPendingCheckout, setLocalPendingCheckout] =
+    useState<LocalPendingShoppingCheckout | null>(null);
+  const [resumingShoppingCheckout, setResumingShoppingCheckout] = useState(false);
   const [seedPending, setSeedPending] = useState(false);
   const [seedingDefaults, setSeedingDefaults] = useState(false);
 
@@ -178,6 +229,22 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [focusMensualSection, setFocusMensualSection] = useState<'plantillas' | null>(null);
   const [quickExpenseOpen, setQuickExpenseOpen] = useState(false);
   const [quickExpensePrefill, setQuickExpensePrefill] = useState<ExpensePrefill | null>(null);
+  const [shoppingOpen, setShoppingOpen] = useState(false);
+  const [pendingShoppingCleanupSnapshots, setPendingShoppingCleanupSnapshots] = useState<
+    ShoppingCheckoutItemSnapshot[]
+  >([]);
+  const shoppingItemsRef = useRef<ShoppingItem[]>(shoppingItems);
+  const resumeCheckoutInFlightRef = useRef(false);
+  useEffect(() => {
+    shoppingItemsRef.current = shoppingItems;
+  }, [shoppingItems]);
+  useEffect(() => {
+    setPendingShoppingCleanupSnapshots([]);
+  }, [householdId]);
+  const pendingShoppingCleanupIds = useMemo(
+    () => pendingShoppingCleanupSnapshots.map((s) => s.id),
+    [pendingShoppingCleanupSnapshots]
+  );
   const [pendingOpenShopping, setPendingOpenShopping] = useState(false);
   const [noticeSettingsTick, setNoticeSettingsTick] = useState(0);
   const quickExpenseOnSavedRef = useRef<(() => Promise<void> | void) | null>(null);
@@ -201,6 +268,10 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const consumePendingOpenShopping = useCallback(() => {
     setPendingOpenShopping(false);
+  }, []);
+
+  const openShoppingList = useCallback(() => {
+    setShoppingOpen(true);
   }, []);
 
   const clearFocusMensualSection = useCallback(() => {
@@ -252,6 +323,8 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const showToast = useCallback((msg: string) => {
+    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+    setUndoToast(null);
     setToastMessage(msg);
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     toastTimerRef.current = window.setTimeout(() => setToastMessage(null), 3500);
@@ -367,7 +440,10 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // 1) Base subscriptions always active once inside a household
   useEffect(() => {
-    if (!householdId || !viewerUid) return;
+    if (!householdId || !viewerUid) {
+      setCustomCategories([]);
+      return;
+    }
     const onErr = (e: Error) => {
       setHouseholdError(
         toUserFriendlyErrorMessage(e, 'No se pudieron sincronizar los datos del hogar.')
@@ -375,9 +451,11 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
     const unsubH = repo.subscribeHousehold(householdId, setHousehold, onErr);
     const unsubM = repo.subscribeMembers(householdId, setMembers, onErr);
+    const unsubCat = repo.subscribeCustomCategories(householdId, setCustomCategories, onErr);
     return () => {
       unsubH();
       unsubM();
+      unsubCat();
     };
   }, [householdId, viewerUid, repo]);
 
@@ -501,42 +579,74 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       effectiveTab === 'ahorros' ||
       (uiMode === 'avanzado' && effectiveTab === 'ajustes');
     if (!householdId || !viewerUid || !needed) {
-      setCurrentMonthBudget(null);
+      setRawCurrentMonthBudget(null);
+      setCurrentCategoryBudgets([]);
       return;
     }
     const currentMonthKey = getCurrentMonthKeyLocal();
     const onErr = (e: Error) =>
       setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar el presupuesto del mes.'));
-    return repo.subscribeBudget(householdId, currentMonthKey, setCurrentMonthBudget, onErr);
+    const unsubB = repo.subscribeBudget(householdId, currentMonthKey, setRawCurrentMonthBudget, onErr);
+    const unsubCb = repo.subscribeCategoryBudgets(
+      householdId,
+      currentMonthKey,
+      setCurrentCategoryBudgets,
+      onErr
+    );
+    return () => {
+      unsubB();
+      unsubCb();
+    };
   }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
 
   // 9) Selected month budget (Avanzado · Mensual only)
   useEffect(() => {
     if (!householdId || !viewerUid || uiMode !== 'avanzado' || effectiveTab !== 'mensual') {
-      setBudget(null);
+      setRawBudget(null);
+      setSelectedCategoryBudgets([]);
       return;
     }
     const onErr = (e: Error) =>
       setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo cargar el presupuesto del mes.'));
-    return repo.subscribeBudget(householdId, selectedMonthKey, setBudget, onErr);
+    const unsubB = repo.subscribeBudget(householdId, selectedMonthKey, setRawBudget, onErr);
+    const unsubCb = repo.subscribeCategoryBudgets(
+      householdId,
+      selectedMonthKey,
+      setSelectedCategoryBudgets,
+      onErr
+    );
+    return () => {
+      unsubB();
+      unsubCb();
+    };
   }, [householdId, viewerUid, uiMode, effectiveTab, selectedMonthKey, repo]);
 
-  // 10) Month closures (Inicio, Mensual, Ahorros, Avanzado Ajustes, or while quick-add expense modal is open)
+  const currentMonthBudget = useMemo(
+    () =>
+      mergeMonthlyAndCustomBudgetLimits(
+        rawCurrentMonthBudget,
+        currentCategoryBudgets,
+        getCurrentMonthKeyLocal()
+      ),
+    [rawCurrentMonthBudget, currentCategoryBudgets]
+  );
+
+  const budget = useMemo(
+    () =>
+      mergeMonthlyAndCustomBudgetLimits(rawBudget, selectedCategoryBudgets, selectedMonthKey),
+    [rawBudget, selectedCategoryBudgets, selectedMonthKey]
+  );
+
+  // 10) Month closures (always active inside a household so QuickExpenseModal and ShoppingCheckoutPanel enforce closed months from any tab)
   useEffect(() => {
-    const needed =
-      effectiveTab === 'inicio' ||
-      effectiveTab === 'mensual' ||
-      effectiveTab === 'ahorros' ||
-      (uiMode === 'avanzado' && effectiveTab === 'ajustes') ||
-      quickExpenseOpen;
-    if (!householdId || !viewerUid || !needed) {
+    if (!householdId || !viewerUid) {
       setMonthClosures([]);
       return;
     }
     const onErr = (e: Error) =>
       setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron comprobar los meses cerrados.'));
     return repo.subscribeMonthClosures(householdId, setMonthClosures, onErr);
-  }, [householdId, viewerUid, uiMode, effectiveTab, quickExpenseOpen, repo]);
+  }, [householdId, viewerUid, repo]);
 
   // 12) Goals & Goal movements (Inicio or Ahorros)
   useEffect(() => {
@@ -555,16 +665,67 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [householdId, viewerUid, effectiveTab, repo]);
 
-  // 13) Shopping list (Inicio only)
+  // 13) Shopping list (Inicio or whenever Shopping drawer is open)
   useEffect(() => {
-    if (!householdId || !viewerUid || effectiveTab !== 'inicio') {
+    if (!householdId || !viewerUid || (effectiveTab !== 'inicio' && !shoppingOpen)) {
       setShoppingItems([]);
       return;
     }
     const onErr = (e: Error) =>
       setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudo sincronizar la lista de la compra.'));
     return repo.subscribeShopping(householdId, setShoppingItems, onErr);
-  }, [householdId, viewerUid, effectiveTab, repo]);
+  }, [householdId, viewerUid, effectiveTab, shoppingOpen, repo]);
+
+  // 14) Shopping household catalog (only when Shopping drawer is open)
+  useEffect(() => {
+    if (!householdId || !viewerUid || !shoppingOpen) {
+      setShoppingCatalog([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudo cargar el catálogo de la compra.')
+      );
+    return repo.subscribeShoppingCatalog(householdId, setShoppingCatalog, onErr);
+  }, [householdId, viewerUid, shoppingOpen, repo]);
+
+  // 15) Pending durable shopping checkouts (0 docs in steady state; enables cross-device & reload recovery)
+  useEffect(() => {
+    if (!householdId || !viewerUid) {
+      setPendingShoppingCheckouts([]);
+      setLocalPendingCheckout(null);
+      return;
+    }
+    setLocalPendingCheckout(loadLocalPendingCheckout(householdId, viewerUid));
+    const onErr = (e: Error) =>
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudo comprobar las compras pendientes de limpieza.')
+      );
+    return repo.subscribePendingShoppingCheckouts(
+      householdId,
+      viewerUid,
+      setPendingShoppingCheckouts,
+      onErr
+    );
+  }, [householdId, viewerUid, repo]);
+
+  const refreshLocalPendingCheckout = useCallback(() => {
+    if (!householdId || !viewerUid) {
+      setLocalPendingCheckout(null);
+      return;
+    }
+    setLocalPendingCheckout(loadLocalPendingCheckout(householdId, viewerUid));
+  }, [householdId, viewerUid]);
+
+  usePwaUpdateBlock(
+    resumingShoppingCheckout || localPendingCheckout?.state === 'committing',
+    'write'
+  );
+
+  const categoryRegistry = useMemo(
+    () => buildCategoryRegistry(customCategories, household?.categoryColors),
+    [customCategories, household?.categoryColors]
+  );
 
   const effectiveSplitPctA = useMemo(() => {
     if (!household) return 50;
@@ -577,6 +738,10 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const logout = useCallback(async () => {
+    globalSearchSessionCache.clearAll();
+    clearAllLocalPendingCheckouts();
+    setLocalPendingCheckout(null);
+    setPendingShoppingCheckouts([]);
     if (isDemoMode) {
       setIsDemoMode(false);
       setHouseholdId(null);
@@ -587,10 +752,17 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [isDemoMode]);
 
   const enterDemoMode = useCallback(() => {
+    globalSearchSessionCache.clearAll();
+    clearAllLocalPendingCheckouts();
+    setLocalPendingCheckout(null);
     setIsDemoMode(true);
   }, []);
 
   const exitDemoMode = useCallback(() => {
+    globalSearchSessionCache.clearAll();
+    clearAllLocalPendingCheckouts();
+    setLocalPendingCheckout(null);
+    setPendingShoppingCheckouts([]);
     setIsDemoMode(false);
     setHouseholdId(null);
     setHousehold(null);
@@ -644,21 +816,286 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const toggleUiMode = useCallback(async () => {
     if (!householdId || !currentUserProfile) return;
     const next: UiMode = uiMode === 'sencillo' ? 'avanzado' : 'sencillo';
-    await repo.updateMemberUiMode(householdId, currentUserProfile.uid, next);
-    if (next === 'sencillo' && activeTab === 'ajustes') {
-      setActiveTab('inicio');
+    try {
+      await repo.updateMemberUiMode(householdId, currentUserProfile.uid, next);
+      if (next === 'sencillo' && activeTab === 'ajustes') {
+        setActiveTab('inicio');
+      }
+      showToast(next === 'avanzado' ? 'Modo Avanzado activado' : 'Modo Sencillo activado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo cambiar el modo de interfaz.'));
     }
-    showToast(next === 'avanzado' ? 'Modo Avanzado activado' : 'Modo Sencillo activado');
   }, [householdId, currentUserProfile, uiMode, activeTab, repo, showToast]);
 
   const openHabitualSetupInAvanzado = useCallback(async () => {
-    if (uiMode !== 'avanzado' && householdId && currentUserProfile) {
-      await repo.updateMemberUiMode(householdId, currentUserProfile.uid, 'avanzado');
+    try {
+      if (uiMode !== 'avanzado' && householdId && currentUserProfile) {
+        await repo.updateMemberUiMode(householdId, currentUserProfile.uid, 'avanzado');
+      }
+      setSelectedMonthKey(getCurrentMonthKeyLocal());
+      setFocusMensualSection('plantillas');
+      setActiveTab('mensual');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo abrir la configuración de habituales.'));
     }
-    setSelectedMonthKey(getCurrentMonthKeyLocal());
-    setFocusMensualSection('plantillas');
-    setActiveTab('mensual');
-  }, [uiMode, householdId, currentUserProfile, repo]);
+  }, [uiMode, householdId, currentUserProfile, repo, showToast]);
+
+  const registerPendingShoppingCleanup = useCallback(
+    (snapshots: ShoppingCheckoutItemSnapshot[]) => {
+      setPendingShoppingCleanupSnapshots(snapshots);
+    },
+    []
+  );
+
+  const openConvertShoppingToExpense = useCallback(
+    (itemIds: string[], prefill: ExpensePrefill) => {
+      const targetIdSet = new Set(itemIds);
+      const capturedSnapshots: ShoppingCheckoutItemSnapshot[] = shoppingItemsRef.current
+        .filter((item) => targetIdSet.has(item.id) && item.done)
+        .map((item) => ({
+          id: item.id,
+          text: item.text,
+          qty: item.qty,
+          unit: item.unit || '',
+          done: Boolean(item.done),
+          updatedAt: item.updatedAt || '',
+        }));
+      openQuickExpenseWithPrefill(prefill, async () => {
+        if (!householdId || capturedSnapshots.length === 0) return;
+        const reconciled = reconcileShoppingItemsForCleanup(
+          capturedSnapshots,
+          shoppingItemsRef.current
+        );
+        const skipped = reconciled.skippedModified.length + reconciled.skippedUnchecked.length;
+        if (reconciled.safeToDeleteIds.length === 0) {
+          setPendingShoppingCleanupSnapshots([]);
+          if (skipped > 0) {
+            showToast(
+              `Gasto guardado. Se conservaron ${skipped} productos modificados o desmarcados mientras tanto.`
+            );
+          }
+          return;
+        }
+        try {
+          await repo.deleteShoppingItemsBulk(householdId, reconciled.safeToDeleteIds);
+          setPendingShoppingCleanupSnapshots([]);
+          showToast(
+            skipped > 0
+              ? `Gasto guardado, ${reconciled.safeToDeleteIds.length} limpiados y ${skipped} conservados por cambios recientes`
+              : 'Gasto de compra guardado y marcados limpiados'
+          );
+        } catch {
+          const safeSet = new Set(reconciled.safeToDeleteIds);
+          setPendingShoppingCleanupSnapshots(
+            capturedSnapshots.filter((snap) => safeSet.has(snap.id))
+          );
+          showToast(
+            'El gasto se ha guardado, pero no se pudieron limpiar los marcados. Puedes reintentar sin duplicar el gasto.'
+          );
+        }
+      });
+    },
+    [householdId, openQuickExpenseWithPrefill, repo, showToast]
+  );
+
+  const retryShoppingCleanup = useCallback(async () => {
+    if (!householdId || pendingShoppingCleanupSnapshots.length === 0) return;
+    const reconciled = reconcileShoppingItemsForCleanup(
+      pendingShoppingCleanupSnapshots,
+      shoppingItemsRef.current
+    );
+    const skipped = reconciled.skippedModified.length + reconciled.skippedUnchecked.length;
+    if (reconciled.safeToDeleteIds.length === 0) {
+      setPendingShoppingCleanupSnapshots([]);
+      showToast(
+        skipped > 0
+          ? `No se borró ningún producto: ${skipped} fueron modificados o desmarcados recientemente.`
+          : 'Los productos ya no estaban en la lista.'
+      );
+      return;
+    }
+    try {
+      await repo.deleteShoppingItemsBulk(householdId, reconciled.safeToDeleteIds);
+      setPendingShoppingCleanupSnapshots([]);
+      showToast(
+        skipped > 0
+          ? `Retirados ${reconciled.safeToDeleteIds.length} productos y conservados ${skipped} modificados recientemente`
+          : 'Productos marcados eliminados de la lista'
+      );
+    } catch (err) {
+      showToast(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudieron limpiar los marcados. Vuelve a intentarlo.'
+        )
+      );
+    }
+  }, [householdId, pendingShoppingCleanupSnapshots, repo, showToast]);
+
+  const dismissShoppingCleanup = useCallback(() => {
+    setPendingShoppingCleanupSnapshots([]);
+  }, []);
+
+  const resumePendingShoppingCheckout = useCallback(
+    async (checkoutId?: string) => {
+      if (!householdId || !currentUserProfile || !viewerUid) return;
+      if (!isDemoMode && typeof navigator !== 'undefined' && navigator.onLine === false) {
+        showToast('Necesitas conexión a internet para comprobar y completar esta compra en el servidor.');
+        return;
+      }
+
+      const local = loadLocalPendingCheckout(householdId, viewerUid);
+      const targetLocal =
+        local && (!checkoutId || local.checkoutId === checkoutId) ? local : null;
+      const targetServer = pendingShoppingCheckouts.find((c) =>
+        checkoutId ? c.id === checkoutId : true
+      );
+
+      if (!targetLocal && !targetServer) return;
+
+      setResumingShoppingCheckout(true);
+      try {
+        if (targetLocal) {
+          const result = await executeDurableShoppingCheckout({
+            input: {
+              checkoutId: targetLocal.checkoutId,
+              monthKey: targetLocal.monthKey,
+              concept: targetLocal.concept,
+              amount: targetLocal.amount,
+              date: targetLocal.date,
+              paidBy: targetLocal.paidBy,
+              splitPctA: targetLocal.splitPctA,
+              isPrivate: targetLocal.isPrivate,
+              notes: targetLocal.notes,
+              snapshots: targetLocal.snapshots,
+            },
+            inFlightRef: resumeCheckoutInFlightRef,
+            commitPhase1: (phase1Input) =>
+              repo.commitShoppingCheckoutPhase1(householdId, phase1Input, currentUserProfile),
+            cleanupBatch: (id, snapsById) =>
+              repo.cleanupShoppingCheckoutBatch(householdId, id, snapsById),
+            onPhase1Confirmed: (_expenseId, pendingIds) => {
+              globalSearchSessionCache.invalidateHousehold(householdId);
+              if (pendingIds.length > 0) {
+                const updated: LocalPendingShoppingCheckout = {
+                  ...targetLocal,
+                  state: 'cleanup_pending',
+                  updatedAt: new Date().toISOString(),
+                };
+                saveLocalPendingCheckout(updated);
+                setLocalPendingCheckout(updated);
+              }
+            },
+            onCleared: () => {
+              clearLocalPendingCheckout(householdId, viewerUid);
+              setLocalPendingCheckout(null);
+            },
+          });
+
+          if (result.status === 'ignored_in_flight') return;
+          if (result.status === 'overlap_conflict') {
+            showToast(
+              'Esa compra ya fue procesada o modificada desde otro dispositivo. No se ha duplicado ningún gasto.'
+            );
+            return;
+          }
+          if (result.status === 'all_modified_or_gone') {
+            showToast('Los productos seleccionados cambiaron o ya no estaban marcados. No se creó gasto.');
+            return;
+          }
+          if (result.status === 'phase1_failed') {
+            showToast(
+              toUserFriendlyErrorMessage(
+                result.error,
+                'No se pudo comprobar la compra en el servidor. Inténtalo de nuevo con conexión.'
+              )
+            );
+            return;
+          }
+          if (result.status === 'cleanup_partial') {
+            showToast(
+              `Gasto confirmado sin duplicar, pero quedan ${result.remainingItemIds.length} productos por retirar. Puedes reintentar.`
+            );
+            return;
+          }
+          const concurrentSuffix =
+            result.skippedConcurrentCount > 0
+              ? ` · ${result.skippedConcurrentCount} conservados por cambios recientes`
+              : '';
+          showToast(
+            result.reusedExistingExpense
+              ? `Compra ya confirmada en el servidor (sin duplicar gasto)${
+                  result.deletedCount > 0 ? ` · ${result.deletedCount} retirados` : ''
+                }${concurrentSuffix}`
+              : `Compra completada y ${result.deletedCount} productos retirados${concurrentSuffix}`
+          );
+          return;
+        }
+
+        if (targetServer) {
+          if (resumeCheckoutInFlightRef.current) return;
+          resumeCheckoutInFlightRef.current = true;
+          try {
+            let remaining = [...targetServer.pendingItemIds];
+            let deletedCount = 0;
+            let skippedCount = 0;
+            let guard = 0;
+            while (remaining.length > 0 && guard < 15) {
+              guard += 1;
+              const batch = await repo.cleanupShoppingCheckoutBatch(householdId, targetServer.id);
+              deletedCount += batch.deletedIds.length;
+              skippedCount += batch.skippedConcurrentIds.length;
+              remaining = batch.remainingItemIds;
+              if (batch.completed) break;
+            }
+            const skippedSuffix =
+              skippedCount > 0 ? ` · ${skippedCount} conservados por cambios recientes` : '';
+            showToast(
+              `Limpieza completada (${deletedCount} ${
+                deletedCount === 1 ? 'producto retirado' : 'productos retirados'
+              })${skippedSuffix}`
+            );
+          } finally {
+            resumeCheckoutInFlightRef.current = false;
+          }
+        }
+      } catch (err) {
+        showToast(
+          toUserFriendlyErrorMessage(
+            err,
+            'No se pudo completar la limpieza pendiente. Inténtalo de nuevo.'
+          )
+        );
+      } finally {
+        setResumingShoppingCheckout(false);
+      }
+    },
+    [householdId, currentUserProfile, viewerUid, isDemoMode, pendingShoppingCheckouts, repo, showToast]
+  );
+
+  const dismissPendingCheckoutRecovery = useCallback(
+    async (checkoutId?: string) => {
+      if (!householdId || !viewerUid) return;
+      const local = loadLocalPendingCheckout(householdId, viewerUid);
+      if (local && (!checkoutId || local.checkoutId === checkoutId)) {
+        clearLocalPendingCheckout(householdId, viewerUid);
+        setLocalPendingCheckout(null);
+      }
+      const serverTarget = pendingShoppingCheckouts.find((c) =>
+        checkoutId ? c.id === checkoutId : true
+      );
+      if (serverTarget) {
+        try {
+          await repo.dismissPendingShoppingCheckout(householdId, serverTarget.id);
+        } catch (err) {
+          showToast(
+            toUserFriendlyErrorMessage(err, 'No se pudo descartar el aviso de limpieza.')
+          );
+        }
+      }
+    },
+    [householdId, viewerUid, pendingShoppingCheckouts, repo, showToast]
+  );
 
   // Apply PWA deep link ONLY once auth + household + members are ready, then clean URL params
   useEffect(() => {
@@ -672,8 +1109,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setQuickExpenseOpen(true);
     }
     if (dl.open === 'shopping') {
-      setActiveTab('inicio');
-      setPendingOpenShopping(true);
+      setShoppingOpen(true);
     } else if (dl.tab) {
       setActiveTab(uiMode === 'sencillo' && dl.tab === 'ajustes' ? 'inicio' : dl.tab);
     }
@@ -785,8 +1221,24 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     quickExpenseOnSaved: quickExpenseOnSavedRef.current,
     openQuickExpenseWithPrefill,
     clearQuickExpensePrefill,
+    shoppingOpen,
+    setShoppingOpen,
+    openShoppingList,
+    pendingShoppingCleanupIds,
+    pendingShoppingCheckouts,
+    localPendingCheckout,
+    resumingShoppingCheckout,
+    refreshLocalPendingCheckout,
+    registerPendingShoppingCleanup,
+    openConvertShoppingToExpense,
+    retryShoppingCleanup,
+    dismissShoppingCleanup,
+    resumePendingShoppingCheckout,
+    dismissPendingCheckoutRecovery,
     pendingOpenShopping,
     consumePendingOpenShopping,
+    customCategories,
+    categoryRegistry,
     activity,
     initialCosts,
     checklist,
@@ -797,10 +1249,12 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     recentTransactions,
     budget,
     currentMonthBudget,
+    categoryBudgets: currentCategoryBudgets,
     monthClosures,
     goals,
     goalMovements,
     shoppingItems,
+    shoppingCatalog,
     repo,
     toastMessage,
     showToast,

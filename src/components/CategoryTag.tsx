@@ -1,14 +1,15 @@
 import React from 'react';
 import { useNido } from '../context/NidoContext';
-import { hexToRgba, resolveCategoryColor } from '../domain/categoryPalette';
-import { TRANSACTION_CATEGORY_LABELS } from '../domain/presets';
+import { hexToRgba } from '../domain/categoryPalette';
 import type { CategoryColorMap, TransactionCategory } from '../types/nido';
+import { CategoryIcon } from './CategoryIcon';
 
 interface CategoryTagProps {
   category: TransactionCategory;
   customColors?: CategoryColorMap;
   size?: 'xs' | 'sm';
   labelOverride?: string;
+  showIcon?: boolean;
   className?: string;
 }
 
@@ -17,11 +18,15 @@ export const CategoryTag: React.FC<CategoryTagProps> = ({
   customColors,
   size = 'sm',
   labelOverride,
+  showIcon = false,
   className = '',
 }) => {
-  const { household } = useNido();
-  const hex = resolveCategoryColor(category, customColors ?? household?.categoryColors);
-  const label = labelOverride ?? TRANSACTION_CATEGORY_LABELS[category];
+  const { categoryRegistry } = useNido();
+  const meta = categoryRegistry.getMeta(category);
+  const overrideColor = customColors?.[category];
+  const hex =
+    overrideColor && /^#[0-9A-Fa-f]{6}$/.test(overrideColor) ? overrideColor : meta.color;
+  const label = labelOverride ?? meta.label;
 
   return (
     <span
@@ -38,7 +43,13 @@ export const CategoryTag: React.FC<CategoryTagProps> = ({
         className={`rounded-full shrink-0 ${size === 'xs' ? 'w-2 h-2' : 'w-2.5 h-2.5'}`}
         style={{ backgroundColor: hex }}
       />
+      {showIcon && <CategoryIcon icon={meta.icon} className={size === 'xs' ? 'w-3 h-3 shrink-0' : 'w-3.5 h-3.5 shrink-0'} />}
       <span className="truncate">{label}</span>
+      {meta.archived && (
+        <span className="text-[10px] font-medium text-slate-500 dark:text-slate-400">
+          (Archivada)
+        </span>
+      )}
     </span>
   );
 };

@@ -452,6 +452,7 @@ export interface CategoryBudgetProgress {
   category: ExpenseCategory;
   spent: number;
   limit: number;
+  hasLimit?: boolean;
   pct: number;
   status: BudgetTrafficLight;
   isRecurringOnly: boolean;
@@ -487,20 +488,34 @@ export function computeBudgetProgress(
   const result: CategoryBudgetProgress[] = [];
   for (const category of categories) {
     const spent = roundCents(spentMap.get(category) ?? 0);
-    const limit = roundCents(Number(limits[category]) || 0);
-    if (spent === 0 && limit === 0) continue;
+    const rawLimit = Object.prototype.hasOwnProperty.call(limits, category)
+      ? limits[category]
+      : undefined;
+    const hasLimit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit >= 0;
+    const limit = hasLimit ? roundCents(rawLimit) : 0;
+    if (spent === 0 && !hasLimit) continue;
     const isRecurringOnly =
       hasRecurringByCat.has(category) && !hasNonRecurringByCat.has(category);
     let status: BudgetTrafficLight = 'sin_limite';
     let pct = 0;
-    if (limit > 0) {
-      pct = Math.round((spent / limit) * 100);
-      if (spent > limit) status = 'rojo';
-      else if (isRecurringOnly) status = 'verde';
-      else if (pct < 80) status = 'verde';
-      else status = 'ambar';
+    if (hasLimit) {
+      if (limit === 0) {
+        if (spent > 0) {
+          status = 'rojo';
+          pct = 100;
+        } else {
+          status = 'verde';
+          pct = 0;
+        }
+      } else {
+        pct = Math.round((spent / limit) * 100);
+        if (spent > limit) status = 'rojo';
+        else if (isRecurringOnly) status = 'verde';
+        else if (pct < 80) status = 'verde';
+        else status = 'ambar';
+      }
     }
-    result.push({ category, spent, limit, pct, status, isRecurringOnly });
+    result.push({ category, spent, limit, hasLimit, pct, status, isRecurringOnly });
   }
 
   return result.sort((a, b) => b.spent - a.spent);
@@ -524,7 +539,11 @@ export function getBudgetThresholdAlerts(
   const progress = computeBudgetProgress(transactions, budget);
   return progress
     .filter((bp) => {
-      if (bp.limit <= 0) return false;
+      const hasLimit = bp.hasLimit ?? bp.limit > 0;
+      if (!hasLimit) return false;
+      if (bp.limit === 0) {
+        return bp.spent > 0;
+      }
       const ratioPct = (bp.spent / bp.limit) * 100;
       if (ratioPct < thresholdPct) return false;
       if (bp.isRecurringOnly && bp.spent <= bp.limit) {
@@ -534,19 +553,23 @@ export function getBudgetThresholdAlerts(
     })
     .map((bp) => {
       const exceeded = bp.spent > bp.limit;
-      const atLimit = !exceeded && Math.abs(bp.spent - bp.limit) < 0.005;
+      const atLimit = bp.limit > 0 && !exceeded && Math.abs(bp.spent - bp.limit) < 0.005;
       const overAmount = exceeded ? roundCents(bp.spent - bp.limit) : 0;
       return {
         category: bp.category,
         spent: bp.spent,
         limit: bp.limit,
-        pct: Math.round((bp.spent / bp.limit) * 100),
+        pct: bp.limit > 0 ? Math.round((bp.spent / bp.limit) * 100) : 100,
         atLimit,
         exceeded,
         overAmount,
       };
     })
-    .sort((a, b) => b.spent / b.limit - a.spent / a.limit);
+    .sort((a, b) => {
+      const ratioA = a.limit > 0 ? a.spent / a.limit : Number.POSITIVE_INFINITY;
+      const ratioB = b.limit > 0 ? b.spent / b.limit : Number.POSITIVE_INFINITY;
+      return ratioB - ratioA || b.overAmount - a.overAmount;
+    });
 }
 
 // ─── Global Transaction Search & 6-Month Category Comparison ─────────────────
@@ -567,7 +590,8 @@ export interface GlobalSearchCriteria {
 
 export function filterGlobalTransactions(
   transactions: Transaction[],
-  criteria: GlobalSearchCriteria
+  criteria: GlobalSearchCriteria,
+  categoryLabels: Record<string, string> = TRANSACTION_CATEGORY_LABELS
 ): Transaction[] {
   const qText = normalizeSearchText(criteria.text);
   const qAmtRaw = criteria.amountQuery.trim().replace(/\s+/g, '').replace('€', '');
@@ -579,9 +603,8 @@ export function filterGlobalTransactions(
     .filter((tx) => {
       if (criteria.category !== 'todas' && tx.category !== criteria.category) return false;
       if (qText) {
-        const hay = normalizeSearchText(
-          `${tx.concept} ${tx.notes} ${TRANSACTION_CATEGORY_LABELS[tx.category] || tx.category}`
-        );
+        const catLabel = categoryLabels[tx.category] || TRANSACTION_CATEGORY_LABELS[tx.category] || tx.category;
+        const hay = normalizeSearchText(`${tx.concept} ${tx.notes} ${catLabel}`);
         if (!hay.includes(qText)) return false;
       }
       if (qAmtRaw) {
@@ -951,11 +974,20 @@ export function computeSavingsCapacity(
   }
 
   const limits = options?.budget?.limits ?? {};
+  const activeRecurringCats = new Set(
+    recurringList.filter((r) => r.active && (Number(r.amount) || 0) > 0).map((r) => r.category)
+  );
+  const variableCustomSum = Object.entries(limits).reduce((acc, [cat, val]) => {
+    if (cat.startsWith('cat_') && !activeRecurringCats.has(cat)) {
+      return acc + Math.max(0, Number(val) || 0);
+    }
+    return acc;
+  }, 0);
   const variableBudgetsMonthly = roundCents(
     VARIABLE_BUDGET_CATEGORIES.reduce(
       (acc, cat) => acc + Math.max(0, Number(limits[cat]) || 0),
       0
-    )
+    ) + variableCustomSum
   );
 
   let habitualSpend: number;

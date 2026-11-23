@@ -10,7 +10,8 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test:unit": "npx tsx --test src/domain/finance.test.ts",
-    "test:rules": "firebase emulators:exec --only firestore \"npx tsx --test firestore.rules.test.ts\""
+    "test:rules": "firebase emulators:exec --only firestore \"npx tsx --test firestore.rules.test.ts\"",
+    "catalog:update": "node scripts/update-mercadona-catalog.mjs"
   },
   "dependencies": {
     "@firebase/eslint-plugin-security-rules": "^0.0.2",

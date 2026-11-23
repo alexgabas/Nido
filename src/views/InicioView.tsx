@@ -20,7 +20,6 @@ import {
 import { CategoryTag } from '../components/CategoryTag';
 import { DonutChart, MonthlyBarChart } from '../components/Charts';
 import { ONBOARDING_SEEN_KEY, OnboardingWalkthrough } from '../components/OnboardingWalkthrough';
-import { ShoppingListSection } from '../components/ShoppingListSection';
 import { useNido } from '../context/NidoContext';
 import {
   buildLastBackupStorageKey,
@@ -28,7 +27,6 @@ import {
   loadLastBackupRequestedAt,
   shouldShowBackupReminder,
 } from '../domain/backup';
-import { resolveCategoryColor } from '../domain/categoryPalette';
 import {
   calculateCoupleBalance,
   computeFurnitureSummary,
@@ -36,6 +34,7 @@ import {
   formatCoupleBalanceSecondPerson,
   formatDateES,
   formatEUR,
+  formatLocalDateISO,
   formatMonthLabelES,
   formatMonthShortES,
   getBudgetThresholdAlerts,
@@ -48,7 +47,6 @@ import {
   roundCents,
   shiftMonthKey,
 } from '../domain/finance';
-import { EXPENSE_CATEGORY_LABELS } from '../domain/presets';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import type { ExpenseCategory } from '../types/nido';
 
@@ -78,25 +76,26 @@ export const InicioView: React.FC = () => {
     goalMovements,
     shoppingItems,
     activity,
+    categoryRegistry,
+    openShoppingList,
+    pendingShoppingCleanupIds,
+    pendingShoppingCheckouts,
+    localPendingCheckout,
+    resumingShoppingCheckout,
+    retryShoppingCleanup,
+    dismissShoppingCleanup,
+    resumePendingShoppingCheckout,
+    dismissPendingCheckoutRecovery,
     repo,
     showToast,
-    pendingOpenShopping,
-    consumePendingOpenShopping,
   } = useNido();
 
-  const [shoppingOpen, setShoppingOpen] = useState(false);
   const [incomeModalOpen, setIncomeModalOpen] = useState(false);
   const [draftIncomeA, setDraftIncomeA] = useState('');
   const [draftIncomeB, setDraftIncomeB] = useState('');
   const [savingIncomes, setSavingIncomes] = useState(false);
   const [incomeError, setIncomeError] = useState<string | null>(null);
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
-
-  useEffect(() => {
-    if (!pendingOpenShopping) return;
-    setShoppingOpen(true);
-    consumePendingOpenShopping();
-  }, [pendingOpenShopping, consumePendingOpenShopping]);
 
   useEffect(() => {
     if (isDemoMode || !household?.id) return;
@@ -177,7 +176,7 @@ export const InicioView: React.FC = () => {
   const currentMonthBudgetTotal = useMemo(() => {
     if (!currentMonthBudget || currentMonthBudget.monthKey !== currentMonthKey) return 0;
     return roundCents(
-      Object.values(currentMonthBudget.limits ?? {}).reduce(
+      Object.values(currentMonthBudget.limits ?? {}).reduce<number>(
         (sum, v) => sum + Math.max(0, Number(v) || 0),
         0
       )
@@ -238,12 +237,12 @@ export const InicioView: React.FC = () => {
     }
     return Array.from(map.entries())
       .map(([cat, value]) => ({
-        label: EXPENSE_CATEGORY_LABELS[cat] || cat,
+        label: categoryRegistry.getLabel(cat),
         value: roundCents(value),
-        color: resolveCategoryColor(cat, household?.categoryColors),
+        color: categoryRegistry.getColor(cat),
       }))
       .sort((a, b) => b.value - a.value);
-  }, [currentMonthTx, household?.categoryColors]);
+  }, [currentMonthTx, categoryRegistry]);
 
   const furnitureSummary = useMemo(
     () => computeFurnitureSummary(furnitureItems),
@@ -442,6 +441,118 @@ export const InicioView: React.FC = () => {
     </section>
   );
 
+  const firstServerPendingCheckout = pendingShoppingCheckouts[0] ?? null;
+  const hasDurablePendingCheckout = Boolean(localPendingCheckout || firstServerPendingCheckout);
+
+  const shoppingCleanupBanner = (hasDurablePendingCheckout ||
+    pendingShoppingCleanupIds.length > 0) && (
+    <section
+      aria-label="Limpieza pendiente de lista de la compra"
+      className="rounded-2xl bg-amber-50 dark:bg-amber-950/35 border border-amber-300 dark:border-amber-700/60 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+    >
+      {localPendingCheckout ? (
+        <>
+          <div className="space-y-0.5">
+            <p className="text-xs font-bold text-amber-950 dark:text-amber-100">
+              {localPendingCheckout.state === 'committing'
+                ? `Hay una compra pendiente de comprobar (${formatEUR(localPendingCheckout.amount)})`
+                : `Compra confirmada con limpieza pendiente (${formatEUR(localPendingCheckout.amount)})`}
+            </p>
+            <p className="text-[11px] text-amber-900/90 dark:text-amber-200/90">
+              {localPendingCheckout.state === 'committing'
+                ? 'Se interrumpió el guardado. Comprobaremos en el servidor antes de actuar para no duplicar el gasto.'
+                : 'El gasto ya está guardado; puedes completar la retirada de productos sin duplicarlo.'}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={resumingShoppingCheckout}
+              onClick={() => void resumePendingShoppingCheckout(localPendingCheckout.checkoutId)}
+              className="min-h-[44px] px-3.5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-50 text-white text-xs font-bold"
+            >
+              {resumingShoppingCheckout
+                ? 'Comprobando...'
+                : localPendingCheckout.state === 'committing'
+                  ? 'Comprobar y completar'
+                  : 'Reanudar limpieza'}
+            </button>
+            <button
+              type="button"
+              disabled={resumingShoppingCheckout}
+              onClick={() =>
+                void dismissPendingCheckoutRecovery(localPendingCheckout.checkoutId)
+              }
+              className="min-h-[44px] px-3 rounded-xl border border-amber-300 dark:border-amber-700 text-xs font-semibold text-amber-950 dark:text-amber-100"
+            >
+              Descartar
+            </button>
+          </div>
+        </>
+      ) : firstServerPendingCheckout ? (
+        <>
+          <div className="space-y-0.5">
+            <p className="text-xs font-bold text-amber-950 dark:text-amber-100">
+              Gasto guardado, pero quedaron {firstServerPendingCheckout.pendingItemIds.length}{' '}
+              producto
+              {firstServerPendingCheckout.pendingItemIds.length === 1 ? '' : 's'} por retirar de la
+              lista
+            </p>
+            <p className="text-[11px] text-amber-900/90 dark:text-amber-200/90">
+              Puedes reanudar la limpieza desde este dispositivo sin duplicar el gasto.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={resumingShoppingCheckout}
+              onClick={() => void resumePendingShoppingCheckout(firstServerPendingCheckout.id)}
+              className="min-h-[44px] px-3.5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-50 text-white text-xs font-bold"
+            >
+              {resumingShoppingCheckout ? 'Limpiando...' : 'Reanudar limpieza'}
+            </button>
+            <button
+              type="button"
+              disabled={resumingShoppingCheckout}
+              onClick={() => void dismissPendingCheckoutRecovery(firstServerPendingCheckout.id)}
+              className="min-h-[44px] px-3 rounded-xl border border-amber-300 dark:border-amber-700 text-xs font-semibold text-amber-950 dark:text-amber-100"
+            >
+              Descartar
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="space-y-0.5">
+            <p className="text-xs font-bold text-amber-950 dark:text-amber-100">
+              Gasto guardado, pero quedaron {pendingShoppingCleanupIds.length} producto
+              {pendingShoppingCleanupIds.length === 1 ? '' : 's'} por retirar de la lista
+            </p>
+            <p className="text-[11px] text-amber-900/90 dark:text-amber-200/90">
+              Puedes reintentar la limpieza ahora sin duplicar el gasto.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => void retryShoppingCleanup()}
+              className="min-h-[44px] px-3.5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs font-bold"
+            >
+              Reintentar limpiar comprados
+            </button>
+            <button
+              type="button"
+              onClick={dismissShoppingCleanup}
+              className="min-h-[44px] px-3 rounded-xl border border-amber-300 dark:border-amber-700 text-xs font-semibold text-amber-950 dark:text-amber-100"
+            >
+              Descartar
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+
   // ─── MODO SENCILLO ──────────────────────────────────────────────────────────
   if (uiMode === 'sencillo') {
     const viewerName = currentMember?.displayName?.trim() || memberA?.displayName?.trim() || '';
@@ -459,6 +570,7 @@ export const InicioView: React.FC = () => {
         </header>
 
         {partnerMissingBanner}
+        {shoppingCleanupBanner}
 
         {/* Hero 1: Natural-language monthly spend */}
         <section
@@ -619,7 +731,7 @@ export const InicioView: React.FC = () => {
                     {alert.exceeded ? (
                       <>
                         Os habéis pasado en{' '}
-                        <strong>{EXPENSE_CATEGORY_LABELS[alert.category]}</strong> por{' '}
+                        <strong>{categoryRegistry.getLabel(alert.category)}</strong> por{' '}
                         <span className="tabular-nums font-semibold">
                           {formatEUR(alert.overAmount)}
                         </span>
@@ -627,12 +739,12 @@ export const InicioView: React.FC = () => {
                     ) : alert.atLimit ? (
                       <>
                         Habéis llegado al límite en{' '}
-                        <strong>{EXPENSE_CATEGORY_LABELS[alert.category]}</strong>
+                        <strong>{categoryRegistry.getLabel(alert.category)}</strong>
                       </>
                     ) : (
                       <>
                         Estáis cerca del límite en{' '}
-                        <strong>{EXPENSE_CATEGORY_LABELS[alert.category]}</strong>
+                        <strong>{categoryRegistry.getLabel(alert.category)}</strong>
                       </>
                     )}
                   </span>
@@ -703,7 +815,7 @@ export const InicioView: React.FC = () => {
         <section aria-label="Accesos rápidos" className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
           <button
             type="button"
-            onClick={() => setShoppingOpen(true)}
+            onClick={openShoppingList}
             className="sm:col-span-2 min-h-[88px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
           >
             <div className="flex items-center gap-4 min-w-0">
@@ -764,7 +876,6 @@ export const InicioView: React.FC = () => {
           </button>
         </section>
 
-        <ShoppingListSection open={shoppingOpen} onClose={() => setShoppingOpen(false)} />
         {incomeModal}
         <OnboardingWalkthrough
           open={walkthroughOpen}
@@ -793,6 +904,7 @@ export const InicioView: React.FC = () => {
       </div>
 
       {partnerMissingBanner}
+      {shoppingCleanupBanner}
 
       {/* 3 Big KPI Cards */}
       <section aria-label="Cifras principales" className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -905,7 +1017,7 @@ export const InicioView: React.FC = () => {
 
         <button
           type="button"
-          onClick={() => setShoppingOpen(true)}
+          onClick={openShoppingList}
           className="text-left rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 hover:border-[#0E5A64]/40 transition-colors"
         >
           <div className="flex items-center gap-3.5 min-w-0">
@@ -957,7 +1069,7 @@ export const InicioView: React.FC = () => {
               >
                 <div className="min-w-0">
                   <p className="text-xs font-bold truncate">
-                    Presupuesto · {EXPENSE_CATEGORY_LABELS[alert.category]}
+                    Presupuesto · {categoryRegistry.getLabel(alert.category)}
                   </p>
                   <p className="text-xs text-slate-600 dark:text-slate-400 tabular-nums">
                     {formatEUR(alert.spent)} de {formatEUR(alert.limit)}
@@ -1001,8 +1113,14 @@ export const InicioView: React.FC = () => {
         const lastBackup = loadLastBackupRequestedAt(
           buildLastBackupStorageKey(householdId, currentUserProfile.uid)
         );
-        const householdAgeDays = household?.createdAt
-          ? daysSinceLastBackup(household.createdAt.slice(0, 10), todayISO)
+        const createdLocalDate = (() => {
+          if (!household?.createdAt) return null;
+          const dt = new Date(household.createdAt);
+          if (Number.isNaN(dt.getTime())) return null;
+          return formatLocalDateISO(dt);
+        })();
+        const householdAgeDays = createdLocalDate
+          ? daysSinceLastBackup(createdLocalDate, todayISO)
           : null;
         const shouldRemind = lastBackup
           ? shouldShowBackupReminder(lastBackup, todayISO, 30)
@@ -1173,7 +1291,6 @@ export const InicioView: React.FC = () => {
         </section>
       </div>
 
-      <ShoppingListSection open={shoppingOpen} onClose={() => setShoppingOpen(false)} />
       {incomeModal}
       <OnboardingWalkthrough
         open={walkthroughOpen}

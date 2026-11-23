@@ -43,7 +43,6 @@ import {
   computeBudgetProgress,
   computeCategoryComparison,
   daysInMonth,
-  filterGlobalTransactions,
   findMissingRecurringForMonth,
   formatCoupleBalanceSecondPerson,
   formatDateES,
@@ -55,15 +54,18 @@ import {
   shiftMonthKey,
 } from '../domain/finance';
 import {
-  TRANSACTION_CATEGORY_LABELS,
-  type RecurringCatalogPreset,
-} from '../domain/presets';
-import { exportNidoPDF } from '../services/pdfExport';
+  filterGlobalExpenses,
+  globalSearchSessionCache,
+  type GlobalSearchOrigin,
+} from '../domain/globalSearch';
+import type { RecurringCatalogPreset } from '../domain/presets';
+import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
   COMMON_ACCOUNT_ID,
   type ExpenseCategory,
   type ExpensePrefill,
+  type InitialCost,
   type MonthlyBudget,
   type RecurringExpense,
   type Transaction,
@@ -82,6 +84,7 @@ export const MensualView: React.FC = () => {
     effectiveSplitPctA,
     selectedMonthKey,
     setSelectedMonthKey,
+    setActiveTab,
     focusMensualSection,
     clearFocusMensualSection,
     uiMode,
@@ -90,6 +93,8 @@ export const MensualView: React.FC = () => {
     recentTransactions,
     budget,
     monthClosures,
+    customCategories,
+    categoryRegistry,
     repo,
     showToast,
     scheduleUndo,
@@ -109,15 +114,19 @@ export const MensualView: React.FC = () => {
   const [sortField, setSortField] = useState<TxSortField>('date');
   const [sortAsc, setSortAsc] = useState(false);
 
-  // Avanzado: Global search on demand (no permanent listener; cached in session)
+  // Avanzado: Global search on demand (no permanent listener; cached in session scoped by householdId + viewerUid)
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [cachedHistory, setCachedHistory] = useState<Transaction[] | null>(null);
+  const [cachedInitialCosts, setCachedInitialCosts] = useState<InitialCost[] | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [globalOrigin, setGlobalOrigin] = useState<GlobalSearchOrigin>('todos');
+  const [globalPayer, setGlobalPayer] = useState<string>('todos');
   const [globalText, setGlobalText] = useState('');
   const [globalAmount, setGlobalAmount] = useState('');
-  const [globalCategory, setGlobalCategory] = useState<TransactionCategory | 'todas'>('todas');
+  const [globalCategory, setGlobalCategory] = useState<string>('todas');
   const [globalLimit, setGlobalLimit] = useState(40);
+  const historyLoadSeqRef = useRef(0);
 
   const [selectedTxIds, setSelectedTxIds] = useState<Set<string>>(new Set());
   const [confirmBulkDeleteTx, setConfirmBulkDeleteTx] = useState(false);
@@ -131,6 +140,8 @@ export const MensualView: React.FC = () => {
   // Habitual expenses catalog & budget modals
   const [habitualModalOpen, setHabitualModalOpen] = useState(false);
   const [budgetModalOpen, setBudgetModalOpen] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [pdfExportError, setPdfExportError] = useState<string | null>(null);
 
   const plantillasSectionRef = useRef<HTMLElement | null>(null);
 
@@ -212,50 +223,127 @@ export const MensualView: React.FC = () => {
     [recurring, monthTransactions, selectedMonthKey]
   );
 
-  // Reset session history cache if household or user changes
+  // Reset local view state when household or viewer user changes (strict scope isolation)
   useEffect(() => {
-    setCachedHistory(null);
+    historyLoadSeqRef.current += 1;
+    const scoped =
+      householdId && currentUserProfile?.uid
+        ? globalSearchSessionCache.get(householdId, currentUserProfile.uid)
+        : null;
+    setCachedHistory(scoped ? scoped.transactions : null);
+    setCachedInitialCosts(scoped ? scoped.initialCosts : null);
     setHistoryError(null);
+    setHistoryLoading(false);
   }, [householdId, currentUserProfile?.uid]);
+
+  const invalidateScopedHistoryCache = () => {
+    if (householdId && currentUserProfile?.uid) {
+      globalSearchSessionCache.invalidateScope(householdId, currentUserProfile.uid);
+    } else if (householdId) {
+      globalSearchSessionCache.invalidateHousehold(householdId);
+    }
+    setCachedHistory(null);
+    setCachedInitialCosts(null);
+  };
 
   const loadHistoryOnDemand = async (force = false) => {
     if (!householdId || !currentUserProfile) return;
-    if (cachedHistory !== null && !force) return;
+    const scopeHouseholdId = householdId;
+    const scopeUid = currentUserProfile.uid;
+
+    if (!force) {
+      const existing = globalSearchSessionCache.get(scopeHouseholdId, scopeUid);
+      if (existing) {
+        setCachedHistory(existing.transactions);
+        setCachedInitialCosts(existing.initialCosts);
+        setHistoryError(null);
+        return;
+      }
+    }
+
+    const requestSeq = ++historyLoadSeqRef.current;
     setHistoryLoading(true);
     setHistoryError(null);
     try {
-      const rows = await repo.fetchAllTransactions(householdId, currentUserProfile.uid);
+      const [rows, costs] = await Promise.all([
+        repo.fetchAllTransactions(scopeHouseholdId, scopeUid),
+        repo.fetchAllInitialCosts(scopeHouseholdId),
+      ]);
+      // Ignorar si cambió de hogar/usuario o hubo una petición más reciente mientras cargaba
+      if (requestSeq !== historyLoadSeqRef.current) return;
+      globalSearchSessionCache.set(scopeHouseholdId, scopeUid, {
+        transactions: rows,
+        initialCosts: costs,
+      });
       setCachedHistory(rows);
+      setCachedInitialCosts(costs);
     } catch (err) {
+      if (requestSeq !== historyLoadSeqRef.current) return;
       setHistoryError(
-        toUserFriendlyErrorMessage(err, 'No se pudo cargar el historial de movimientos.')
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudo cargar el historial de movimientos y mudanza.'
+        )
       );
     } finally {
-      setHistoryLoading(false);
+      if (requestSeq === historyLoadSeqRef.current) {
+        setHistoryLoading(false);
+      }
     }
   };
 
   const hasGlobalCriteria =
-    globalText.trim() !== '' || globalAmount.trim() !== '' || globalCategory !== 'todas';
+    globalText.trim() !== '' ||
+    globalAmount.trim() !== '' ||
+    globalCategory !== 'todas' ||
+    globalOrigin !== 'todos' ||
+    globalPayer !== 'todos';
 
-  const globalResults = useMemo(() => {
-    if (uiMode !== 'avanzado' || !globalSearchOpen || !cachedHistory) return [];
-    return filterGlobalTransactions(cachedHistory, {
-      text: globalText,
-      amountQuery: globalAmount,
-      category: globalCategory,
-    });
-  }, [uiMode, globalSearchOpen, cachedHistory, globalText, globalAmount, globalCategory]);
-
-  const globalTotalAmount = useMemo(
-    () =>
-      roundCents(
-        globalResults
-          .filter((t) => !t.isSettlement)
-          .reduce((sum, t) => sum + (Number(t.amount) || 0), 0)
-      ),
-    [globalResults]
-  );
+  const globalSummary = useMemo(() => {
+    if (
+      uiMode !== 'avanzado' ||
+      !globalSearchOpen ||
+      cachedHistory === null ||
+      cachedInitialCosts === null
+    ) {
+      return {
+        items: [],
+        monthlyCount: 0,
+        monthlyExpenseTotal: 0,
+        movingCount: 0,
+        movingTotal: 0,
+        movingPaidTotal: 0,
+        movingPendingTotal: 0,
+      };
+    }
+    return filterGlobalExpenses(
+      cachedHistory,
+      cachedInitialCosts,
+      {
+        origin: globalOrigin,
+        payer: globalPayer,
+        text: globalText,
+        amountQuery: globalAmount,
+        category: globalCategory,
+      },
+      {
+        viewerUid: currentUserProfile?.uid,
+        expenseCategoryLabels: categoryRegistry.labelsMap,
+      }
+    );
+  }, [
+    uiMode,
+    globalSearchOpen,
+    cachedHistory,
+    cachedInitialCosts,
+    globalOrigin,
+    globalPayer,
+    globalText,
+    globalAmount,
+    globalCategory,
+    currentUserProfile?.uid,
+    categoryRegistry.labelsMap,
+  ]);
 
   const comparisonSourceTransactions = useMemo(() => {
     const map = new Map<string, Transaction>();
@@ -277,9 +365,10 @@ export const MensualView: React.FC = () => {
     const q = txSearch.trim().toLowerCase();
     const filtered = monthTransactions.filter((tx) => {
       if (categoryFilter !== 'todas' && tx.category !== categoryFilter) return false;
-      if (payerFilter !== 'todos' && tx.paidBy !== payerFilter) return false;
+      const normalizedPaidBy = tx.paidBy === 'comun' ? COMMON_ACCOUNT_ID : tx.paidBy;
+      if (payerFilter !== 'todos' && normalizedPaidBy !== payerFilter) return false;
       if (q) {
-        const hay = `${tx.concept} ${tx.notes} ${TRANSACTION_CATEGORY_LABELS[tx.category]}`.toLowerCase();
+        const hay = `${tx.concept} ${tx.notes} ${categoryRegistry.getLabel(tx.category)}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -289,16 +378,15 @@ export const MensualView: React.FC = () => {
       if (sortField === 'date') cmp = a.date.localeCompare(b.date);
       else if (sortField === 'concept') cmp = a.concept.localeCompare(b.concept, 'es');
       else if (sortField === 'category') {
-        cmp = TRANSACTION_CATEGORY_LABELS[a.category].localeCompare(
-          TRANSACTION_CATEGORY_LABELS[b.category],
-          'es'
-        );
+        cmp = categoryRegistry
+          .getLabel(a.category)
+          .localeCompare(categoryRegistry.getLabel(b.category), 'es');
       } else {
         cmp = a.amount - b.amount;
       }
       return sortAsc ? cmp : -cmp;
     });
-  }, [uiMode, monthTransactions, txSearch, categoryFilter, payerFilter, sortField, sortAsc]);
+  }, [uiMode, monthTransactions, txSearch, categoryFilter, payerFilter, sortField, sortAsc, categoryRegistry]);
 
   const fullNameA = memberA?.displayName?.trim() || 'Persona A';
   const fullNameB = memberB?.displayName?.trim() || 'Pareja';
@@ -346,7 +434,7 @@ export const MensualView: React.FC = () => {
         },
         currentUserProfile
       );
-      setCachedHistory(null);
+      invalidateScopedHistoryCache();
       if (globalSearchOpen) void loadHistoryOnDemand(true);
       showToast('Gasto actualizado');
       return true;
@@ -371,7 +459,7 @@ export const MensualView: React.FC = () => {
     try {
       await repo.deleteTransactionsBulk(householdId, deletable, currentUserProfile);
       setSelectedTxIds(new Set());
-      setCachedHistory(null);
+      invalidateScopedHistoryCache();
       if (globalSearchOpen) void loadHistoryOnDemand(true);
       showToast(`Eliminados ${deletable.length} movimientos`);
     } catch (err) {
@@ -417,48 +505,56 @@ export const MensualView: React.FC = () => {
       ? today
       : `${selectedMonthKey}-${String(daysInMonth(selectedMonthKey)).padStart(2, '0')}`;
 
-    await repo.upsertTransaction(
-      householdId,
-      {
-        monthKey: selectedMonthKey,
-        concept: `Liquidación ${formatMonthLabelES(selectedMonthKey)}`,
-        category: 'liquidacion',
-        amount: balance.owesAmount,
-        date: txDate,
-        paidBy: payerUid,
-        recurringId: null,
-        splitPctA: effectiveSplitPctA,
-        isSettlement: true,
-        settlementTo: receiverUid,
-        isPrivate: false,
-        createdBy: currentUserProfile.uid,
-        notes: 'Liquidación de saldo entre pareja',
-      },
-      currentUserProfile
-    );
-    showToast('Liquidación registrada');
+    try {
+      await repo.upsertTransaction(
+        householdId,
+        {
+          monthKey: selectedMonthKey,
+          concept: `Liquidación ${formatMonthLabelES(selectedMonthKey)}`,
+          category: 'liquidacion',
+          amount: balance.owesAmount,
+          date: txDate,
+          paidBy: payerUid,
+          recurringId: null,
+          splitPctA: effectiveSplitPctA,
+          isSettlement: true,
+          settlementTo: receiverUid,
+          isPrivate: false,
+          createdBy: currentUserProfile.uid,
+          notes: 'Liquidación de saldo entre pareja',
+        },
+        currentUserProfile
+      );
+      showToast('Liquidación registrada');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo registrar la liquidación.'));
+    }
   };
 
   const handleCloseMonth = async () => {
     if (!householdId || !currentUserProfile) return;
     setConfirmCloseMonth(false);
-    await repo.closeMonth(
-      householdId,
-      {
-        monthKey: selectedMonthKey,
-        totalSpent: balance.totalSpent,
-        paidA: balance.paidA,
-        paidB: balance.paidB,
-        paidComun: balance.paidComun,
-        shareA: balance.shareA,
-        shareB: balance.shareB,
-        balanceA: balance.balanceA,
-        settlementText: balance.summaryText,
-        closedBy: currentUserProfile.uid,
-      },
-      currentUserProfile
-    );
-    showToast(`Mes ${selectedMonthKey} cerrado`);
+    try {
+      await repo.closeMonth(
+        householdId,
+        {
+          monthKey: selectedMonthKey,
+          totalSpent: balance.totalSpent,
+          paidA: balance.paidA,
+          paidB: balance.paidB,
+          paidComun: balance.paidComun,
+          shareA: balance.shareA,
+          shareB: balance.shareB,
+          balanceA: balance.balanceA,
+          settlementText: balance.summaryText,
+          closedBy: currentUserProfile.uid,
+        },
+        currentUserProfile
+      );
+      showToast(`Mes ${selectedMonthKey} cerrado`);
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo cerrar el mes.'));
+    }
   };
 
   const viewerIsMemberA = currentMember
@@ -511,9 +607,19 @@ export const MensualView: React.FC = () => {
     }
   };
 
-  const handleSaveBudgets = async (limits: MonthlyBudget['limits']) => {
+  const handleSaveBudgets = async (limits: Record<string, number>) => {
     if (!householdId || !currentUserProfile) return;
-    await repo.saveBudget(householdId, selectedMonthKey, limits, currentUserProfile);
+    if (isClosed) {
+      showToast('No puedes modificar los presupuestos de un mes cerrado.');
+      return;
+    }
+    await repo.saveAllBudgets(
+      householdId,
+      selectedMonthKey,
+      limits,
+      customCategories.map((c) => c.id),
+      currentUserProfile
+    );
     setBudgetModalOpen(false);
     showToast('Presupuesto mensual actualizado');
   };
@@ -528,23 +634,31 @@ export const MensualView: React.FC = () => {
         showToast('No puedes eliminar un gasto de un mes cerrado.');
         return;
       }
-      await repo.deleteTransaction(householdId, backup.id, backup.concept, currentUserProfile, {
-        isPrivate: backup.isPrivate,
-      });
-      setCachedHistory(null);
-      if (globalSearchOpen) void loadHistoryOnDemand(true);
-      scheduleUndo(`Eliminado "${backup.concept}"`, async () => {
-        if (closedMonthKeysRef.current.has(backup.monthKey)) {
-          showToast('No se puede deshacer: el mes está cerrado.');
-          return;
-        }
-        await repo.restoreTransaction(householdId, backup, currentUserProfile);
-        setCachedHistory(null);
+      try {
+        await repo.deleteTransaction(householdId, backup.id, backup.concept, currentUserProfile, {
+          isPrivate: backup.isPrivate,
+        });
+        invalidateScopedHistoryCache();
         if (globalSearchOpen) void loadHistoryOnDemand(true);
-      });
+        scheduleUndo(`Eliminado "${backup.concept}"`, async () => {
+          if (closedMonthKeysRef.current.has(backup.monthKey)) {
+            showToast('No se puede deshacer: el mes está cerrado.');
+            return;
+          }
+          await repo.restoreTransaction(householdId, backup, currentUserProfile);
+          invalidateScopedHistoryCache();
+          if (globalSearchOpen) void loadHistoryOnDemand(true);
+        });
+      } catch (err) {
+        showToast(toUserFriendlyErrorMessage(err, 'No se pudo eliminar el movimiento.'));
+      }
     } else {
-      await repo.deleteRecurring(householdId, target.item.id, target.item.concept, currentUserProfile);
-      showToast('Plantilla eliminada');
+      try {
+        await repo.deleteRecurring(householdId, target.item.id, target.item.concept, currentUserProfile);
+        showToast('Plantilla eliminada');
+      } catch (err) {
+        showToast(toUserFriendlyErrorMessage(err, 'No se pudo eliminar la plantilla.'));
+      }
     }
   };
 
@@ -554,7 +668,7 @@ export const MensualView: React.FC = () => {
       monthTransactions.map((t) => [
         formatDateES(t.date),
         t.concept,
-        TRANSACTION_CATEGORY_LABELS[t.category],
+        categoryRegistry.getLabel(t.category),
         memberLabel(t.paidBy),
         t.isPrivate ? 'Personal' : t.splitPctA,
         t.isPrivate ? 'Personal' : t.isSettlement ? 'Liquidación' : 'Gasto',
@@ -565,23 +679,37 @@ export const MensualView: React.FC = () => {
     showToast('CSV mensual descargado');
   };
 
-  const handleExportPDF = () => {
-    if (!household) return;
+  const handleExportPDF = async () => {
+    if (!household || exportingPdf) return;
+    setExportingPdf(true);
+    setPdfExportError(null);
     const fromDate = `${selectedMonthKey}-01`;
     const toDate = `${selectedMonthKey}-${String(daysInMonth(selectedMonthKey)).padStart(2, '0')}`;
-    exportNidoPDF({
-      scope: 'mensual',
-      household,
-      members,
-      fromDate,
-      toDate,
-      transactions: monthTransactions,
-      initialCosts: [],
-      items: [],
-      goals: [],
-      goalMovements: [],
-    });
-    showToast('PDF mensual descargado');
+    try {
+      await loadAndExportNidoPDF({
+        scope: 'mensual',
+        household,
+        members,
+        fromDate,
+        toDate,
+        transactions: monthTransactions,
+        initialCosts: [],
+        items: [],
+        goals: [],
+        goalMovements: [],
+        categoryLabels: categoryRegistry.labelsMap,
+      });
+      showToast('PDF mensual descargado');
+    } catch (err) {
+      setPdfExportError(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudo cargar el módulo PDF. Comprueba tu conexión e inténtalo de nuevo.'
+        )
+      );
+    } finally {
+      setExportingPdf(false);
+    }
   };
 
   // ─── MODO SENCILLO ──────────────────────────────────────────────────────────
@@ -831,11 +959,12 @@ export const MensualView: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={handleExportPDF}
-            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5"
+            disabled={exportingPdf}
+            onClick={() => void handleExportPDF()}
+            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
           >
             <Download className="w-4 h-4" />
-            <span>PDF</span>
+            <span>{exportingPdf ? 'Generando PDF...' : 'PDF'}</span>
           </button>
           {!isClosed ? (
             <button
@@ -849,11 +978,15 @@ export const MensualView: React.FC = () => {
           ) : (
             <button
               type="button"
-              onClick={() =>
-                householdId &&
-                currentUserProfile &&
-                void repo.reopenMonth(householdId, selectedMonthKey, currentUserProfile)
-              }
+              onClick={async () => {
+                if (!householdId || !currentUserProfile) return;
+                try {
+                  await repo.reopenMonth(householdId, selectedMonthKey, currentUserProfile);
+                  showToast(`Mes ${selectedMonthKey} desbloqueado`);
+                } catch (err) {
+                  showToast(toUserFriendlyErrorMessage(err, 'No se pudo desbloquear el mes.'));
+                }
+              }}
               className="min-h-[44px] px-3.5 rounded-xl bg-amber-500/15 text-amber-800 dark:text-amber-300 text-xs font-semibold flex items-center gap-1.5"
             >
               <Unlock className="w-4 h-4" />
@@ -863,21 +996,59 @@ export const MensualView: React.FC = () => {
         </div>
       </div>
 
+      {pdfExportError && (
+        <div
+          role="alert"
+          className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] px-4 py-3 text-xs font-medium flex flex-wrap items-center justify-between gap-2"
+        >
+          <span>{pdfExportError}</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={exportingPdf}
+              onClick={() => void handleExportPDF()}
+              className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64] text-white font-semibold disabled:opacity-50"
+            >
+              Reintentar
+            </button>
+            <button
+              type="button"
+              onClick={() => setPdfExportError(null)}
+              className="min-h-[44px] px-2.5 rounded-lg border border-current/30 font-semibold"
+            >
+              Cerrar
+            </button>
+          </div>
+        </div>
+      )}
+
       <GlobalSearchSection
         open={globalSearchOpen}
-        cachedHistory={cachedHistory}
+        cachedMonthlyCount={cachedHistory ? cachedHistory.length : null}
+        cachedMovingCount={cachedInitialCosts ? cachedInitialCosts.length : null}
         historyLoading={historyLoading}
         historyError={historyError}
+        globalOrigin={globalOrigin}
+        globalPayer={globalPayer}
         globalText={globalText}
         globalAmount={globalAmount}
         globalCategory={globalCategory}
         globalLimit={globalLimit}
         hasGlobalCriteria={hasGlobalCriteria}
-        globalResults={globalResults}
-        globalTotalAmount={globalTotalAmount}
+        summary={globalSummary}
         closedMonthKeys={closedMonthKeys}
+        memberA={memberA}
+        memberB={memberB}
         memberLabel={memberLabel}
         onRefresh={() => void loadHistoryOnDemand(true)}
+        onOriginChange={(val) => {
+          setGlobalOrigin(val);
+          setGlobalLimit(40);
+        }}
+        onPayerChange={(val) => {
+          setGlobalPayer(val);
+          setGlobalLimit(40);
+        }}
         onTextChange={(val) => {
           setGlobalText(val);
           setGlobalLimit(40);
@@ -891,6 +1062,8 @@ export const MensualView: React.FC = () => {
           setGlobalLimit(40);
         }}
         onClearCriteria={() => {
+          setGlobalOrigin('todos');
+          setGlobalPayer('todos');
           setGlobalText('');
           setGlobalAmount('');
           setGlobalCategory('todas');
@@ -898,6 +1071,7 @@ export const MensualView: React.FC = () => {
         onShowMore={() => setGlobalLimit((n) => n + 40)}
         onClose={() => setGlobalSearchOpen(false)}
         onGoToMonth={setSelectedMonthKey}
+        onGoToMudanza={() => setActiveTab('mudanza')}
         onEditTx={(tx) => {
           setTxPrefill(null);
           setEditingTx(tx);
@@ -1104,7 +1278,7 @@ export const MensualView: React.FC = () => {
         editingTx={editingTx}
         prefill={txPrefill}
         onSaved={() => {
-          setCachedHistory(null);
+          invalidateScopedHistoryCache();
           if (globalSearchOpen) void loadHistoryOnDemand(true);
         }}
       />
@@ -1126,7 +1300,7 @@ export const MensualView: React.FC = () => {
         open={csvImportOpen}
         onClose={() => setCsvImportOpen(false)}
         onImported={() => {
-          setCachedHistory(null);
+          invalidateScopedHistoryCache();
           if (globalSearchOpen) void loadHistoryOnDemand(true);
         }}
       />
@@ -1159,6 +1333,7 @@ export const MensualView: React.FC = () => {
       <BudgetEditorModal
         open={budgetModalOpen}
         selectedMonthKey={selectedMonthKey}
+        isClosed={isClosed}
         budget={budget}
         activeFixedByCategory={activeFixedByCategory}
         onSave={handleSaveBudgets}

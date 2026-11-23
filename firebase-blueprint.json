@@ -219,7 +219,7 @@
         },
         "category": {
           "type": "string",
-          "enum": ["alquiler", "fianza", "garantia_adicional", "suministros", "cerrajeria", "mudanza", "mobiliario", "otros"]
+          "description": "System InitialCostCategory enum OR household custom category ID (cat_*)."
         },
         "amount": {
           "type": "number"
@@ -361,7 +361,7 @@
         },
         "category": {
           "type": "string",
-          "enum": ["alquiler", "luz", "agua", "gas", "internet", "movil", "suscripciones", "seguros", "comunidad", "supermercado", "transporte", "ocio", "otros"]
+          "description": "System ExpenseCategory enum OR household custom category ID (cat_*)."
         },
         "amount": {
           "type": "number"
@@ -417,7 +417,7 @@
         },
         "category": {
           "type": "string",
-          "enum": ["alquiler", "luz", "agua", "gas", "internet", "movil", "suscripciones", "seguros", "comunidad", "supermercado", "transporte", "ocio", "otros", "liquidacion"]
+          "description": "System ExpenseCategory enum, 'liquidacion', OR household custom category ID (cat_*)."
         },
         "amount": {
           "type": "number"
@@ -626,10 +626,56 @@
           "maxLength": 120
         },
         "qty": {
-          "type": "number"
+          "type": "number",
+          "description": "Positive quantity in (0, 999], allowing decimals such as 0.5 kg."
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Optional measurement unit (ud, kg, g, L, paq, etc.)."
         },
         "done": {
           "type": "boolean"
+        },
+        "catalogId": {
+          "type": "string",
+          "maxLength": 48,
+          "description": "Optional stable ID linking to external static Mercadona catalog."
+        },
+        "brand": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Optional brand name (e.g. Hacendado, Deliplus)."
+        },
+        "format": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Optional pack/content format (e.g. 1 L, 500 g)."
+        },
+        "section": {
+          "type": "string",
+          "maxLength": 48,
+          "enum": [
+            "",
+            "Fruta y verdura",
+            "Carne, charcutería y huevos",
+            "Pescado y marisco",
+            "Lácteos, quesos y bebidas vegetales",
+            "Panadería y bollería",
+            "Despensa, arroz, pasta y conservas",
+            "Desayuno, café y dulces",
+            "Congelados",
+            "Platos preparados y refrigerados",
+            "Bebidas",
+            "Limpieza y hogar",
+            "Cuidado personal e higiene",
+            "Bebé y mascotas",
+            "Otros de supermercado"
+          ]
+        },
+        "sourceType": {
+          "type": "string",
+          "enum": ["", "mercadona", "custom", "generic"]
         },
         "addedBy": {
           "type": "string",
@@ -646,6 +692,189 @@
         }
       },
       "required": ["text", "qty", "done", "addedBy", "createdAt", "updatedAt"]
+    },
+    "CustomCategory": {
+      "title": "CustomCategory",
+      "description": "Household-scoped custom expense category with shared color, icon, order, archive flag, and CSV keywords.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "color": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        },
+        "icon": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "order": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 999
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "csvKeywords": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "color", "icon", "order", "archived", "csvKeywords", "createdAt", "updatedAt"]
+    },
+    "CategoryBudgetLimit": {
+      "title": "CategoryBudgetLimit",
+      "description": "Monthly budget limit for a custom expense category, keyed by YYYY-MM__cat_id.",
+      "type": "object",
+      "properties": {
+        "monthKey": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}$",
+          "maxLength": 7
+        },
+        "categoryId": {
+          "type": "string",
+          "pattern": "^cat_[a-zA-Z0-9_]{2,44}$"
+        },
+        "limit": {
+          "type": "number",
+          "minimum": 0
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["monthKey", "categoryId", "limit", "updatedAt"]
+    },
+    "ShoppingCatalogItem": {
+      "title": "ShoppingCatalogItem",
+      "description": "Household product reference, favorites, and recents synced compactly for zero-cost autocomplete.",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "defaultUnit": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "usageCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "lastUsedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "favorite": {
+          "type": "boolean"
+        },
+        "catalogId": {
+          "type": "string",
+          "maxLength": 48
+        },
+        "brand": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "format": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "section": {
+          "type": "string",
+          "maxLength": 48
+        },
+        "sourceType": {
+          "type": "string",
+          "enum": ["", "mercadona", "custom", "generic"]
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["text", "defaultUnit", "usageCount", "lastUsedAt", "createdBy", "createdAt", "updatedAt"]
+    },
+    "PendingShoppingCheckout": {
+      "title": "PendingShoppingCheckout",
+      "description": "Temporary coordination record for multi-batch durable shopping list cleanup after atomic expense creation; deleted when cleanup completes.",
+      "type": "object",
+      "properties": {
+        "expenseId": {
+          "type": "string",
+          "pattern": "^tx_chk_[a-zA-Z0-9_]{6,40}$"
+        },
+        "monthKey": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}$",
+          "maxLength": 7
+        },
+        "amount": {
+          "type": "number",
+          "minimum": 0
+        },
+        "concept": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "pendingItemIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "maxItems": 100
+        },
+        "totalItemCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "isPrivate": {
+          "type": "boolean"
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["expenseId", "monthKey", "amount", "concept", "pendingItemIds", "totalItemCount", "isPrivate", "createdBy", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -691,7 +920,15 @@
     },
     "/households/{hid}/budgets/{monthKey}": {
       "schema": { "$ref": "#/entities/MonthlyBudget" },
-      "description": "Monthly category budgets keyed by YYYY-MM."
+      "description": "Monthly system category budgets keyed by YYYY-MM."
+    },
+    "/households/{hid}/categoryBudgets/{docId}": {
+      "schema": { "$ref": "#/entities/CategoryBudgetLimit" },
+      "description": "Monthly budget limits for custom household categories keyed by YYYY-MM__cat_id."
+    },
+    "/households/{hid}/categories/{catId}": {
+      "schema": { "$ref": "#/entities/CustomCategory" },
+      "description": "Custom expense categories scoped to the household."
     },
     "/households/{hid}/monthClosures/{monthKey}": {
       "schema": { "$ref": "#/entities/MonthClosure" },
@@ -708,6 +945,14 @@
     "/households/{hid}/shopping/{id}": {
       "schema": { "$ref": "#/entities/ShoppingItem" },
       "description": "Shared household shopping list items."
+    },
+    "/households/{hid}/shoppingCatalog/{prodId}": {
+      "schema": { "$ref": "#/entities/ShoppingCatalogItem" },
+      "description": "Household reusable product catalog for shopping autocomplete."
+    },
+    "/households/{hid}/shoppingCheckouts/{checkoutId}": {
+      "schema": { "$ref": "#/entities/PendingShoppingCheckout" },
+      "description": "Temporary multi-batch shopping checkout cleanup recovery state (deleted when complete)."
     }
   }
 }

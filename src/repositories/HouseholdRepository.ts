@@ -1,9 +1,17 @@
 import type { RecurringCatalogPreset } from '../domain/presets';
 import type {
+  ShoppingCheckoutBatchCleanupResult,
+  ShoppingCheckoutItemSnapshot,
+  ShoppingCheckoutPhase1Input,
+  ShoppingCheckoutPhase1Result,
+} from '../domain/shoppingCheckout';
+import type {
   ActivityEntry,
+  CategoryBudgetLimit,
   CategoryColorMap,
   ChecklistItem,
   CsvCategoryKeywords,
+  CustomCategory,
   ExpenseCategory,
   FurnitureItem,
   FurnitureStatus,
@@ -15,9 +23,13 @@ import type {
   MonthClosure,
   MonthlyBudget,
   NidoBackupV1,
+  PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  ShoppingCatalogItem,
   ShoppingItem,
+  ShoppingSection,
+  ShoppingSourceType,
   Transaction,
   UiMode,
 } from '../types/nido';
@@ -97,6 +109,7 @@ export interface HouseholdRepository {
     onData: (c: InitialCost[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
+  fetchAllInitialCosts(householdId: string): Promise<InitialCost[]>;
   subscribeChecklist(
     householdId: string,
     onData: (items: ChecklistItem[]) => void,
@@ -153,6 +166,33 @@ export interface HouseholdRepository {
     onData: (items: ShoppingItem[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
+  subscribeShoppingCatalog(
+    householdId: string,
+    onData: (items: ShoppingCatalogItem[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  subscribePendingShoppingCheckouts(
+    householdId: string,
+    viewerUid: string,
+    onData: (items: PendingShoppingCheckout[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  subscribeCustomCategories(
+    householdId: string,
+    onData: (items: CustomCategory[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  subscribeCategoryBudgets(
+    householdId: string,
+    monthKey: string,
+    onData: (items: CategoryBudgetLimit[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  fetchAllCategoryBudgets(householdId: string): Promise<CategoryBudgetLimit[]>;
+  fetchMonthBudgets(
+    householdId: string,
+    monthKey: string
+  ): Promise<{ systemBudget: MonthlyBudget | null; categoryBudgets: CategoryBudgetLimit[] }>;
 
   // Settings & Member
   updateSettings(
@@ -172,6 +212,23 @@ export interface HouseholdRepository {
     householdId: string,
     uid: string,
     uiMode: UiMode
+  ): Promise<void>;
+
+  // Custom Categories
+  upsertCustomCategory(
+    householdId: string,
+    cat: Omit<CustomCategory, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
+    actor: UserProfileInput
+  ): Promise<string>;
+  reorderCustomCategories(
+    householdId: string,
+    ordered: Array<{ id: string; order: number }>
+  ): Promise<void>;
+  deleteUnusedCustomCategory(
+    householdId: string,
+    id: string,
+    name: string,
+    actor: UserProfileInput
   ): Promise<void>;
 
   // Initial Costs
@@ -301,6 +358,13 @@ export interface HouseholdRepository {
     limits: MonthlyBudget['limits'],
     actor: UserProfileInput
   ): Promise<void>;
+  saveAllBudgets(
+    householdId: string,
+    monthKey: string,
+    limits: Record<string, number>,
+    customCategoryIds: string[],
+    actor: UserProfileInput
+  ): Promise<void>;
   closeMonth(
     householdId: string,
     closure: Omit<MonthClosure, 'closedAt'>,
@@ -346,11 +410,52 @@ export interface HouseholdRepository {
   // Shopping List (sin log de actividad por ítem)
   upsertShoppingItem(
     householdId: string,
-    item: { id?: string; text: string; qty: number; done: boolean },
+    item: {
+      id?: string;
+      text: string;
+      qty: number;
+      unit?: string;
+      done: boolean;
+      catalogId?: string;
+      brand?: string;
+      format?: string;
+      section?: ShoppingSection;
+      sourceType?: ShoppingSourceType;
+    },
     actor: UserProfileInput
   ): Promise<string>;
   deleteShoppingItem(householdId: string, id: string): Promise<void>;
   deleteShoppingItemsBulk(householdId: string, ids: string[]): Promise<void>;
+  commitShoppingCheckoutPhase1(
+    householdId: string,
+    input: ShoppingCheckoutPhase1Input,
+    actor: UserProfileInput
+  ): Promise<ShoppingCheckoutPhase1Result>;
+  cleanupShoppingCheckoutBatch(
+    householdId: string,
+    checkoutId: string,
+    snapshotsById?: Record<string, ShoppingCheckoutItemSnapshot>
+  ): Promise<ShoppingCheckoutBatchCleanupResult>;
+  dismissPendingShoppingCheckout(householdId: string, checkoutId: string): Promise<void>;
+  upsertShoppingCatalogItem(
+    householdId: string,
+    input: {
+      text: string;
+      defaultUnit?: string;
+      favorite?: boolean;
+      catalogId?: string;
+      brand?: string;
+      format?: string;
+      section?: ShoppingSection;
+      sourceType?: ShoppingSourceType;
+    },
+    actor: UserProfileInput
+  ): Promise<string>;
+  toggleShoppingCatalogFavorite(
+    householdId: string,
+    id: string,
+    favorite: boolean
+  ): Promise<void>;
 
   // Export & Backup Restore
   exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1>;

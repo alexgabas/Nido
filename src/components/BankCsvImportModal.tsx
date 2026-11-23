@@ -11,6 +11,10 @@ import {
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
 import {
+  isCustomCategoryId,
+  isSystemExpenseCategory,
+} from '../domain/categories';
+import {
   buildParsedBankRows,
   detectCsvDelimiter,
   guessCsvColumns,
@@ -57,6 +61,8 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
     effectiveSplitPctA,
     monthClosures,
     recentTransactions,
+    customCategories,
+    categoryRegistry,
     repo,
     showToast,
   } = useNido();
@@ -77,7 +83,7 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
   // Editable keyword rules
   const [keywordsOpen, setKeywordsOpen] = useState(false);
   const [draftKeywords, setDraftKeywords] = useState<Record<ExpenseCategory, string>>(() =>
-    resolveKeywordsMap(household?.csvKeywords)
+    resolveKeywordsMap(household?.csvKeywords, customCategories)
   );
   const [savingKeywords, setSavingKeywords] = useState(false);
   const [keywordPrompt, setKeywordPrompt] = useState<{
@@ -97,11 +103,11 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
   useEffect(() => {
     if (!open) return;
     setError(null);
-    setDraftKeywords(resolveKeywordsMap(household?.csvKeywords));
+    setDraftKeywords(resolveKeywordsMap(household?.csvKeywords, customCategories));
     setRowOverrides({});
     setKeywordPrompt(null);
     setDefaultPaidBy(COMMON_ACCOUNT_ID);
-  }, [open, household?.csvKeywords]);
+  }, [open, household?.csvKeywords, customCategories]);
 
   useEffect(() => {
     if (!open || !householdId || !currentUserProfile) return;
@@ -147,8 +153,8 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
 
   const parsedRows = useMemo(() => {
     if (dataRows.length === 0) return [];
-    return buildParsedBankRows(dataRows, mapping, historyTx, draftKeywords);
-  }, [dataRows, mapping, historyTx, draftKeywords]);
+    return buildParsedBankRows(dataRows, mapping, historyTx, draftKeywords, customCategories);
+  }, [dataRows, mapping, historyTx, draftKeywords, customCategories]);
 
   const isRowDisabled = (rowIndex: number): { disabled: boolean; reason: string | null } => {
     const row = parsedRows[rowIndex];
@@ -215,12 +221,37 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
   };
 
   const handleSaveKeywords = async () => {
-    if (!householdId) return;
+    if (!householdId || !currentUserProfile) return;
     setSavingKeywords(true);
     setError(null);
     try {
-      const payload: CsvCategoryKeywords = { ...draftKeywords };
-      await repo.updateCsvKeywords(householdId, payload);
+      const systemPayload: CsvCategoryKeywords = {};
+      for (const sysCat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
+        if (isSystemExpenseCategory(sysCat) && typeof draftKeywords[sysCat] === 'string') {
+          systemPayload[sysCat] = draftKeywords[sysCat];
+        }
+      }
+      await repo.updateCsvKeywords(householdId, systemPayload);
+
+      for (const customCat of customCategories) {
+        if (customCat.archived) continue;
+        const nextKw = (draftKeywords[customCat.id] ?? '').trim();
+        if (nextKw !== (customCat.csvKeywords ?? '').trim()) {
+          await repo.upsertCustomCategory(
+            householdId,
+            {
+              id: customCat.id,
+              name: customCat.name,
+              color: customCat.color,
+              icon: customCat.icon,
+              archived: customCat.archived,
+              order: customCat.order,
+              csvKeywords: nextKw,
+            },
+            currentUserProfile
+          );
+        }
+      }
       showToast('Reglas de palabras clave guardadas');
     } catch (err) {
       setError(toUserFriendlyErrorMessage(err, 'No se pudieron guardar las reglas.'));
@@ -231,7 +262,7 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
 
   const handleConfirmQuickKeyword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!householdId || !keywordPrompt) return;
+    if (!householdId || !keywordPrompt || !currentUserProfile) return;
     const cleanKw = keywordPrompt.keyword.trim().toLowerCase();
     if (cleanKw.length < 2) {
       setError('Escribe una palabra clave de al menos 2 caracteres.');
@@ -244,19 +275,46 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
       .filter(Boolean);
     const alreadyExists = existingList.some((item) => item.toLowerCase() === cleanKw);
     const nextList = alreadyExists ? existingList : [...existingList, cleanKw];
+    const nextKwString = nextList.join(', ');
     const nextKeywords: Record<ExpenseCategory, string> = {
       ...draftKeywords,
-      [cat]: nextList.join(', '),
+      [cat]: nextKwString,
     };
 
     setSavingQuickKeyword(true);
     setError(null);
     try {
-      await repo.updateCsvKeywords(householdId, nextKeywords);
+      if (isCustomCategoryId(cat)) {
+        const targetCustom = customCategories.find((c) => c.id === cat);
+        if (!targetCustom) {
+          throw new Error('No se encontró la categoría personalizada.');
+        }
+        await repo.upsertCustomCategory(
+          householdId,
+          {
+            id: targetCustom.id,
+            name: targetCustom.name,
+            color: targetCustom.color,
+            icon: targetCustom.icon,
+            archived: targetCustom.archived,
+            order: targetCustom.order,
+            csvKeywords: nextKwString,
+          },
+          currentUserProfile
+        );
+      } else {
+        const systemPayload: CsvCategoryKeywords = {};
+        for (const sysCat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
+          if (isSystemExpenseCategory(sysCat) && typeof nextKeywords[sysCat] === 'string') {
+            systemPayload[sysCat] = nextKeywords[sysCat];
+          }
+        }
+        await repo.updateCsvKeywords(householdId, systemPayload);
+      }
       setDraftKeywords(nextKeywords);
       setKeywordPrompt(null);
       showToast(
-        `Palabra clave «${cleanKw}» guardada para ${EXPENSE_CATEGORY_LABELS[cat]}`
+        `Palabra clave «${cleanKw}» guardada para ${categoryRegistry.getLabel(cat)}`
       );
     } catch (err) {
       setError(toUserFriendlyErrorMessage(err, 'No se pudo guardar la palabra clave.'));
@@ -521,23 +579,23 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
                   Separa las palabras clave con comas (ej. «MERCADONA, BONPREU, CONSUM»). Se aplican al instante sobre la vista previa.
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[])
-                    .filter((cat) => cat !== 'otros')
+                  {categoryRegistry.activeCategories
+                    .filter((cat) => cat.id !== 'otros')
                     .map((cat) => (
-                      <div key={cat}>
+                      <div key={cat.id}>
                         <label
-                          htmlFor={`kw-${cat}`}
+                          htmlFor={`kw-${cat.id}`}
                           className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1"
                         >
-                          {EXPENSE_CATEGORY_LABELS[cat]}
+                          {cat.label}
                         </label>
                         <input
-                          id={`kw-${cat}`}
+                          id={`kw-${cat.id}`}
                           type="text"
                           maxLength={300}
-                          value={draftKeywords[cat] ?? ''}
+                          value={draftKeywords[cat.id] ?? ''}
                           onChange={(e) =>
-                            setDraftKeywords((prev) => ({ ...prev, [cat]: e.target.value }))
+                            setDraftKeywords((prev) => ({ ...prev, [cat.id]: e.target.value }))
                           }
                           className="w-full min-h-[44px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
                         />
@@ -547,7 +605,9 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
                 <div className="flex flex-wrap justify-end gap-2">
                   <button
                     type="button"
-                    onClick={() => setDraftKeywords({ ...DEFAULT_CSV_KEYWORDS })}
+                    onClick={() =>
+                      setDraftKeywords(resolveKeywordsMap(DEFAULT_CSV_KEYWORDS, customCategories))
+                    }
                     className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
                   >
                     Restaurar por defecto
@@ -583,7 +643,7 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
                   className="rounded-2xl border border-[#0E5A64]/35 bg-[#0E5A64]/6 dark:bg-[#2AA1AE]/10 p-3.5 space-y-2.5"
                 >
                   <p className="text-xs font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
-                    Recordar palabra clave para «{EXPENSE_CATEGORY_LABELS[keywordPrompt.targetCategory]}»
+                    Recordar palabra clave para «{categoryRegistry.getLabel(keywordPrompt.targetCategory)}»
                   </p>
                   <p className="text-[11px] text-slate-600 dark:text-slate-300">
                     Revisa o acorta el término antes de guardarlo en las reglas del hogar (evita fechas o referencias variables):
@@ -707,9 +767,12 @@ export const BankCsvImportModal: React.FC<BankCsvImportModalProps> = ({
                                 }}
                                 className="min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
                               >
-                                {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((c) => (
-                                  <option key={c} value={c}>
-                                    {EXPENSE_CATEGORY_LABELS[c]}
+                                {(categoryRegistry.activeCategories.some((c) => c.id === cat)
+                                  ? categoryRegistry.activeCategories
+                                  : [...categoryRegistry.activeCategories, categoryRegistry.getMeta(cat)]
+                                ).map((c) => (
+                                  <option key={c.id} value={c.id}>
+                                    {c.archived ? `${c.label} (Archivada)` : c.label}
                                   </option>
                                 ))}
                               </select>

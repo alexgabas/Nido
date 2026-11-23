@@ -90,6 +90,48 @@ async function seedHouseholdPhaseA(uid: string, hid = 'h1', inviteCode = 'SNT26A
   await batch.commit();
 }
 
+async function joinHouseholdSecondMember(
+  uid: string,
+  hid = 'h1',
+  inviteCode = 'SNT26A',
+  displayName = 'Marta'
+) {
+  const db = dbForUser(uid, true);
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const joinBatch = db.batch();
+
+  joinBatch.update(db.doc(`households/${hid}`), {
+    memberUids: firebase.firestore.FieldValue.arrayUnion(uid),
+    updatedAt: ts,
+  });
+  joinBatch.update(db.doc(`invites/${inviteCode}`), {
+    memberCount: 2,
+  });
+  joinBatch.set(db.doc(`households/${hid}/members/${uid}`), {
+    displayName,
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.set(db.doc(`users/${uid}`), {
+    householdId: hid,
+    updatedAt: ts,
+  });
+  joinBatch.set(db.doc(`households/${hid}/activity/act_join_${uid}`), {
+    uid,
+    actorName: displayName,
+    action: 'join',
+    entity: 'hogar',
+    entityId: hid,
+    summary: `${displayName} se unió al hogar`,
+    timestamp: ts,
+  });
+
+  await joinBatch.commit();
+}
+
 before(async () => {
   const emulatorHost = parseEmulatorHost() ?? { host: '127.0.0.1', port: 8080 };
   testEnv = await initializeTestEnvironment({
@@ -1226,6 +1268,782 @@ test('14. households Action 6: categoryColors compartidos por miembro, hex #RRGG
     })
   );
 });
+
+test('15. Categorías personalizadas (/categories/{catId}): CRUD, formato hex/icono/id estricto e inmutabilidad de createdAt', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Crear categoría válida
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categories/cat_gimnasio').set({
+      name: 'Gimnasio',
+      color: '#16A34A',
+      icon: 'dumbbell',
+      order: 1,
+      archived: false,
+      csvKeywords: 'basic-fit, dir, gimnasio',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // ID inválido sin prefijo cat_ -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/categories/not_cat_1').set({
+      name: 'Mal ID',
+      color: '#16A34A',
+      icon: 'tag',
+      order: 2,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Color hex inválido -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/categories/cat_bad_hex').set({
+      name: 'Mal color',
+      color: 'verde',
+      icon: 'tag',
+      order: 2,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Icono inválido -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/categories/cat_bad_icon').set({
+      name: 'Mal icono',
+      color: '#16A34A',
+      icon: 'icono_inventado',
+      order: 2,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Editar nombre, color y archivar permitido; cambiar createdAt rechazado
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categories/cat_gimnasio').update({
+      name: 'Deporte y gym',
+      color: '#0D9488',
+      archived: true,
+      updatedAt: ts,
+    })
+  );
+  const pastTs = firebase.firestore.Timestamp.fromMillis(Date.now() - 60_000);
+  await assertFails(
+    dbAlex.doc('households/h1/categories/cat_gimnasio').update({
+      createdAt: pastTs,
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso no puede leer ni escribir
+  await assertFails(dbIntruder.doc('households/h1/categories/cat_gimnasio').get());
+  await assertFails(
+    dbIntruder.doc('households/h1/categories/cat_hack').set({
+      name: 'Hack',
+      color: '#16A34A',
+      icon: 'tag',
+      order: 1,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Miembro puede eliminar una categoría personalizada sin uso
+  await assertSucceeds(dbAlex.doc('households/h1/categories/cat_gimnasio').delete());
+});
+
+test('16. Aislamiento entre hogares de categorías personalizadas y categoryBudgets/{monthKey}__{catId}', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await seedHouseholdPhaseA('uid_marta', 'h2', 'MRTA26');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+
+  // Alex crea cat_gimnasio en h1
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categories/cat_gimnasio').set({
+      name: 'Gimnasio',
+      color: '#16A34A',
+      icon: 'dumbbell',
+      order: 1,
+      archived: false,
+      csvKeywords: 'basic-fit',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Alex puede usar cat_gimnasio en transactions, recurring, initialCosts y categoryBudgets dentro de h1
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_gym').set({
+      monthKey: '2026-11',
+      concept: 'Cuota Basic-Fit',
+      category: 'cat_gimnasio',
+      amount: 35,
+      date: '2026-11-05',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 100,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_gym').set({
+      concept: 'Mensualidad gimnasio',
+      category: 'cat_gimnasio',
+      amount: 35,
+      frequency: 'mensual',
+      dayOfMonth: 5,
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/initialCosts/ic_gym').set({
+      concept: 'Matrícula club',
+      category: 'cat_gimnasio',
+      amount: 50,
+      paidBy: 'uid_alex',
+      status: 'pagado',
+      dueDate: '',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categoryBudgets/2026-11__cat_gimnasio').set({
+      monthKey: '2026-11',
+      categoryId: 'cat_gimnasio',
+      limit: 60,
+      updatedAt: ts,
+    })
+  );
+
+  // Clave de categoryBudgets mal formada o colocada en budgets/{monthKey} -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/categoryBudgets/doc_malo').set({
+      monthKey: '2026-11',
+      categoryId: 'cat_gimnasio',
+      limit: 60,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/budgets/2026-11').set({
+      monthKey: '2026-11',
+      limits: { cat_gimnasio: 60 },
+      updatedAt: ts,
+    })
+  );
+
+  // Marta (hogar h2) NO puede referenciar cat_gimnasio de h1 en ninguna colección de h2
+  await assertFails(
+    dbMarta.doc('households/h2/transactions/tx_cross').set({
+      monthKey: '2026-11',
+      concept: 'Intento cruzado',
+      category: 'cat_gimnasio',
+      amount: 20,
+      date: '2026-11-05',
+      paidBy: 'uid_marta',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_marta',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h2/recurring/rec_cross').set({
+      concept: 'Recurrente cruzada',
+      category: 'cat_gimnasio',
+      amount: 20,
+      frequency: 'mensual',
+      dayOfMonth: 5,
+      splitOverride: null,
+      paidByDefault: 'uid_marta',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h2/initialCosts/ic_cross').set({
+      concept: 'Inicial cruzado',
+      category: 'cat_gimnasio',
+      amount: 20,
+      paidBy: 'uid_marta',
+      status: 'pendiente',
+      dueDate: '',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h2/categoryBudgets/2026-11__cat_gimnasio').set({
+      monthKey: '2026-11',
+      categoryId: 'cat_gimnasio',
+      limit: 60,
+      updatedAt: ts,
+    })
+  );
+});
+
+test('17. shopping con unit y qty decimal + shoppingCatalog/{prodId} con validación estricta', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Shopping con qty decimal 0.5 y unit 'kg' -> permitido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shopping/shop_dec').set({
+      text: 'Tomates pera',
+      qty: 0.5,
+      unit: 'kg',
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Shopping con qty <= 0, > 999 o unit > 20 -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/shopping/shop_big').set({
+      text: 'Arroz',
+      qty: 1000,
+      unit: 'kg',
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/shopping/shop_bad_unit').set({
+      text: 'Arroz',
+      qty: 1,
+      unit: 'unidad_demasiado_larga_para_regla',
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // shoppingCatalog válido con prod_
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shoppingCatalog/prod_tomates_pera').set({
+      text: 'Tomates pera',
+      defaultUnit: 'kg',
+      usageCount: 1,
+      lastUsedAt: '2026-11-20',
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Actualizar usageCount y lastUsedAt permitido; cambiar createdBy rechazado
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shoppingCatalog/prod_tomates_pera').update({
+      usageCount: 2,
+      lastUsedAt: '2026-11-21',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingCatalog/prod_tomates_pera').update({
+      createdBy: 'uid_intruder',
+      updatedAt: ts,
+    })
+  );
+
+  // ID sin prefijo prod_ o usageCount <= 0 o > 100000 -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingCatalog/tomates_pera').set({
+      text: 'Tomates pera',
+      defaultUnit: 'kg',
+      usageCount: 1,
+      lastUsedAt: '2026-11-20',
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingCatalog/prod_bad_count').set({
+      text: 'Patatas',
+      defaultUnit: 'kg',
+      usageCount: 0,
+      lastUsedAt: '2026-11-20',
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // shopping con metadata válida de catálogo Mercadona -> permitido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shopping/shop_mc').set({
+      text: 'Leche sin lactosa',
+      qty: 2,
+      unit: 'L',
+      done: false,
+      catalogId: 'mc_leche_sin_lactosa_123',
+      brand: 'Hacendado',
+      format: '1 L',
+      section: 'Lácteos, quesos y bebidas vegetales',
+      sourceType: 'mercadona',
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // section o sourceType inventado en shopping -> rechazado
+  await assertFails(
+    dbAlex.doc('households/h1/shopping/shop_bad_sec').set({
+      text: 'Leche',
+      qty: 1,
+      done: false,
+      section: 'Pasillo 99 inventado',
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/shopping/shop_bad_src').set({
+      text: 'Leche',
+      qty: 1,
+      done: false,
+      sourceType: 'carrefour',
+      addedBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // shoppingCatalog con favorite + metadata y actualización de favorito -> permitido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shoppingCatalog/prod_leche_sin_lactosa').set({
+      text: 'Leche sin lactosa',
+      defaultUnit: 'L',
+      usageCount: 1,
+      lastUsedAt: '2026-11-20',
+      favorite: true,
+      catalogId: 'mc_leche_sin_lactosa_123',
+      brand: 'Hacendado',
+      format: '1 L',
+      section: 'Lácteos, quesos y bebidas vegetales',
+      sourceType: 'mercadona',
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shoppingCatalog/prod_leche_sin_lactosa').update({
+      favorite: false,
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso rechazado en shoppingCatalog
+  await assertFails(dbIntruder.doc('households/h1/shoppingCatalog/prod_tomates_pera').get());
+});
+
+// ─── 18. Meses cerrados en reglas (transactions, budgets, categoryBudgets) ──
+test('18. monthClosures bloquea escrituras en transactions, budgets y categoryBudgets hasta reabrir', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+
+  // Creamos categoría personalizada, gasto y presupuestos en mes abierto 2026-10
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categories/cat_mascotas').set({
+      name: 'Mascotas',
+      color: '#D97706',
+      icon: 'paw-print',
+      order: 0,
+      archived: false,
+      csvKeywords: 'vet',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_open_1').set({
+      monthKey: '2026-10',
+      concept: 'Compra octubre',
+      category: 'supermercado',
+      amount: 55.4,
+      date: '2026-10-12',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/budgets/2026-10').set({
+      monthKey: '2026-10',
+      limits: { supermercado: 400 },
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categoryBudgets/2026-10__cat_mascotas').set({
+      monthKey: '2026-10',
+      categoryId: 'cat_mascotas',
+      limit: 80,
+      updatedAt: ts,
+    })
+  );
+
+  // Cerramos 2026-10
+  await assertSucceeds(
+    dbAlex.doc('households/h1/monthClosures/2026-10').set({
+      monthKey: '2026-10',
+      totalSpent: 55.4,
+      paidA: 55.4,
+      paidB: 0,
+      paidComun: 0,
+      shareA: 27.7,
+      shareB: 27.7,
+      balanceA: 27.7,
+      settlementText: 'Marta debe 27,70 € a Alex',
+      closedBy: 'uid_alex',
+      closedAt: ts,
+    })
+  );
+
+  // Con 2026-10 cerrado: crear, editar, borrar en transactions, budgets y categoryBudgets -> RECHAZADO
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_closed_new').set({
+      monthKey: '2026-10',
+      concept: 'Intento tardío',
+      category: 'otros',
+      amount: 10,
+      date: '2026-10-20',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_open_1').update({
+      amount: 99,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbAlex.doc('households/h1/transactions/tx_open_1').delete());
+
+  // Tampoco se puede mover un movimiento de un mes abierto a un mes cerrado
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_nov_1').set({
+      monthKey: '2026-11',
+      concept: 'Gasto noviembre',
+      category: 'otros',
+      amount: 20,
+      date: '2026-11-05',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/transactions/tx_nov_1').update({
+      monthKey: '2026-10',
+      date: '2026-10-25',
+      updatedAt: ts,
+    })
+  );
+
+  await assertFails(
+    dbAlex.doc('households/h1/budgets/2026-10').update({
+      limits: { supermercado: 500 },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbAlex.doc('households/h1/budgets/2026-10').delete());
+
+  await assertFails(
+    dbAlex.doc('households/h1/categoryBudgets/2026-10__cat_mascotas').update({
+      limit: 120,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbAlex.doc('households/h1/categoryBudgets/2026-10__cat_mascotas').delete());
+
+  // Reabrir el mes (delete monthClosure) vuelve a permitir ediciones
+  await assertSucceeds(dbAlex.doc('households/h1/monthClosures/2026-10').delete());
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_open_1').update({
+      amount: 60,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/budgets/2026-10').update({
+      limits: { supermercado: 450 },
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/categoryBudgets/2026-10__cat_mascotas').update({
+      limit: 95,
+      updatedAt: ts,
+    })
+  );
+});
+
+// ─── 19. shoppingCheckouts atómicos, privacidad e integridad ──────────────────
+test('19. shoppingCheckouts exige gasto enlazado, progreso decreciente, privacidad y aislamiento', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Huérfano sin transacción tx_chk_* asociada -> RECHAZADO
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingCheckouts/chk_orphan_12345').set({
+      expenseId: 'tx_chk_orphan_12345',
+      monthKey: '2026-11',
+      amount: 42.5,
+      concept: 'Compra Mercadona',
+      pendingItemIds: ['item_11', 'item_12'],
+      totalItemCount: 12,
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Creación atómica de gasto + shoppingCheckout compartido -> PERMITIDO
+  const sharedBatch = dbAlex.batch();
+  sharedBatch.set(dbAlex.doc('households/h1/transactions/tx_chk_shared_001'), {
+    monthKey: '2026-11',
+    concept: 'Compra semanal',
+    category: 'supermercado',
+    amount: 78.9,
+    date: '2026-11-20',
+    paidBy: 'uid_alex',
+    recurringId: null,
+    splitPctA: 50,
+    isSettlement: false,
+    settlementTo: '',
+    isPrivate: false,
+    createdBy: 'uid_alex',
+    notes: 'Lista de la compra',
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  sharedBatch.set(dbAlex.doc('households/h1/shoppingCheckouts/chk_shared_001'), {
+    expenseId: 'tx_chk_shared_001',
+    monthKey: '2026-11',
+    amount: 78.9,
+    concept: 'Compra semanal',
+    pendingItemIds: ['item_11', 'item_12'],
+    totalItemCount: 12,
+    isPrivate: false,
+    createdBy: 'uid_alex',
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  await assertSucceeds(sharedBatch.commit());
+
+  // Pareja (Marta) puede leer, reducir pendingItemIds y borrar al terminar un checkout compartido
+  await assertSucceeds(dbMarta.doc('households/h1/shoppingCheckouts/chk_shared_001').get());
+  await assertSucceeds(
+    dbMarta.doc('households/h1/shoppingCheckouts/chk_shared_001').update({
+      pendingItemIds: ['item_12'],
+      updatedAt: ts,
+    })
+  );
+  // Inflar pendingItemIds o cambiar expenseId -> RECHAZADO
+  await assertFails(
+    dbMarta.doc('households/h1/shoppingCheckouts/chk_shared_001').update({
+      pendingItemIds: ['item_12', 'item_99'],
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h1/shoppingCheckouts/chk_shared_001').update({
+      amount: 1,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(dbMarta.doc('households/h1/shoppingCheckouts/chk_shared_001').delete());
+
+  // Checkout privado de Alex: requiere amount 0 y concept 'Compra privada', invisible para Marta
+  const privBatch = dbAlex.batch();
+  privBatch.set(dbAlex.doc('households/h1/transactions/tx_chk_priv_001'), {
+    monthKey: '2026-11',
+    concept: 'Capricho privado',
+    category: 'supermercado',
+    amount: 19.5,
+    date: '2026-11-21',
+    paidBy: 'uid_alex',
+    recurringId: null,
+    splitPctA: 100,
+    isSettlement: false,
+    settlementTo: '',
+    isPrivate: true,
+    createdBy: 'uid_alex',
+    notes: '',
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  privBatch.set(dbAlex.doc('households/h1/shoppingCheckouts/chk_priv_001'), {
+    expenseId: 'tx_chk_priv_001',
+    monthKey: '2026-11',
+    amount: 0,
+    concept: 'Compra privada',
+    pendingItemIds: ['item_p1'],
+    totalItemCount: 11,
+    isPrivate: true,
+    createdBy: 'uid_alex',
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  await assertSucceeds(privBatch.commit());
+
+  await assertSucceeds(dbAlex.doc('households/h1/shoppingCheckouts/chk_priv_001').get());
+  await assertFails(dbMarta.doc('households/h1/shoppingCheckouts/chk_priv_001').get());
+  await assertFails(dbMarta.doc('households/h1/shoppingCheckouts/chk_priv_001').delete());
+  await assertFails(dbIntruder.doc('households/h1/shoppingCheckouts/chk_priv_001').get());
+});
+
+// ─── 20. Compatibilidad de consultas reales del repositorio con las reglas ───
+test('20. Consultas reales de FirestoreHouseholdRepository cumplen las reglas y privacidad', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_pub_q').set({
+      monthKey: '2026-11',
+      concept: 'Luz',
+      category: 'luz',
+      amount: 65,
+      date: '2026-11-10',
+      paidBy: 'cuenta_comun',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/transactions/tx_priv_q').set({
+      monthKey: '2026-11',
+      concept: 'Regalo sorpresa',
+      category: 'otros',
+      amount: 40,
+      date: '2026-11-11',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 100,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Consultas de campo único usadas por subscribeVisibleTransactions / fetchVisibleTransactionsMap
+  await assertSucceeds(
+    dbMarta.collection('households/h1/transactions').where('isPrivate', '==', false).get()
+  );
+  await assertSucceeds(
+    dbMarta.collection('households/h1/transactions').where('createdBy', '==', 'uid_marta').get()
+  );
+  // Consulta sin filtro o pidiendo los privados de la pareja -> RECHAZADO
+  await assertFails(dbMarta.collection('households/h1/transactions').get());
+  await assertFails(
+    dbMarta.collection('households/h1/transactions').where('createdBy', '==', 'uid_alex').get()
+  );
+
+  // Consultas de campo único usadas por subscribePendingShoppingCheckouts
+  await assertSucceeds(
+    dbMarta.collection('households/h1/shoppingCheckouts').where('isPrivate', '==', false).get()
+  );
+  await assertSucceeds(
+    dbMarta.collection('households/h1/shoppingCheckouts').where('createdBy', '==', 'uid_marta').get()
+  );
+  await assertFails(dbMarta.collection('households/h1/shoppingCheckouts').get());
+  await assertFails(
+    dbIntruder.collection('households/h1/shoppingCheckouts').where('isPrivate', '==', false).get()
+  );
+});
+
+
 
 
 

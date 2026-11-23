@@ -18,6 +18,7 @@ export interface BuildRecurringIcsOptions {
   fromMonthKey: string;
   monthsHorizon: IcsHorizonMonths;
   alarmDaysBefore: IcsAlarmDaysBefore;
+  categoryLabels?: Record<string, string>;
   now?: Date;
 }
 
@@ -89,6 +90,7 @@ export function buildRecurringIcsCalendar(
     fromMonthKey,
     monthsHorizon,
     alarmDaysBefore,
+    categoryLabels,
     now = new Date(),
   } = options;
 
@@ -123,9 +125,14 @@ export function buildRecurringIcsCalendar(
         const summary = `${rec.concept} (${formatEUR(rec.amount)})`;
         const payerLabel =
           rec.paidByDefault === COMMON_ACCOUNT_ID ? 'Cuenta común' : 'Pago individual';
+        const catLabel =
+          categoryLabels?.[rec.category] ||
+          EXPENSE_CATEGORY_LABELS[rec.category] ||
+          rec.category ||
+          'Otros';
         const description = [
           `Hogar: ${householdName || 'Nido'}`,
-          `Categoría: ${EXPENSE_CATEGORY_LABELS[rec.category]}`,
+          `Categoría: ${catLabel}`,
           `Frecuencia: ${FREQUENCY_LABELS[rec.frequency]}`,
           `Pagador previsto: ${payerLabel}`,
           'Generado desde Nido (exportación estática puntual).',
@@ -139,7 +146,7 @@ export function buildRecurringIcsCalendar(
           `DTEND;VALUE=DATE:${dtEnd}`,
           `SUMMARY:${escapeIcsText(summary)}`,
           `DESCRIPTION:${escapeIcsText(description)}`,
-          `CATEGORIES:${escapeIcsText(EXPENSE_CATEGORY_LABELS[rec.category])}`,
+          `CATEGORIES:${escapeIcsText(catLabel)}`,
           'TRANSP:TRANSPARENT',
           'BEGIN:VALARM',
           'ACTION:DISPLAY',

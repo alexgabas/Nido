@@ -1,6 +1,20 @@
-import type { NidoBackupV1 } from '../types/nido';
+import {
+  MAX_LENGTHS,
+  SHOPPING_SECTIONS,
+  type NidoBackupV1,
+  type ShoppingSection,
+  type ShoppingSourceType,
+} from '../types/nido';
+import {
+  buildCategoryBudgetDocId,
+  isCustomCategoryId,
+  isValidCategoryIcon,
+} from './categories';
 import { isValidHexColor } from './categoryPalette';
 import { localDaysBetween } from './finance';
+
+const VALID_SHOPPING_SECTIONS = new Set<string>(SHOPPING_SECTIONS);
+const VALID_SHOPPING_SOURCES = new Set<string>(['mercadona', 'custom', 'generic']);
 
 export function formatCSVNumberES(n: number): string {
   return (Math.round((n + Number.EPSILON) * 100) / 100).toFixed(2).replace('.', ',');
@@ -161,6 +175,46 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     return val;
   };
 
+  let customCategories: NidoBackupV1['customCategories'] = undefined;
+  const customCategoryIdSet = new Set<string>();
+  if (raw.customCategories !== undefined) {
+    if (!Array.isArray(raw.customCategories)) {
+      throw new Error('customCategories inválido en la copia.');
+    }
+    customCategories = raw.customCategories.map((item, idx) => {
+      if (!isObj(item)) throw new Error(`customCategories[${idx}] inválido.`);
+      const id = assertStr(item.id, `customCategories[${idx}].id`, 48, 6);
+      if (!isCustomCategoryId(id)) {
+        throw new Error(`ID inválido en customCategories[${idx}]: ${id}.`);
+      }
+      const color = assertStr(item.color, `customCategories[${idx}].color`, 7, 7);
+      if (!isValidHexColor(color)) {
+        throw new Error(`Color hexadecimal inválido en customCategories[${idx}].`);
+      }
+      const icon = assertStr(item.icon ?? 'tag', `customCategories[${idx}].icon`, MAX_LENGTHS.categoryIcon, 1);
+      if (!isValidCategoryIcon(icon)) {
+        throw new Error(`Icono inválido en customCategories[${idx}].`);
+      }
+      if (typeof item.archived !== 'boolean') {
+        throw new Error(`customCategories[${idx}].archived inválido.`);
+      }
+      const order = assertFiniteNum(item.order ?? idx, `customCategories[${idx}].order`);
+      if (order < 0 || order > 999) {
+        throw new Error(`Orden fuera de rango en customCategories[${idx}].`);
+      }
+      customCategoryIdSet.add(id);
+      return {
+        id,
+        name: assertStr(item.name, `customCategories[${idx}].name`, MAX_LENGTHS.categoryName, 1),
+        color: color.toUpperCase(),
+        icon,
+        order: Math.round(order),
+        archived: item.archived,
+        csvKeywords: assertStr(item.csvKeywords ?? '', `customCategories[${idx}].csvKeywords`, MAX_LENGTHS.csvKeywordString),
+      };
+    });
+  }
+
   let csvKeywords: NidoBackupV1['csvKeywords'] = undefined;
   if (raw.csvKeywords !== undefined) {
     if (!isObj(raw.csvKeywords)) throw new Error('csvKeywords inválido en la copia.');
@@ -191,10 +245,17 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     categoryColors = cleanColors as NidoBackupV1['categoryColors'];
   }
 
+  const isAllowedExpenseCategory = (cat: string): boolean => {
+    if (VALID_TX_CATS.has(cat) && cat !== 'liquidacion') return true;
+    return customCategoryIdSet.has(cat);
+  };
+
   const initialCosts = arr('initialCosts').map((item, idx) => {
     if (!isObj(item)) throw new Error(`initialCosts[${idx}] inválido.`);
     const cat = String(item.category);
-    if (!VALID_INITIAL_CATS.has(cat)) throw new Error(`Categoría inválida en initialCosts[${idx}].`);
+    if (!VALID_INITIAL_CATS.has(cat) && !customCategoryIdSet.has(cat)) {
+      throw new Error(`Categoría inválida en initialCosts[${idx}].`);
+    }
     const status = String(item.status);
     if (status !== 'pendiente' && status !== 'pagado') {
       throw new Error(`Estado inválido en initialCosts[${idx}].`);
@@ -254,7 +315,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     if (!isObj(item)) throw new Error(`recurring[${idx}] inválido.`);
     const cat = String(item.category);
     const freq = String(item.frequency);
-    if (!VALID_TX_CATS.has(cat) || cat === 'liquidacion') {
+    if (!isAllowedExpenseCategory(cat)) {
       throw new Error(`Categoría inválida en recurring[${idx}].`);
     }
     if (!VALID_FREQS.has(freq)) throw new Error(`Frecuencia inválida en recurring[${idx}].`);
@@ -288,7 +349,9 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
   const transactions = arr('transactions').map((item, idx) => {
     if (!isObj(item)) throw new Error(`transactions[${idx}] inválido.`);
     const cat = String(item.category);
-    if (!VALID_TX_CATS.has(cat)) throw new Error(`Categoría inválida en transactions[${idx}].`);
+    if (!VALID_TX_CATS.has(cat) && !customCategoryIdSet.has(cat)) {
+      throw new Error(`Categoría inválida en transactions[${idx}].`);
+    }
     const splitPctA = assertFiniteNum(item.splitPctA, `transactions[${idx}].splitPctA`);
     if (splitPctA < 0 || splitPctA > 100) throw new Error(`splitPctA inválido en transactions[${idx}].`);
     if (typeof item.isSettlement !== 'boolean') {
@@ -323,20 +386,54 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     };
   });
 
+  const extractedCustomBudgets: Array<{ id: string; monthKey: string; categoryId: string; limit: number }> = [];
+  const extractedBudgetIds = new Set<string>();
   const budgets = arr('budgets').map((item, idx) => {
     if (!isObj(item)) throw new Error(`budgets[${idx}] inválido.`);
     if (!isObj(item.limits)) throw new Error(`budgets[${idx}].limits inválido.`);
+    const monthKey = assertMonthKey(item.monthKey, `budgets[${idx}].monthKey`);
     const cleanLimits: Record<string, number> = {};
     for (const [k, v] of Object.entries(item.limits)) {
       if (VALID_TX_CATS.has(k) && k !== 'liquidacion') {
         cleanLimits[k] = assertNonNegNum(v, `budgets[${idx}].limits.${k}`);
+      } else if (customCategoryIdSet.has(k)) {
+        const val = assertNonNegNum(v, `budgets[${idx}].limits.${k}`);
+        const docId = buildCategoryBudgetDocId(monthKey, k);
+        if (!extractedBudgetIds.has(docId)) {
+          extractedBudgetIds.add(docId);
+          extractedCustomBudgets.push({ id: docId, monthKey, categoryId: k, limit: val });
+        }
       }
     }
     return {
-      monthKey: assertMonthKey(item.monthKey, `budgets[${idx}].monthKey`),
+      monthKey,
       limits: cleanLimits,
     };
   });
+
+  let categoryBudgets: NidoBackupV1['categoryBudgets'] = undefined;
+  if (raw.categoryBudgets !== undefined) {
+    if (!Array.isArray(raw.categoryBudgets)) {
+      throw new Error('categoryBudgets inválido en la copia.');
+    }
+    categoryBudgets = raw.categoryBudgets.map((item, idx) => {
+      if (!isObj(item)) throw new Error(`categoryBudgets[${idx}] inválido.`);
+      const monthKey = assertMonthKey(item.monthKey, `categoryBudgets[${idx}].monthKey`);
+      const categoryId = assertStr(item.categoryId, `categoryBudgets[${idx}].categoryId`, 48, 6);
+      if (!customCategoryIdSet.has(categoryId)) {
+        throw new Error(`Categoría desconocida en categoryBudgets[${idx}]: ${categoryId}.`);
+      }
+      const id = buildCategoryBudgetDocId(monthKey, categoryId);
+      return {
+        id,
+        monthKey,
+        categoryId,
+        limit: assertNonNegNum(item.limit, `categoryBudgets[${idx}].limit`),
+      };
+    });
+  } else if (extractedCustomBudgets.length > 0) {
+    categoryBudgets = extractedCustomBudgets;
+  }
 
   const monthClosures = arr('monthClosures').map((item, idx) => {
     if (!isObj(item)) throw new Error(`monthClosures[${idx}] inválido.`);
@@ -385,18 +482,80 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     };
   });
 
+  const parseOptShoppingMeta = (item: Record<string, unknown>, prefix: string) => {
+    const catalogId =
+      typeof item.catalogId === 'string' && item.catalogId.trim()
+        ? assertStr(item.catalogId.trim(), `${prefix}.catalogId`, MAX_LENGTHS.shoppingCatalogId)
+        : '';
+    const brand =
+      typeof item.brand === 'string' && item.brand.trim()
+        ? assertStr(item.brand.trim(), `${prefix}.brand`, MAX_LENGTHS.shoppingBrand)
+        : '';
+    const format =
+      typeof item.format === 'string' && item.format.trim()
+        ? assertStr(item.format.trim(), `${prefix}.format`, MAX_LENGTHS.shoppingFormat)
+        : '';
+    const rawSection = typeof item.section === 'string' ? item.section.trim() : '';
+    const section: ShoppingSection | undefined =
+      rawSection && VALID_SHOPPING_SECTIONS.has(rawSection)
+        ? (rawSection as ShoppingSection)
+        : undefined;
+    const rawSource = typeof item.sourceType === 'string' ? item.sourceType.trim() : '';
+    const sourceType: ShoppingSourceType | undefined =
+      rawSource && VALID_SHOPPING_SOURCES.has(rawSource)
+        ? (rawSource as ShoppingSourceType)
+        : undefined;
+    return {
+      ...(catalogId ? { catalogId } : {}),
+      ...(brand ? { brand } : {}),
+      ...(format ? { format } : {}),
+      ...(section ? { section } : {}),
+      ...(sourceType ? { sourceType } : {}),
+    };
+  };
+
   const shopping = Array.isArray(raw.shopping)
     ? raw.shopping.map((item, idx) => {
         if (!isObj(item)) throw new Error(`shopping[${idx}] inválido.`);
         if (typeof item.done !== 'boolean') throw new Error(`shopping[${idx}].done inválido.`);
         const qty = assertFiniteNum(item.qty, `shopping[${idx}].qty`);
-        if (qty < 1 || qty > 999) throw new Error(`Cantidad fuera de rango en shopping[${idx}].`);
+        if (qty <= 0 || qty > 999) throw new Error(`Cantidad fuera de rango en shopping[${idx}].`);
+        const unit =
+          item.unit !== undefined && item.unit !== null
+            ? assertStr(item.unit, `shopping[${idx}].unit`, MAX_LENGTHS.shoppingUnit)
+            : '';
         return {
           id: assertStr(item.id, `shopping[${idx}].id`, 128, 1),
           text: assertStr(item.text, `shopping[${idx}].text`, 120, 1),
           qty,
+          ...(unit ? { unit } : {}),
           done: item.done,
+          ...parseOptShoppingMeta(item, `shopping[${idx}]`),
           addedBy: assertStr(item.addedBy ?? '', `shopping[${idx}].addedBy`, 128),
+        };
+      })
+    : undefined;
+
+  const shoppingCatalog = Array.isArray(raw.shoppingCatalog)
+    ? raw.shoppingCatalog.map((item, idx) => {
+        if (!isObj(item)) throw new Error(`shoppingCatalog[${idx}] inválido.`);
+        const usageCount = assertFiniteNum(item.usageCount ?? 1, `shoppingCatalog[${idx}].usageCount`);
+        if (usageCount < 1 || usageCount > 100000) {
+          throw new Error(`usageCount fuera de rango en shoppingCatalog[${idx}].`);
+        }
+        return {
+          id: assertStr(item.id, `shoppingCatalog[${idx}].id`, 48, 6),
+          text: assertStr(item.text, `shoppingCatalog[${idx}].text`, 120, 1),
+          defaultUnit: assertStr(
+            item.defaultUnit ?? '',
+            `shoppingCatalog[${idx}].defaultUnit`,
+            MAX_LENGTHS.shoppingUnit
+          ),
+          usageCount: Math.round(usageCount),
+          lastUsedAt: assertStr(item.lastUsedAt ?? '', `shoppingCatalog[${idx}].lastUsedAt`, 32),
+          ...(typeof item.favorite === 'boolean' ? { favorite: item.favorite } : {}),
+          ...parseOptShoppingMeta(item, `shoppingCatalog[${idx}]`),
+          createdBy: assertStr(item.createdBy ?? '', `shoppingCatalog[${idx}].createdBy`, 128),
         };
       })
     : undefined;
@@ -416,6 +575,8 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     },
     ...(csvKeywords ? { csvKeywords } : {}),
     ...(categoryColors ? { categoryColors } : {}),
+    ...(customCategories ? { customCategories } : {}),
+    ...(categoryBudgets ? { categoryBudgets } : {}),
     initialCosts,
     checklist,
     items,
@@ -426,6 +587,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     goals,
     goalMovements,
     ...(shopping ? { shopping } : {}),
+    ...(shoppingCatalog ? { shoppingCatalog } : {}),
   };
 }
 

@@ -1,15 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { AlertCircle, Trash2 } from 'lucide-react';
+import { useNido } from '../../context/NidoContext';
 import {
   computeRecurringHistoricalAverage,
   formatEUR,
   inferSplitChoice,
   resolveSplitPctForChoice,
 } from '../../domain/finance';
-import {
-  EXPENSE_CATEGORY_LABELS,
-  FREQUENCY_LABELS,
-} from '../../domain/presets';
+import { FREQUENCY_LABELS } from '../../domain/presets';
 import { isValidMonthKey } from '../../domain/recurrence';
 import { toUserFriendlyErrorMessage } from '../../services/firebase';
 import {
@@ -53,6 +51,7 @@ export const RecurringTemplateModal: React.FC<RecurringTemplateModalProps> = ({
   onDeleteRequest,
   onClose,
 }) => {
+  const { categoryRegistry } = useNido();
   const [concept, setConcept] = useState('');
   const [category, setCategory] = useState<ExpenseCategory>('alquiler');
   const [amount, setAmount] = useState('');
@@ -106,6 +105,9 @@ export const RecurringTemplateModal: React.FC<RecurringTemplateModalProps> = ({
   const histAvg = editingRec
     ? computeRecurringHistoricalAverage(transactions, editingRec.id, 3)
     : null;
+  const selectableCategories = categoryRegistry.activeCategories.some((c) => c.id === category)
+    ? categoryRegistry.activeCategories
+    : [...categoryRegistry.activeCategories, categoryRegistry.getMeta(category)];
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -216,9 +218,9 @@ export const RecurringTemplateModal: React.FC<RecurringTemplateModalProps> = ({
                 onChange={(e) => setCategory(e.target.value as ExpenseCategory)}
                 className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
               >
-                {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
-                  <option key={cat} value={cat}>
-                    {EXPENSE_CATEGORY_LABELS[cat]}
+                {selectableCategories.map((cat) => (
+                  <option key={cat.id} value={cat.id}>
+                    {cat.archived ? `${cat.label} (Archivada)` : cat.label}
                   </option>
                 ))}
               </select>

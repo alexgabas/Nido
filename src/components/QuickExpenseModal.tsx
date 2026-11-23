@@ -1,21 +1,16 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
-  Car,
   Check,
+  ChevronDown,
+  ChevronUp,
   Delete,
-  Droplets,
-  Home,
   Lock,
-  ShoppingCart,
-  Tag,
-  UtensilsCrossed,
   Wallet,
-  Wifi,
   X,
-  Zap,
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
+import { pickSimpleWizardCategories } from '../domain/categories';
 import {
   clampSplitPct,
   computeRecurringHistoricalAverage,
@@ -25,8 +20,7 @@ import {
   inferSplitChoice,
   resolveSplitPctForChoice,
 } from '../domain/finance';
-import { resolveCategoryColor } from '../domain/categoryPalette';
-import { EXPENSE_CATEGORY_LABELS } from '../domain/presets';
+import { globalSearchSessionCache } from '../domain/globalSearch';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
   COMMON_ACCOUNT_ID,
@@ -35,6 +29,7 @@ import {
   type SplitPresetChoice,
   type Transaction,
 } from '../types/nido';
+import { CategoryIcon } from './CategoryIcon';
 
 interface QuickExpenseModalProps {
   open: boolean;
@@ -43,21 +38,6 @@ interface QuickExpenseModalProps {
   prefill?: ExpensePrefill | null;
   onSaved?: (() => Promise<void> | void) | null;
 }
-
-const SENCILLO_CATEGORIES: Array<{
-  id: ExpenseCategory;
-  label: string;
-  icon: React.ComponentType<{ className?: string }>;
-}> = [
-  { id: 'supermercado', label: 'Supermercado', icon: ShoppingCart },
-  { id: 'alquiler', label: 'Alquiler', icon: Home },
-  { id: 'luz', label: 'Luz', icon: Zap },
-  { id: 'agua', label: 'Agua', icon: Droplets },
-  { id: 'internet', label: 'Internet', icon: Wifi },
-  { id: 'ocio', label: 'Ocio', icon: UtensilsCrossed },
-  { id: 'transporte', label: 'Transporte', icon: Car },
-  { id: 'otros', label: 'Otros', icon: Tag },
-];
 
 const KEYPAD_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', ',', '0', 'BACK'] as const;
 
@@ -97,7 +77,6 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   onSaved = null,
 }) => {
   const {
-    household,
     householdId,
     currentUserProfile,
     currentMember,
@@ -108,6 +87,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     monthClosures,
     recentTransactions,
     monthTransactions,
+    categoryRegistry,
     uiMode,
     repo,
     showToast,
@@ -118,6 +98,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     : !memberB || currentUserProfile?.uid !== memberB.uid;
 
   const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
+  const [showAllSimpleCats, setShowAllSimpleCats] = useState(false);
   const [amount, setAmount] = useState('');
   const [concept, setConcept] = useState('');
   const [conceptTouched, setConceptTouched] = useState(false);
@@ -129,6 +110,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   const [isPrivate, setIsPrivate] = useState(false);
   const [notes, setNotes] = useState('');
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   const isSimpleWizard = uiMode === 'sencillo' && !editingTx;
@@ -141,10 +123,22 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       editingTx.createdBy !== currentUserProfile.uid
   );
 
+  const simpleWizardCats = useMemo(
+    () => pickSimpleWizardCategories(categoryRegistry.activeCategories, recentTransactions, 8),
+    [categoryRegistry.activeCategories, recentTransactions]
+  );
+
+  const editableCategories = useMemo(() => {
+    const active = categoryRegistry.activeCategories;
+    if (!category || active.some((c) => c.id === category)) return active;
+    return [...active, categoryRegistry.getMeta(category)];
+  }, [categoryRegistry, category]);
+
   useEffect(() => {
     if (!open) return;
     setError(null);
     setWizardStep(1);
+    setShowAllSimpleCats(false);
     if (editingTx) {
       setConceptTouched(false);
       const clampedSplit = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
@@ -175,7 +169,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       const initialCategory = prefill?.category ?? 'supermercado';
       const initialConcept =
         prefill?.concept ??
-        (uiMode === 'sencillo' ? EXPENSE_CATEGORY_LABELS[initialCategory] : '');
+        (uiMode === 'sencillo' ? categoryRegistry.getLabel(initialCategory) : '');
       setConceptTouched(Boolean(prefill?.concept));
       setAmount(prefill?.amount ? prefill.amount.trim().replace('.', ',') : '');
       setConcept(initialConcept);
@@ -197,6 +191,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     effectiveSplitPctA,
     uiMode,
     viewerIsMemberA,
+    categoryRegistry,
   ]);
 
   const appendKeypadChar = (key: string) => {
@@ -271,7 +266,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   const handleSelectSimpleCategory = (cat: ExpenseCategory) => {
     setCategory(cat);
     if (!conceptTouched || !concept.trim()) {
-      setConcept(EXPENSE_CATEGORY_LABELS[cat]);
+      setConcept(categoryRegistry.getLabel(cat));
     }
     setError(null);
     setWizardStep(3);
@@ -294,12 +289,12 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
   };
 
   const saveTransaction = async () => {
-    if (!householdId || !currentUserProfile) return;
+    if (!householdId || !currentUserProfile || savingRef.current) return;
     if (!hasValidAmount) {
       setError('Introduce un importe mayor que 0.');
       return;
     }
-    const cleanConcept = concept.trim() || (isSimpleWizard ? EXPENSE_CATEGORY_LABELS[category] : '');
+    const cleanConcept = concept.trim() || (isSimpleWizard ? categoryRegistry.getLabel(category) : '');
     if (!cleanConcept) {
       setError('Escribe un concepto breve (ej. Compra Bonpreu).');
       return;
@@ -346,6 +341,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
 
     const safePaidBy = isPrivate ? (editingTx?.createdBy || currentUserProfile.uid) : paidBy;
 
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -369,6 +365,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
         },
         currentUserProfile
       );
+      globalSearchSessionCache.invalidateHousehold(householdId);
       if (onSaved) {
         try {
           await onSaved();
@@ -383,6 +380,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     } catch (err) {
       setError(toUserFriendlyErrorMessage(err, 'No se pudo guardar el gasto. Inténtalo de nuevo.'));
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -538,7 +536,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           )}
 
-          {/* PASO 2: CATEGORÍA (MÁXIMO 8 ICONOS GRANDES) */}
+          {/* PASO 2: CATEGORÍA (MÁXIMO 8 PRINCIPALES + MÁS CATEGORÍAS) */}
           {wizardStep === 2 && (
             <div className="flex-1 flex flex-col justify-between gap-4">
               <div className="space-y-4">
@@ -550,10 +548,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
-                  {SENCILLO_CATEGORIES.map((item) => {
-                    const Icon = item.icon;
+                  {simpleWizardCats.primaryCategories.map((item) => {
                     const active = category === item.id;
-                    const dotColor = resolveCategoryColor(item.id, household?.categoryColors);
                     return (
                       <button
                         key={item.id}
@@ -568,14 +564,65 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                         <span
                           aria-hidden="true"
                           className="absolute top-3 right-3 w-2.5 h-2.5 rounded-full"
-                          style={{ backgroundColor: dotColor }}
+                          style={{ backgroundColor: item.color }}
                         />
-                        <Icon className="w-7 h-7" />
-                        <span className="text-sm font-bold">{item.label}</span>
+                        <CategoryIcon icon={item.icon} className="w-7 h-7" />
+                        <span className="text-sm font-bold text-center leading-tight line-clamp-2">
+                          {item.label}
+                        </span>
                       </button>
                     );
                   })}
                 </div>
+
+                {simpleWizardCats.overflowCategories.length > 0 && (
+                  <div className="space-y-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowAllSimpleCats((v) => !v)}
+                      className="w-full min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4] inline-flex items-center justify-center gap-1.5"
+                    >
+                      <span>
+                        {showAllSimpleCats
+                          ? 'Ocultar otras categorías'
+                          : `Más categorías (${simpleWizardCats.overflowCategories.length})`}
+                      </span>
+                      {showAllSimpleCats ? (
+                        <ChevronUp className="w-4 h-4" />
+                      ) : (
+                        <ChevronDown className="w-4 h-4" />
+                      )}
+                    </button>
+
+                    {showAllSimpleCats && (
+                      <div className="grid grid-cols-2 gap-2.5">
+                        {simpleWizardCats.overflowCategories.map((item) => {
+                          const active = category === item.id;
+                          return (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => handleSelectSimpleCategory(item.id)}
+                              className={`min-h-[54px] px-3 py-2.5 rounded-xl border flex items-center gap-2.5 text-left transition-all ${
+                                active
+                                  ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                                  : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-[#0F1F24] dark:text-[#F0F5F6]'
+                              }`}
+                            >
+                              <span
+                                aria-hidden="true"
+                                className="w-2.5 h-2.5 rounded-full shrink-0"
+                                style={{ backgroundColor: item.color }}
+                              />
+                              <CategoryIcon icon={item.icon} className="w-4 h-4 shrink-0" />
+                              <span className="text-xs font-bold truncate">{item.label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <button
@@ -594,7 +641,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
               <div className="space-y-4">
                 <div className="text-center space-y-1">
                   <p className="font-mono-num text-lg font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                    {formatEUR(numericAmount)} · {EXPENSE_CATEGORY_LABELS[category]}
+                    {formatEUR(numericAmount)} · {categoryRegistry.getLabel(category)}
                   </p>
                   <h2 className="font-display text-2xl font-bold">
                     {isPrivate ? 'Gasto privado' : '¿Quién lo ha pagado?'}
@@ -747,7 +794,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                       setConceptTouched(true);
                       setConcept(e.target.value);
                     }}
-                    placeholder={EXPENSE_CATEGORY_LABELS[category]}
+                    placeholder={categoryRegistry.getLabel(category)}
                     className="w-full min-h-[48px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-sm font-medium"
                   />
                   {notes.trim() && (
@@ -866,9 +913,10 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                 onChange={(e) => setCategory(e.target.value as ExpenseCategory)}
                 className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
               >
-                {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
-                  <option key={cat} value={cat}>
-                    {EXPENSE_CATEGORY_LABELS[cat]}
+                {editableCategories.map((cat) => (
+                  <option key={cat.id} value={cat.id}>
+                    {cat.label}
+                    {cat.archived ? ' (Archivada)' : ''}
                   </option>
                 ))}
               </select>
@@ -1075,28 +1123,28 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
               Categoría
             </span>
             <div className="flex flex-wrap gap-1.5">
-              {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => {
-                const dotColor = resolveCategoryColor(cat, household?.categoryColors);
-                return (
-                  <button
-                    key={cat}
-                    type="button"
-                    onClick={() => setCategory(cat)}
-                    className={`min-h-[44px] px-3 rounded-xl text-xs font-medium transition-colors whitespace-nowrap inline-flex items-center gap-1.5 ${
-                      category === cat
-                        ? 'bg-[#0E5A64] text-white'
-                        : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
-                    }`}
-                  >
-                    <span
-                      aria-hidden="true"
-                      className="w-2 h-2 rounded-full shrink-0"
-                      style={{ backgroundColor: dotColor }}
-                    />
-                    <span>{EXPENSE_CATEGORY_LABELS[cat]}</span>
-                  </button>
-                );
-              })}
+              {editableCategories.map((cat) => (
+                <button
+                  key={cat.id}
+                  type="button"
+                  onClick={() => setCategory(cat.id)}
+                  className={`min-h-[44px] px-3 rounded-xl text-xs font-medium transition-colors whitespace-nowrap inline-flex items-center gap-1.5 ${
+                    category === cat.id
+                      ? 'bg-[#0E5A64] text-white'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
+                  }`}
+                >
+                  <span
+                    aria-hidden="true"
+                    className="w-2 h-2 rounded-full shrink-0"
+                    style={{ backgroundColor: cat.color }}
+                  />
+                  <span>
+                    {cat.label}
+                    {cat.archived ? ' (Archivada)' : ''}
+                  </span>
+                </button>
+              ))}
             </div>
           </div>
 

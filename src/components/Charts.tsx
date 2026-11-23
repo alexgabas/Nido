@@ -31,7 +31,7 @@ export const DonutChart: React.FC<{
             className="text-slate-100 dark:text-slate-800"
           />
           {total > 0 &&
-            slices.map((s) => {
+            slices.map((s, idx) => {
               if (s.value <= 0) return null;
               const fraction = s.value / total;
               const dashLength = fraction * circumference;
@@ -39,7 +39,7 @@ export const DonutChart: React.FC<{
               accumulated += fraction;
               return (
                 <circle
-                  key={s.label}
+                  key={`${idx}-${s.label}`}
                   cx="70"
                   cy="70"
                   r={radius}
@@ -66,10 +66,10 @@ export const DonutChart: React.FC<{
         ) : (
           slices
             .filter((s) => s.value > 0)
-            .map((s) => {
+            .map((s, idx) => {
               const pct = total > 0 ? Math.round((s.value / total) * 100) : 0;
               return (
-                <div key={s.label} className="flex items-center justify-between gap-3 text-sm">
+                <div key={`${idx}-${s.label}`} className="flex items-center justify-between gap-3 text-sm">
                   <div className="flex items-center gap-2 min-w-0">
                     <span
                       className="w-2.5 h-2.5 rounded-sm shrink-0"

@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { ArrowUpDown, Check, Lock, Pencil, Search, Trash2, X } from 'lucide-react';
 import { CategoryTag } from '../CategoryTag';
+import { useNido } from '../../context/NidoContext';
 import { clampSplitPct, formatDateES, formatEUR, formatMonthLabelES } from '../../domain/finance';
-import { EXPENSE_CATEGORY_LABELS, TRANSACTION_CATEGORY_LABELS } from '../../domain/presets';
 import {
   COMMON_ACCOUNT_ID,
   type ExpenseCategory,
@@ -71,6 +71,7 @@ export const TransactionsTableSection: React.FC<TransactionsTableSectionProps> =
   onOpenEditModal,
   onDeleteRequest,
 }) => {
+  const { categoryRegistry } = useNido();
   const [inlineEditId, setInlineEditId] = useState<string | null>(null);
   const [inlineConcept, setInlineConcept] = useState('');
   const [inlineCategory, setInlineCategory] = useState<ExpenseCategory>('supermercado');
@@ -154,11 +155,12 @@ export const TransactionsTableSection: React.FC<TransactionsTableSectionProps> =
             className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium"
           >
             <option value="todas">Todas las categorías</option>
-            {(Object.keys(TRANSACTION_CATEGORY_LABELS) as TransactionCategory[]).map((cat) => (
-              <option key={cat} value={cat}>
-                {TRANSACTION_CATEGORY_LABELS[cat]}
+            {categoryRegistry.allKnownCategories.map((cat) => (
+              <option key={cat.id} value={cat.id}>
+                {cat.archived ? `${cat.label} (Archivada)` : cat.label}
               </option>
             ))}
+            <option value="liquidacion">Liquidación</option>
           </select>
         </div>
         <div className="sm:col-span-3">
@@ -315,9 +317,15 @@ export const TransactionsTableSection: React.FC<TransactionsTableSectionProps> =
                           onChange={(e) => setInlineCategory(e.target.value as ExpenseCategory)}
                           className="min-h-[44px] px-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
                         >
-                          {(Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]).map((cat) => (
-                            <option key={cat} value={cat}>
-                              {EXPENSE_CATEGORY_LABELS[cat]}
+                          {(categoryRegistry.activeCategories.some((c) => c.id === inlineCategory)
+                            ? categoryRegistry.activeCategories
+                            : [
+                                ...categoryRegistry.activeCategories,
+                                categoryRegistry.getMeta(inlineCategory),
+                              ]
+                          ).map((cat) => (
+                            <option key={cat.id} value={cat.id}>
+                              {cat.archived ? `${cat.label} (Archivada)` : cat.label}
                             </option>
                           ))}
                         </select>

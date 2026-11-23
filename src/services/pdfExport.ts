@@ -29,7 +29,7 @@ import type {
 
 export type PdfReportScope = 'mensual' | 'mudanza' | 'ahorros' | 'completo';
 
-interface PdfExportInput {
+export interface PdfExportInput {
   scope: PdfReportScope;
   household: Household;
   members: HouseholdMember[];
@@ -40,6 +40,7 @@ interface PdfExportInput {
   items: FurnitureItem[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
+  categoryLabels?: Record<string, string>;
 }
 
 function memberLabel(uid: string, members: HouseholdMember[]): string {
@@ -59,6 +60,7 @@ export function exportNidoPDF(input: PdfExportInput): void {
     items,
     goals,
     goalMovements,
+    categoryLabels,
   } = input;
 
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
@@ -123,7 +125,7 @@ export function exportNidoPDF(input: PdfExportInput): void {
         ? filteredTx.map((t) => [
             formatDateES(t.date),
             t.isPrivate ? `${t.concept} (Personal)` : t.concept,
-            TRANSACTION_CATEGORY_LABELS[t.category] || t.category,
+            categoryLabels?.[t.category] || TRANSACTION_CATEGORY_LABELS[t.category] || t.category,
             memberLabel(t.paidBy, members),
             t.isPrivate
               ? 'Solo tú'
@@ -176,7 +178,7 @@ export function exportNidoPDF(input: PdfExportInput): void {
       head: [['Concepto inicial', 'Categoría', 'Estado', 'Pagó', 'Importe']],
       body: initialCosts.map((c) => [
         c.concept,
-        INITIAL_COST_CATEGORY_LABELS[c.category],
+        INITIAL_COST_CATEGORY_LABELS[c.category] || categoryLabels?.[c.category] || c.category,
         c.status === 'pagado' ? 'Pagado' : 'Pendiente',
         memberLabel(c.paidBy, members),
         formatEUR(c.amount),

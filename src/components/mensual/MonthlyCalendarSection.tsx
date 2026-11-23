@@ -51,9 +51,9 @@ export const MonthlyCalendarSection: React.FC<MonthlyCalendarSectionProps> = ({
   onEditTransaction,
   onOpenColorModal,
 }) => {
-  const { household } = useNido();
+  const { categoryRegistry } = useNido();
   const todayISO = getTodayLocalISO();
-  const customColors = household?.categoryColors;
+  const customColors = categoryRegistry.colorsMap;
 
   const grid = useMemo(
     () => buildMonthCalendarGrid(monthKey, transactions, recurring, todayISO),

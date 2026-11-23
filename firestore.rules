@@ -45,6 +45,60 @@ service cloud.firestore {
       return n is int || n is float;
     }
 
+    function isValidHexColor(c) {
+      return c is string && c.size() == 7 && c.matches('^#[0-9A-Fa-f]{6}$');
+    }
+
+    function isCustomCategoryId(id) {
+      return id is string && id.size() >= 6 && id.size() <= 48 && id.matches('^cat_[a-zA-Z0-9_]{2,44}$');
+    }
+
+    function isValidShoppingCatalogId(id) {
+      return id is string && id.size() >= 7 && id.size() <= 48 && id.matches('^prod_[a-zA-Z0-9_]{2,43}$');
+    }
+
+    function isValidCheckoutId(id) {
+      return id is string && id.size() >= 10 && id.size() <= 48 && id.matches('^chk_[a-zA-Z0-9_]{6,40}$');
+    }
+
+    function isMonthClosed(hid, monthKey) {
+      return exists(/databases/$(database)/documents/households/$(hid)/monthClosures/$(monthKey));
+    }
+
+    function isValidCategoryIcon(icon) {
+      return icon is string && icon in [
+        'tag', 'home', 'dumbbell', 'heart-pulse', 'paw-print', 'utensils', 'shirt', 'gift',
+        'plane', 'graduation-cap', 'sparkles', 'car', 'alert-circle', 'shopping-bag', 'coffee',
+        'music', 'wrench', 'book', 'zap', 'droplets', 'flame', 'wifi', 'smartphone', 'tv',
+        'shield', 'building-2', 'shopping-cart', 'ticket', 'layers'
+      ];
+    }
+
+    function isValidHouseholdExpenseCategory(cat, hid) {
+      return (cat in [
+        'alquiler', 'luz', 'agua', 'gas', 'internet', 'movil',
+        'suscripciones', 'seguros', 'comunidad', 'supermercado',
+        'transporte', 'ocio', 'otros'
+      ]) || (
+        isCustomCategoryId(cat) && (
+          exists(/databases/$(database)/documents/households/$(hid)/categories/$(cat))
+          || existsAfter(/databases/$(database)/documents/households/$(hid)/categories/$(cat))
+        )
+      );
+    }
+
+    function isValidHouseholdInitialCategory(cat, hid) {
+      return (cat in [
+        'alquiler', 'fianza', 'garantia_adicional', 'suministros',
+        'cerrajeria', 'mudanza', 'mobiliario', 'otros'
+      ]) || (
+        isCustomCategoryId(cat) && (
+          exists(/databases/$(database)/documents/households/$(hid)/categories/$(cat))
+          || existsAfter(/databases/$(database)/documents/households/$(hid)/categories/$(cat))
+        )
+      );
+    }
+
     function isHouseholdMember(hid) {
       return isSignedIn()
         && exists(/databases/$(database)/documents/households/$(hid))
@@ -199,7 +253,7 @@ service cloud.firestore {
       return data.keys().hasAll(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['concept', 'category', 'amount', 'paidBy', 'status', 'dueDate', 'notes', 'createdAt', 'updatedAt'])
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
-        && (data.category in ['alquiler', 'fianza', 'garantia_adicional', 'suministros', 'cerrajeria', 'mudanza', 'mobiliario', 'otros'])
+        && isValidHouseholdInitialCategory(data.category, hid)
         && isNonNegNumber(data.amount)
         && isHouseholdPayer(hid, data.paidBy)
         && (data.status in ['pendiente', 'pagado'])
@@ -243,7 +297,7 @@ service cloud.firestore {
       return data.keys().hasAll(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
-        && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros'])
+        && isValidHouseholdExpenseCategory(data.category, hid)
         && isNonNegNumber(data.amount)
         && (data.frequency in ['mensual', 'bimestral', 'trimestral', 'anual'])
         && isFiniteNumber(data.dayOfMonth) && data.dayOfMonth >= 1 && data.dayOfMonth <= 31
@@ -260,7 +314,7 @@ service cloud.firestore {
         && data.keys().hasOnly(['monthKey', 'concept', 'category', 'amount', 'date', 'paidBy', 'recurringId', 'splitPctA', 'isSettlement', 'settlementTo', 'isPrivate', 'createdBy', 'notes', 'createdAt', 'updatedAt'])
         && isValidMonthKey(data.monthKey)
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
-        && (data.category in ['alquiler', 'luz', 'agua', 'gas', 'internet', 'movil', 'suscripciones', 'seguros', 'comunidad', 'supermercado', 'transporte', 'ocio', 'otros', 'liquidacion'])
+        && (data.category == 'liquidacion' || isValidHouseholdExpenseCategory(data.category, hid))
         && isNonNegNumber(data.amount)
         && isValidDateStr(data.date)
         && isHouseholdPayer(hid, data.paidBy)
@@ -349,15 +403,111 @@ service cloud.firestore {
         && data.createdAt == request.time;
     }
 
+    function isValidShoppingSection(s) {
+      return s is string && s in [
+        '',
+        'Fruta y verdura',
+        'Carne, charcutería y huevos',
+        'Pescado y marisco',
+        'Lácteos, quesos y bebidas vegetales',
+        'Panadería y bollería',
+        'Despensa, arroz, pasta y conservas',
+        'Desayuno, café y dulces',
+        'Congelados',
+        'Platos preparados y refrigerados',
+        'Bebidas',
+        'Limpieza y hogar',
+        'Cuidado personal e higiene',
+        'Bebé y mascotas',
+        'Otros de supermercado'
+      ];
+    }
+
+    function isValidShoppingSourceType(s) {
+      return s is string && s in ['', 'mercadona', 'custom', 'generic'];
+    }
+
     function isValidShoppingItem(data) {
       return data.keys().hasAll(['text', 'qty', 'done', 'addedBy', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['text', 'qty', 'done', 'addedBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['text', 'qty', 'unit', 'done', 'catalogId', 'brand', 'format', 'section', 'sourceType', 'addedBy', 'createdAt', 'updatedAt'])
         && data.text is string && data.text.size() >= 1 && data.text.size() <= 120
-        && isFiniteNumber(data.qty) && data.qty >= 1 && data.qty <= 999
+        && isFiniteNumber(data.qty) && data.qty > 0 && data.qty <= 999
+        && (!('unit' in data) || (data.unit is string && data.unit.size() <= 20))
+        && (!('catalogId' in data) || (data.catalogId is string && data.catalogId.size() <= 48))
+        && (!('brand' in data) || (data.brand is string && data.brand.size() <= 60))
+        && (!('format' in data) || (data.format is string && data.format.size() <= 40))
+        && (!('section' in data) || isValidShoppingSection(data.section))
+        && (!('sourceType' in data) || isValidShoppingSourceType(data.sourceType))
         && data.done is bool
         && data.addedBy is string && data.addedBy.size() >= 1 && data.addedBy.size() <= 128
         && data.createdAt is timestamp
         && data.updatedAt == request.time;
+    }
+
+    function isValidCustomCategory(data) {
+      return data.keys().hasAll(['name', 'color', 'icon', 'order', 'archived', 'csvKeywords', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'color', 'icon', 'order', 'archived', 'csvKeywords', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 40
+        && isValidHexColor(data.color)
+        && isValidCategoryIcon(data.icon)
+        && isFiniteNumber(data.order) && data.order >= 0 && data.order <= 999
+        && data.archived is bool
+        && data.csvKeywords is string && data.csvKeywords.size() <= 300
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidCategoryBudget(data, docId, hid) {
+      return data.keys().hasAll(['monthKey', 'categoryId', 'limit', 'updatedAt'])
+        && data.keys().hasOnly(['monthKey', 'categoryId', 'limit', 'updatedAt'])
+        && isValidMonthKey(data.monthKey)
+        && isCustomCategoryId(data.categoryId)
+        && docId == (data.monthKey + '__' + data.categoryId)
+        && (
+          exists(/databases/$(database)/documents/households/$(hid)/categories/$(data.categoryId))
+          || existsAfter(/databases/$(database)/documents/households/$(hid)/categories/$(data.categoryId))
+        )
+        && isNonNegNumber(data.limit)
+        && data.updatedAt == request.time;
+    }
+
+    function isValidShoppingCatalogItem(data) {
+      return data.keys().hasAll(['text', 'defaultUnit', 'usageCount', 'lastUsedAt', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['text', 'defaultUnit', 'usageCount', 'lastUsedAt', 'favorite', 'catalogId', 'brand', 'format', 'section', 'sourceType', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 120
+        && data.defaultUnit is string && data.defaultUnit.size() <= 20
+        && data.usageCount is int && data.usageCount >= 1 && data.usageCount <= 100000
+        && data.lastUsedAt is string && data.lastUsedAt.size() >= 1 && data.lastUsedAt.size() <= 32
+        && (!('favorite' in data) || data.favorite is bool)
+        && (!('catalogId' in data) || (data.catalogId is string && data.catalogId.size() <= 48))
+        && (!('brand' in data) || (data.brand is string && data.brand.size() <= 60))
+        && (!('format' in data) || (data.format is string && data.format.size() <= 40))
+        && (!('section' in data) || isValidShoppingSection(data.section))
+        && (!('sourceType' in data) || isValidShoppingSourceType(data.sourceType))
+        && data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidShoppingCheckout(data, checkoutId, hid) {
+      return data.keys().hasAll(['expenseId', 'monthKey', 'amount', 'concept', 'pendingItemIds', 'totalItemCount', 'isPrivate', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['expenseId', 'monthKey', 'amount', 'concept', 'pendingItemIds', 'totalItemCount', 'isPrivate', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.expenseId == ('tx_' + checkoutId)
+        && isValidMonthKey(data.monthKey)
+        && isNonNegNumber(data.amount)
+        && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
+        && data.pendingItemIds is list && data.pendingItemIds.size() >= 1 && data.pendingItemIds.size() <= 100
+        && data.pendingItemIds[0] is string && isValidId(data.pendingItemIds[0])
+        && data.totalItemCount is int && data.totalItemCount >= 1 && data.totalItemCount <= 100
+        && data.isPrivate is bool
+        && (!data.isPrivate || (data.amount == 0 && data.concept == 'Compra privada'))
+        && data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time
+        && (
+          exists(/databases/$(database)/documents/households/$(hid)/transactions/$(data.expenseId))
+          || existsAfter(/databases/$(database)/documents/households/$(hid)/transactions/$(data.expenseId))
+        );
     }
 
     // ─── /users/{uid} ────────────────────────────────────────────────────────
@@ -563,6 +713,7 @@ service cloud.firestore {
         allow create: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
           && isValidTransaction(incoming(), hid)
+          && !isMonthClosed(hid, incoming().monthKey)
           && incoming().createdAt <= request.time
           && (
             incoming().createdBy == request.auth.uid
@@ -574,6 +725,8 @@ service cloud.firestore {
         allow update: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
           && isValidTransaction(incoming(), hid)
+          && !isMonthClosed(hid, existing().monthKey)
+          && !isMonthClosed(hid, incoming().monthKey)
           && incoming().createdAt == existing().createdAt
           && (!('isPrivate' in existing()) || existing().isPrivate == false || existing().createdBy == request.auth.uid)
           && (!incoming().isPrivate || incoming().createdBy == request.auth.uid)
@@ -591,6 +744,7 @@ service cloud.firestore {
           );
         allow delete: if isValidId(hid) && isValidId(txId)
           && isHouseholdMember(hid)
+          && !isMonthClosed(hid, existing().monthKey)
           && (!('isPrivate' in existing()) || existing().isPrivate == false || existing().createdBy == request.auth.uid);
       }
 
@@ -600,12 +754,16 @@ service cloud.firestore {
         allow list: if isValidId(hid) && isHouseholdMember(hid);
         allow create: if isValidId(hid) && isValidMonthKey(monthKey)
           && isHouseholdMember(hid)
+          && !isMonthClosed(hid, monthKey)
           && isValidBudget(incoming(), monthKey);
         allow update: if isValidId(hid) && isValidMonthKey(monthKey)
           && isHouseholdMember(hid)
+          && !isMonthClosed(hid, monthKey)
           && isValidBudget(incoming(), monthKey)
           && incoming().diff(existing()).affectedKeys().hasOnly(['limits', 'updatedAt']);
-        allow delete: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+        allow delete: if isValidId(hid) && isValidMonthKey(monthKey)
+          && isHouseholdMember(hid)
+          && !isMonthClosed(hid, monthKey);
       }
 
       // ─── /households/{hid}/monthClosures/{monthKey} ───────────────────────
@@ -650,6 +808,43 @@ service cloud.firestore {
         allow delete: if isValidId(hid) && isValidId(movId) && isHouseholdMember(hid);
       }
 
+      // ─── /households/{hid}/categories/{catId} ─────────────────────────────
+      match /categories/{catId} {
+        allow get: if isValidId(hid) && isCustomCategoryId(catId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isCustomCategoryId(catId)
+          && isHouseholdMember(hid)
+          && isValidCustomCategory(incoming())
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isCustomCategoryId(catId)
+          && isHouseholdMember(hid)
+          && isValidCustomCategory(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'color', 'icon', 'order', 'archived', 'csvKeywords', 'updatedAt']);
+        allow delete: if isValidId(hid) && isCustomCategoryId(catId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/categoryBudgets/{docId} ────────────────────────
+      match /categoryBudgets/{docId} {
+        allow get: if isValidId(hid) && isValidId(docId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(docId)
+          && isHouseholdMember(hid)
+          && isValidCategoryBudget(incoming(), docId, hid)
+          && !isMonthClosed(hid, incoming().monthKey);
+        allow update: if isValidId(hid) && isValidId(docId)
+          && isHouseholdMember(hid)
+          && isValidCategoryBudget(incoming(), docId, hid)
+          && !isMonthClosed(hid, existing().monthKey)
+          && !isMonthClosed(hid, incoming().monthKey)
+          && incoming().monthKey == existing().monthKey
+          && incoming().categoryId == existing().categoryId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['limit', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(docId)
+          && isHouseholdMember(hid)
+          && !isMonthClosed(hid, existing().monthKey);
+      }
+
       // ─── /households/{hid}/shopping/{itemId} ──────────────────────────────
       match /shopping/{itemId} {
         allow get: if isValidId(hid) && isValidId(itemId) && isHouseholdMember(hid);
@@ -664,8 +859,58 @@ service cloud.firestore {
           && isValidShoppingItem(incoming())
           && incoming().createdAt == existing().createdAt
           && incoming().addedBy == existing().addedBy
-          && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'qty', 'done', 'updatedAt']);
+          && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'qty', 'unit', 'done', 'catalogId', 'brand', 'format', 'section', 'sourceType', 'updatedAt']);
         allow delete: if isValidId(hid) && isValidId(itemId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/shoppingCatalog/{prodId} ──────────────────────
+      match /shoppingCatalog/{prodId} {
+        allow get: if isValidId(hid) && isValidShoppingCatalogId(prodId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidShoppingCatalogId(prodId)
+          && isHouseholdMember(hid)
+          && isValidShoppingCatalogItem(incoming())
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidShoppingCatalogId(prodId)
+          && isHouseholdMember(hid)
+          && isValidShoppingCatalogItem(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().createdBy == existing().createdBy
+          && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'defaultUnit', 'usageCount', 'lastUsedAt', 'favorite', 'catalogId', 'brand', 'format', 'section', 'sourceType', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidShoppingCatalogId(prodId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/shoppingCheckouts/{checkoutId} ────────────────
+      match /shoppingCheckouts/{checkoutId} {
+        allow get: if isValidId(hid) && isValidCheckoutId(checkoutId)
+          && isHouseholdMember(hid)
+          && (existing().isPrivate == false || existing().createdBy == request.auth.uid);
+        allow list: if isValidId(hid)
+          && isHouseholdMember(hid)
+          && (resource.data.isPrivate == false || resource.data.createdBy == request.auth.uid);
+        allow create: if isValidId(hid) && isValidCheckoutId(checkoutId)
+          && isHouseholdMember(hid)
+          && isValidShoppingCheckout(incoming(), checkoutId, hid)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidCheckoutId(checkoutId)
+          && isHouseholdMember(hid)
+          && (existing().isPrivate == false || existing().createdBy == request.auth.uid)
+          && isValidShoppingCheckout(incoming(), checkoutId, hid)
+          && incoming().expenseId == existing().expenseId
+          && incoming().monthKey == existing().monthKey
+          && incoming().amount == existing().amount
+          && incoming().concept == existing().concept
+          && incoming().totalItemCount == existing().totalItemCount
+          && incoming().isPrivate == existing().isPrivate
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().pendingItemIds.size() < existing().pendingItemIds.size()
+          && incoming().diff(existing()).affectedKeys().hasOnly(['pendingItemIds', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidCheckoutId(checkoutId)
+          && isHouseholdMember(hid)
+          && (existing().isPrivate == false || existing().createdBy == request.auth.uid);
       }
     }
   }

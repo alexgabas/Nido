@@ -11,15 +11,18 @@ import {
   Plus,
   RotateCcw,
   Settings,
+  ShoppingCart,
   Sun,
   WifiOff,
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { toUserFriendlyErrorMessage } from '../services/firebase';
 import type { NavTab } from '../types/nido';
 import { PWAInstallBanner } from './PWAInstallBanner';
 import { PWAUpdateBanner } from './PWAUpdateBanner';
 import { QuickExpenseModal } from './QuickExpenseModal';
+import { ShoppingListSection } from './ShoppingListSection';
 
 const AVANZADO_NAV_ITEMS: Array<{
   id: NavTab;
@@ -68,7 +71,12 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
     quickExpensePrefill,
     quickExpenseOnSaved,
     clearQuickExpensePrefill,
+    shoppingOpen,
+    setShoppingOpen,
+    openShoppingList,
+    shoppingItems,
     toastMessage,
+    showToast,
     undoToast,
     dismissUndo,
     isDemoMode,
@@ -294,6 +302,25 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
 
                   {/* Quick Secondary Actions */}
                   <div className="space-y-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        openShoppingList();
+                        setMenuOpen(false);
+                      }}
+                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center justify-between hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <span className="flex items-center gap-2.5">
+                        <ShoppingCart className="w-4 h-4 text-[#15803D] dark:text-[#4ADE80]" />
+                        <span>Lista de la compra</span>
+                      </span>
+                      {shoppingItems.filter((i) => !i.done).length > 0 && (
+                        <span className="px-2 py-0.5 rounded-full bg-[#15803D]/15 text-[#15803D] dark:text-[#4ADE80] text-[11px] font-bold tabular-nums">
+                          {shoppingItems.filter((i) => !i.done).length}
+                        </span>
+                      )}
+                    </button>
+
                     {uiMode === 'avanzado' && (
                       <button
                         type="button"
@@ -476,18 +503,33 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       {!isOnline && (
         <div
           role="status"
-          className="fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2 rounded-xl bg-amber-900 px-3.5 py-2 text-xs font-semibold text-white shadow-lg"
+          className="fixed bottom-20 md:bottom-4 left-4 z-[60] flex items-center gap-2 rounded-xl bg-amber-900 px-3.5 py-2 text-xs font-semibold text-white shadow-lg"
         >
           <WifiOff className="w-4 h-4 shrink-0" />
           <span>Sin conexión · Trabajando con caché local</span>
         </div>
       )}
 
+      <QuickExpenseModal
+        open={quickExpenseOpen}
+        onClose={() => {
+          setQuickExpenseOpen(false);
+          clearQuickExpensePrefill();
+        }}
+        prefill={quickExpensePrefill}
+        onSaved={quickExpenseOnSaved}
+      />
+
+      <ShoppingListSection
+        open={shoppingOpen}
+        onClose={() => setShoppingOpen(false)}
+      />
+
       {/* Undo snackbar (5 seconds) */}
       {undoToast && (
         <div
           role="status"
-          className="fixed bottom-20 md:bottom-6 right-4 z-50 flex items-center gap-3 rounded-xl bg-[#0F1F24] dark:bg-slate-800 text-white px-4 py-3 shadow-lg border border-slate-700"
+          className="fixed bottom-20 md:bottom-6 right-4 z-[70] flex items-center gap-3 rounded-xl bg-[#0F1F24] dark:bg-slate-800 text-white px-4 py-3 shadow-lg border border-slate-700"
         >
           <span className="text-sm">{undoToast.message}</span>
           <button
@@ -495,7 +537,11 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
             onClick={async () => {
               const fn = undoToast.onUndo;
               dismissUndo();
-              await fn();
+              try {
+                await fn();
+              } catch (err) {
+                showToast(toUserFriendlyErrorMessage(err, 'No se pudo deshacer la acción.'));
+              }
             }}
             className="min-h-[44px] px-3 rounded-lg bg-[#5EEAD4] text-[#0F1F24] text-xs font-bold flex items-center gap-1"
           >
@@ -509,21 +555,11 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       {toastMessage && !undoToast && (
         <div
           role="status"
-          className="fixed bottom-20 md:bottom-6 right-4 z-40 rounded-xl bg-[#0F1F24] dark:bg-slate-800 text-white px-4 py-2.5 text-sm font-medium shadow-md"
+          className="fixed bottom-20 md:bottom-6 right-4 z-[70] rounded-xl bg-[#0F1F24] dark:bg-slate-800 text-white px-4 py-2.5 text-sm font-medium shadow-md"
         >
           {toastMessage}
         </div>
       )}
-
-      <QuickExpenseModal
-        open={quickExpenseOpen}
-        onClose={() => {
-          setQuickExpenseOpen(false);
-          clearQuickExpensePrefill();
-        }}
-        prefill={quickExpensePrefill}
-        onSaved={quickExpenseOnSaved}
-      />
     </div>
   );
 };

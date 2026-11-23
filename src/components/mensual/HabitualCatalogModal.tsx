@@ -10,6 +10,7 @@ import {
   VARIABLE_BUDGET_SUGGESTIONS,
   type RecurringCatalogPreset,
 } from '../../domain/presets';
+import { isSystemExpenseCategory } from '../../domain/categories';
 import { toUserFriendlyErrorMessage } from '../../services/firebase';
 import type { MonthlyBudget, RecurringExpense } from '../../types/nido';
 
@@ -66,7 +67,14 @@ export const HabitualCatalogModal: React.FC<HabitualCatalogModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const presetsToAdd = RECURRING_CATALOG_PRESETS.filter((p) => selectedCatalogIds.has(p.id));
-    const nextLimits: MonthlyBudget['limits'] = { ...(budget?.limits ?? {}) };
+    const nextLimits: MonthlyBudget['limits'] = {};
+    if (budget?.limits) {
+      for (const [k, v] of Object.entries(budget.limits)) {
+        if (isSystemExpenseCategory(k) && typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+          nextLimits[k] = v;
+        }
+      }
+    }
     let budgetChanged = false;
 
     if (!isClosed) {

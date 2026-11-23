@@ -69,9 +69,44 @@ export default defineConfig(() => {
           ],
         },
       workbox: {
+        cleanupOutdatedCaches: true,
+        navigateFallbackDenylist: [/^\/assets\//, /^\/data\//],
         maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+        globIgnores: [
+          '**/pdfExport-*.js',
+          '**/html2canvas-*.js',
+          '**/purify.es-*.js',
+          '**/index.es-*.js',
+        ],
         runtimeCaching: [
+          {
+            urlPattern: /\/assets\/(pdfExport|html2canvas|purify\.es|index\.es)-.*\.js(\?.*)?$/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'nido-pdf-module-v1',
+              matchOptions: {
+                ignoreSearch: true,
+              },
+              expiration: {
+                maxEntries: 10,
+                maxAgeSeconds: 60 * 60 * 24 * 90,
+              },
+              cacheableResponse: { statuses: [200] },
+            },
+          },
+          {
+            urlPattern: /\/data\/mercadona-catalog.*\.json$/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'nido-mercadona-catalog-v1',
+              expiration: {
+                maxEntries: 3,
+                maxAgeSeconds: 60 * 60 * 24 * 90,
+              },
+              cacheableResponse: { statuses: [200] },
+            },
+          },
           {
             urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
             handler: 'CacheFirst',

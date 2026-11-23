@@ -1,6 +1,11 @@
 import { DEFAULT_CSV_KEYWORDS, EXPENSE_CATEGORY_LABELS } from './presets';
 import { roundCents } from './finance';
-import type { CsvCategoryKeywords, ExpenseCategory, Transaction } from '../types/nido';
+import type {
+  CsvCategoryKeywords,
+  CustomCategory,
+  ExpenseCategory,
+  Transaction,
+} from '../types/nido';
 import { MAX_LENGTHS } from '../types/nido';
 
 export type CsvDelimiter = ';' | ',';
@@ -242,27 +247,40 @@ export function guessCsvColumns(headers: string[]): CsvColumnMapping {
   return { dateIndex, conceptIndex, amountIndex };
 }
 
-export function resolveKeywordsMap(saved?: CsvCategoryKeywords): Record<ExpenseCategory, string> {
+export function resolveKeywordsMap(
+  saved?: CsvCategoryKeywords,
+  customCategories: CustomCategory[] = []
+): Record<ExpenseCategory, string> {
   const merged: Record<ExpenseCategory, string> = { ...DEFAULT_CSV_KEYWORDS };
-  if (!saved) return merged;
-  for (const cat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
-    if (typeof saved[cat] === 'string') {
-      merged[cat] = saved[cat] as string;
+  if (saved) {
+    for (const cat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
+      if (typeof saved[cat] === 'string') {
+        merged[cat] = saved[cat] as string;
+      }
     }
+  }
+  for (const cat of customCategories) {
+    if (cat.archived) continue;
+    merged[cat.id] = cat.csvKeywords || '';
   }
   return merged;
 }
 
 export function matchCategoryFromKeywords(
   concept: string,
-  keywordsMap: CsvCategoryKeywords
+  keywordsMap: CsvCategoryKeywords,
+  customCategories: CustomCategory[] = []
 ): ExpenseCategory {
   const normConcept = normalizeText(concept);
   if (!normConcept) return 'otros';
 
-  const resolved = resolveKeywordsMap(keywordsMap);
-  for (const cat of Object.keys(EXPENSE_CATEGORY_LABELS) as ExpenseCategory[]) {
-    if (cat === 'otros') continue;
+  const resolved = resolveKeywordsMap(keywordsMap, customCategories);
+  // Check active custom categories first (more specific rules defined by the household), then system categories
+  const orderedIds: string[] = [
+    ...customCategories.filter((c) => !c.archived).map((c) => c.id),
+    ...Object.keys(EXPENSE_CATEGORY_LABELS).filter((c) => c !== 'otros'),
+  ];
+  for (const cat of orderedIds) {
     const rawList = resolved[cat] || '';
     const tokens = rawList
       .split(',')
@@ -286,7 +304,8 @@ export function buildParsedBankRows(
   dataRows: string[][],
   mapping: CsvColumnMapping,
   existingTransactions: Transaction[],
-  keywordsMap: CsvCategoryKeywords
+  keywordsMap: CsvCategoryKeywords,
+  customCategories: CustomCategory[] = []
 ): ParsedBankRow[] {
   const seenKeys = new Set<string>();
   for (const tx of existingTransactions) {
@@ -332,7 +351,7 @@ export function buildParsedBankRows(
       absAmount,
       isIncome,
       isDuplicate,
-      suggestedCategory: matchCategoryFromKeywords(concept, keywordsMap),
+      suggestedCategory: matchCategoryFromKeywords(concept, keywordsMap, customCategories),
       error,
     };
   });

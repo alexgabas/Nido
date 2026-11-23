@@ -16,6 +16,13 @@ function statusBadge(bp: CategoryBudgetProgress) {
   const remaining = roundCents(bp.limit - bp.spent);
   switch (bp.status) {
     case 'verde':
+      if (bp.limit === 0 && (bp.hasLimit ?? false)) {
+        return {
+          bar: 'bg-[#15803D]',
+          text: 'text-[#15803D] dark:text-[#4ADE80]',
+          label: 'Límite 0 € · sin gasto',
+        };
+      }
       if (bp.isRecurringOnly) {
         return {
           bar: 'bg-[#15803D]',
@@ -86,18 +93,19 @@ export const BudgetProgressCard: React.FC<BudgetProgressCardProps> = ({
       ) : (
         <div className="space-y-3.5">
           {budgetProgress.map((bp) => {
+            const hasLimit = bp.hasLimit ?? bp.limit > 0;
             const badge = statusBadge(bp);
-            const barWidth = bp.limit > 0 ? Math.min(100, bp.pct) : 0;
+            const barWidth = hasLimit ? Math.min(100, bp.pct) : 0;
             return (
               <div key={bp.category} className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs gap-2">
                   <CategoryTag category={bp.category} size="xs" />
                   <span className="tabular-nums">
                     <strong>{formatEUR(bp.spent)}</strong>
-                    {bp.limit > 0 ? ` / ${formatEUR(bp.limit)}` : ''}
+                    {hasLimit ? ` / ${formatEUR(bp.limit)}` : ''}
                   </span>
                 </div>
-                {bp.limit > 0 && (
+                {hasLimit && (
                   <>
                     <div className="h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
                       <div
@@ -108,7 +116,7 @@ export const BudgetProgressCard: React.FC<BudgetProgressCardProps> = ({
                     <div className="flex justify-between text-[11px]">
                       <span className={`font-medium ${badge.text}`}>{badge.label}</span>
                       <span className="tabular-nums text-slate-500 dark:text-slate-400">
-                        {bp.pct}%
+                        {bp.limit === 0 ? (bp.spent > 0 ? 'Superado' : '0%') : `${bp.pct}%`}
                       </span>
                     </div>
                   </>

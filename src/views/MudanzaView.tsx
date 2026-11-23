@@ -16,6 +16,7 @@ import {
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { useNido } from '../context/NidoContext';
 import { downloadTextFile, generateSpanishCSV } from '../domain/backup';
+import { isSystemExpenseCategory } from '../domain/categories';
 import {
   buildIkeaSearchUrl,
   computeFurnitureSummary,
@@ -24,13 +25,14 @@ import {
   formatEUR,
   getTodayLocalISO,
 } from '../domain/finance';
+import { globalSearchSessionCache } from '../domain/globalSearch';
 import {
   FURNITURE_STATUS_LABELS,
   INITIAL_COST_CATEGORY_LABELS,
   PRIORITY_LABELS,
   ROOM_LABELS,
 } from '../domain/presets';
-import { exportNidoPDF } from '../services/pdfExport';
+import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
   COMMON_ACCOUNT_ID,
@@ -58,6 +60,7 @@ export const MudanzaView: React.FC = () => {
     initialCosts,
     checklist,
     furnitureItems,
+    categoryRegistry,
     repo,
     showToast,
     scheduleUndo,
@@ -118,6 +121,8 @@ export const MudanzaView: React.FC = () => {
     | { kind: 'checklist'; id: string; text: string }
     | null
   >(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [pdfExportError, setPdfExportError] = useState<string | null>(null);
 
   const effectiveSubTab: MudanzaSubTab =
     uiMode === 'sencillo' && subTab === 'gastos' ? 'mobiliario' : subTab;
@@ -207,6 +212,7 @@ export const MudanzaView: React.FC = () => {
         },
         currentUserProfile
       );
+      globalSearchSessionCache.invalidateHousehold(householdId);
       setCostModalOpen(false);
       showToast('Gasto inicial guardado');
     } catch (err) {
@@ -234,63 +240,77 @@ export const MudanzaView: React.FC = () => {
     if (!householdId || !currentUserProfile || !itemName.trim()) return;
     const price = uiMode === 'sencillo' ? (editingItem?.unitPrice ?? 0) : Math.max(0, Number(itemPrice.replace(',', '.')) || 0);
     const qty = uiMode === 'sencillo' ? (editingItem?.qty ?? 1) : Math.max(1, Math.min(999, Math.round(Number(itemQty) || 1)));
-    await repo.upsertFurnitureItem(
-      householdId,
-      {
-        id: editingItem?.id,
-        name: itemName.trim(),
-        room: itemRoom,
-        priority: uiMode === 'sencillo' ? (editingItem?.priority ?? 'imprescindible') : itemPriority,
-        status: uiMode === 'sencillo' ? (editingItem?.status ?? 'pendiente') : itemStatus,
-        store: uiMode === 'sencillo' ? (editingItem?.store ?? 'IKEA') : itemStore.trim() || 'IKEA',
-        productUrl: uiMode === 'sencillo' ? (editingItem?.productUrl ?? '') : itemUrl.trim(),
-        articleNumber: uiMode === 'sencillo' ? (editingItem?.articleNumber ?? '') : itemArticle.trim(),
-        unitPrice: Math.round(price * 100) / 100,
-        qty,
-        notes: uiMode === 'sencillo' ? (editingItem?.notes ?? '') : itemNotes.trim(),
-      },
-      currentUserProfile
-    );
-    setItemModalOpen(false);
-    showToast('Mueble guardado');
+    try {
+      await repo.upsertFurnitureItem(
+        householdId,
+        {
+          id: editingItem?.id,
+          name: itemName.trim(),
+          room: itemRoom,
+          priority: uiMode === 'sencillo' ? (editingItem?.priority ?? 'imprescindible') : itemPriority,
+          status: uiMode === 'sencillo' ? (editingItem?.status ?? 'pendiente') : itemStatus,
+          store: uiMode === 'sencillo' ? (editingItem?.store ?? 'IKEA') : itemStore.trim() || 'IKEA',
+          productUrl: uiMode === 'sencillo' ? (editingItem?.productUrl ?? '') : itemUrl.trim(),
+          articleNumber: uiMode === 'sencillo' ? (editingItem?.articleNumber ?? '') : itemArticle.trim(),
+          unitPrice: Math.round(price * 100) / 100,
+          qty,
+          notes: uiMode === 'sencillo' ? (editingItem?.notes ?? '') : itemNotes.trim(),
+        },
+        currentUserProfile
+      );
+      setItemModalOpen(false);
+      showToast('Mueble guardado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el mueble.'));
+    }
   };
 
   const handleSaveInlineFurniture = async (item: FurnitureItem) => {
     if (!householdId || !currentUserProfile) return;
     const price = Math.max(0, Number(inlineFurPrice.replace(',', '.')) || 0);
     const qty = Math.max(1, Math.min(999, Math.round(Number(inlineFurQty) || 1)));
-    await repo.upsertFurnitureItem(
-      householdId,
-      {
-        ...item,
-        unitPrice: Math.round(price * 100) / 100,
-        qty,
-      },
-      currentUserProfile
-    );
-    setInlineFurId(null);
-    showToast('Artículo actualizado');
+    try {
+      await repo.upsertFurnitureItem(
+        householdId,
+        {
+          ...item,
+          unitPrice: Math.round(price * 100) / 100,
+          qty,
+        },
+        currentUserProfile
+      );
+      setInlineFurId(null);
+      showToast('Artículo actualizado');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el artículo.'));
+    }
   };
 
   const handleConfirmDelete = async () => {
     if (!deleteTarget || !householdId || !currentUserProfile) return;
     const target = deleteTarget;
     setDeleteTarget(null);
-    if (target.kind === 'cost') {
-      const backupItem = { ...target.item };
-      await repo.deleteInitialCost(householdId, backupItem.id, backupItem.concept, currentUserProfile);
-      scheduleUndo(`Eliminado "${backupItem.concept}"`, () =>
-        repo.restoreInitialCost(householdId, backupItem, currentUserProfile)
-      );
-    } else if (target.kind === 'furniture') {
-      const backupItem = { ...target.item };
-      await repo.deleteFurnitureItem(householdId, backupItem.id, backupItem.name, currentUserProfile);
-      scheduleUndo(`Eliminado "${backupItem.name}"`, () =>
-        repo.restoreFurnitureItem(householdId, backupItem, currentUserProfile)
-      );
-    } else {
-      await repo.deleteChecklistItem(householdId, target.id, target.text, currentUserProfile);
-      showToast('Tarea eliminada');
+    try {
+      if (target.kind === 'cost') {
+        const backupItem = { ...target.item };
+        await repo.deleteInitialCost(householdId, backupItem.id, backupItem.concept, currentUserProfile);
+        globalSearchSessionCache.invalidateHousehold(householdId);
+        scheduleUndo(`Eliminado "${backupItem.concept}"`, async () => {
+          await repo.restoreInitialCost(householdId, backupItem, currentUserProfile);
+          globalSearchSessionCache.invalidateHousehold(householdId);
+        });
+      } else if (target.kind === 'furniture') {
+        const backupItem = { ...target.item };
+        await repo.deleteFurnitureItem(householdId, backupItem.id, backupItem.name, currentUserProfile);
+        scheduleUndo(`Eliminado "${backupItem.name}"`, () =>
+          repo.restoreFurnitureItem(householdId, backupItem, currentUserProfile)
+        );
+      } else {
+        await repo.deleteChecklistItem(householdId, target.id, target.text, currentUserProfile);
+        showToast('Tarea eliminada');
+      }
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo eliminar el elemento.'));
     }
   };
 
@@ -310,6 +330,9 @@ export const MudanzaView: React.FC = () => {
     }
   };
 
+  const initialCostCatLabel = (cat: string) =>
+    INITIAL_COST_CATEGORY_LABELS[cat] || categoryRegistry.getLabel(cat);
+
   const handleExportMudanzaCSV = () => {
     const csv = generateSpanishCSV(
       ['Tipo', 'Concepto / Artículo', 'Categoría / Estancia', 'Estado', 'Importe Total (€)'],
@@ -317,7 +340,7 @@ export const MudanzaView: React.FC = () => {
         ...initialCosts.map((c) => [
           'Gasto inicial',
           c.concept,
-          INITIAL_COST_CATEGORY_LABELS[c.category],
+          initialCostCatLabel(c.category),
           c.status === 'pagado' ? 'Pagado' : 'Pendiente',
           c.amount,
         ]),
@@ -334,22 +357,36 @@ export const MudanzaView: React.FC = () => {
     showToast('CSV de mudanza descargado');
   };
 
-  const handleExportMudanzaPDF = () => {
-    if (!household) return;
+  const handleExportMudanzaPDF = async () => {
+    if (!household || exportingPdf) return;
+    setExportingPdf(true);
+    setPdfExportError(null);
     const today = getTodayLocalISO();
-    exportNidoPDF({
-      scope: 'mudanza',
-      household,
-      members,
-      fromDate: today.slice(0, 7) + '-01',
-      toDate: today,
-      transactions: [],
-      initialCosts,
-      items: furnitureItems,
-      goals: [],
-      goalMovements: [],
-    });
-    showToast('PDF de mudanza descargado');
+    try {
+      await loadAndExportNidoPDF({
+        scope: 'mudanza',
+        household,
+        members,
+        fromDate: today.slice(0, 7) + '-01',
+        toDate: today,
+        transactions: [],
+        initialCosts,
+        items: furnitureItems,
+        goals: [],
+        goalMovements: [],
+        categoryLabels: categoryRegistry.labelsMap,
+      });
+      showToast('PDF de mudanza descargado');
+    } catch (err) {
+      setPdfExportError(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudo cargar el módulo PDF. Comprueba tu conexión e inténtalo de nuevo.'
+        )
+      );
+    } finally {
+      setExportingPdf(false);
+    }
   };
 
   const memberLabel = (uid: string) => {
@@ -450,11 +487,14 @@ export const MudanzaView: React.FC = () => {
                           <button
                             key={st}
                             type="button"
-                            onClick={() =>
-                              householdId &&
-                              currentUserProfile &&
-                              void repo.updateFurnitureStatus(householdId, item, st, currentUserProfile)
-                            }
+                            onClick={async () => {
+                              if (!householdId || !currentUserProfile) return;
+                              try {
+                                await repo.updateFurnitureStatus(householdId, item, st, currentUserProfile);
+                              } catch (err) {
+                                showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el estado del mueble.'));
+                              }
+                            }}
                             className={`min-h-[44px] px-3 rounded-2xl text-xs font-bold transition-colors flex items-center justify-center gap-1.5 ${
                               active
                                 ? st === 'comprado' || st === 'ya_lo_tenemos'
@@ -500,15 +540,19 @@ export const MudanzaView: React.FC = () => {
               onSubmit={async (e) => {
                 e.preventDefault();
                 if (!newTaskText.trim() || !householdId || !currentUserProfile) return;
-                await repo.addChecklistItem(
-                  householdId,
-                  newTaskText.trim(),
-                  'Suministros y trámites',
-                  checklist.length + 1,
-                  currentUserProfile
-                );
-                setNewTaskText('');
-                showToast('Tarea añadida');
+                try {
+                  await repo.addChecklistItem(
+                    householdId,
+                    newTaskText.trim(),
+                    'Suministros y trámites',
+                    checklist.length + 1,
+                    currentUserProfile
+                  );
+                  setNewTaskText('');
+                  showToast('Tarea añadida');
+                } catch (err) {
+                  showToast(toUserFriendlyErrorMessage(err, 'No se pudo añadir la tarea.'));
+                }
               }}
               className="flex gap-2"
             >
@@ -549,11 +593,14 @@ export const MudanzaView: React.FC = () => {
                       <li key={task.id} className="py-3 first:pt-0 last:pb-0 flex items-start justify-between gap-2">
                         <button
                           type="button"
-                          onClick={() =>
-                            householdId &&
-                            currentUserProfile &&
-                            void repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile)
-                          }
+                          onClick={async () => {
+                            if (!householdId || !currentUserProfile) return;
+                            try {
+                              await repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile);
+                            } catch (err) {
+                              showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar la tarea.'));
+                            }
+                          }}
                           className="flex items-start gap-3 text-left flex-1 min-h-[46px] py-1"
                         >
                           {task.done ? (
@@ -684,14 +731,41 @@ export const MudanzaView: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={handleExportMudanzaPDF}
-            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+            disabled={exportingPdf}
+            onClick={() => void handleExportMudanzaPDF()}
+            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap disabled:opacity-50"
           >
             <Download className="w-4 h-4" />
-            <span>PDF</span>
+            <span>{exportingPdf ? 'Generando PDF...' : 'PDF'}</span>
           </button>
         </div>
       </div>
+
+      {pdfExportError && (
+        <div
+          role="alert"
+          className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] px-4 py-3 text-xs font-medium flex flex-wrap items-center justify-between gap-2"
+        >
+          <span>{pdfExportError}</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={exportingPdf}
+              onClick={() => void handleExportMudanzaPDF()}
+              className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64] text-white font-semibold disabled:opacity-50"
+            >
+              Reintentar
+            </button>
+            <button
+              type="button"
+              onClick={() => setPdfExportError(null)}
+              className="min-h-[44px] px-2.5 rounded-lg border border-current/30 font-semibold"
+            >
+              Cerrar
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* 3 Sub-tabs */}
       <div className="grid grid-cols-3 gap-1 p-1 bg-slate-200/70 dark:bg-slate-900 rounded-xl">
@@ -787,7 +861,7 @@ export const MudanzaView: React.FC = () => {
                   <div className="min-w-0 space-y-1">
                     <p className="text-sm font-semibold truncate">{c.concept}</p>
                     <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {INITIAL_COST_CATEGORY_LABELS[c.category]} · Pagó: {memberLabel(c.paidBy)}
+                      {initialCostCatLabel(c.category)} · Pagó: {memberLabel(c.paidBy)}
                       {c.dueDate ? ` · Fecha: ${formatDateES(c.dueDate)}` : ''}
                     </p>
                     {c.notes && <p className="text-xs text-slate-500 dark:text-slate-400">{c.notes}</p>}
@@ -799,18 +873,22 @@ export const MudanzaView: React.FC = () => {
                     </span>
                     <button
                       type="button"
-                      onClick={() =>
-                        householdId &&
-                        currentUserProfile &&
-                        void repo.upsertInitialCost(
-                          householdId,
-                          {
-                            ...c,
-                            status: c.status === 'pagado' ? 'pendiente' : 'pagado',
-                          },
-                          currentUserProfile
-                        )
-                      }
+                      onClick={async () => {
+                        if (!householdId || !currentUserProfile) return;
+                        try {
+                          await repo.upsertInitialCost(
+                            householdId,
+                            {
+                              ...c,
+                              status: c.status === 'pagado' ? 'pendiente' : 'pagado',
+                            },
+                            currentUserProfile
+                          );
+                          globalSearchSessionCache.invalidateHousehold(householdId);
+                        } catch (err) {
+                          showToast(toUserFriendlyErrorMessage(err, 'No se pudo cambiar el estado del gasto.'));
+                        }
+                      }}
                       className={`min-h-[44px] px-3 rounded-xl text-xs font-semibold transition-colors ${
                         c.status === 'pagado'
                           ? 'bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80]'
@@ -868,15 +946,19 @@ export const MudanzaView: React.FC = () => {
             onSubmit={async (e) => {
               e.preventDefault();
               if (!newTaskText.trim() || !householdId || !currentUserProfile) return;
-              await repo.addChecklistItem(
-                householdId,
-                newTaskText.trim(),
-                newTaskGroup,
-                checklist.length + 1,
-                currentUserProfile
-              );
-              setNewTaskText('');
-              showToast('Tarea añadida');
+              try {
+                await repo.addChecklistItem(
+                  householdId,
+                  newTaskText.trim(),
+                  newTaskGroup,
+                  checklist.length + 1,
+                  currentUserProfile
+                );
+                setNewTaskText('');
+                showToast('Tarea añadida');
+              } catch (err) {
+                showToast(toUserFriendlyErrorMessage(err, 'No se pudo añadir la tarea.'));
+              }
             }}
             className="flex flex-col sm:flex-row gap-2"
           >
@@ -937,11 +1019,14 @@ export const MudanzaView: React.FC = () => {
                     <li key={task.id} className="py-3 first:pt-0 last:pb-0 flex items-start justify-between gap-2">
                       <button
                         type="button"
-                        onClick={() =>
-                          householdId &&
-                          currentUserProfile &&
-                          void repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile)
-                        }
+                        onClick={async () => {
+                          if (!householdId || !currentUserProfile) return;
+                          try {
+                            await repo.toggleChecklistItem(householdId, task, !task.done, currentUserProfile);
+                          } catch (err) {
+                            showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar la tarea.'));
+                          }
+                        }}
                         className="flex items-start gap-3 text-left flex-1 min-h-[44px] py-1"
                       >
                         {task.done ? (
@@ -1267,11 +1352,14 @@ export const MudanzaView: React.FC = () => {
                           <button
                             key={st}
                             type="button"
-                            onClick={() =>
-                              householdId &&
-                              currentUserProfile &&
-                              void repo.updateFurnitureStatus(householdId, item, st, currentUserProfile)
-                            }
+                            onClick={async () => {
+                              if (!householdId || !currentUserProfile) return;
+                              try {
+                                await repo.updateFurnitureStatus(householdId, item, st, currentUserProfile);
+                              } catch (err) {
+                                showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el estado del mueble.'));
+                              }
+                            }}
                             className={`min-h-[44px] px-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-1 whitespace-nowrap ${
                               active
                                 ? st === 'comprado' || st === 'ya_lo_tenemos'
@@ -1357,6 +1445,19 @@ export const MudanzaView: React.FC = () => {
                         {INITIAL_COST_CATEGORY_LABELS[cat]}
                       </option>
                     ))}
+                    {categoryRegistry.activeCategories
+                      .filter((c) => !isSystemExpenseCategory(c.id))
+                      .map((cat) => (
+                        <option key={cat.id} value={cat.id}>
+                          {cat.label}
+                        </option>
+                      ))}
+                    {!INITIAL_COST_CATEGORY_LABELS[costCategory] &&
+                      !categoryRegistry.activeCategories.some((c) => c.id === costCategory) && (
+                        <option value={costCategory}>
+                          {categoryRegistry.getLabel(costCategory)}
+                        </option>
+                      )}
                   </select>
                 </div>
                 <div>

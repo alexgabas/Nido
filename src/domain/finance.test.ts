@@ -66,17 +66,72 @@ import {
   shouldShowBackupReminder,
   validateAndMigrateBackup,
 } from './backup';
+import {
+  GENERIC_STAPLES_CATALOG,
+  buildShoppingCatalogId,
+  findPendingDuplicateMatch,
+  formatShoppingQtyUnit,
+  groupShoppingItemsBySection,
+  preindexMercadonaCatalog,
+  searchShoppingSuggestions,
+  searchShoppingSuggestionsPaginated,
+  type StaticMercadonaCatalogEntry,
+} from './shoppingCatalog';
+import {
+  buildCategoryRegistry,
+  canSafelyDeleteCustomCategory,
+  generateCustomCategoryId,
+  getAvailableCategorySuggestions,
+  isCategoryDuplicateName,
+  isCategoryUsedInHouseholdData,
+  mergeMonthlyAndCustomBudgetLimits,
+  pickSimpleWizardCategories,
+  planCopyPreviousMonthBudgets,
+} from './categories';
+import {
+  MAX_CHECKOUT_BATCH_ITEMS,
+  buildCheckoutExpenseId,
+  captureShoppingCheckoutSnapshots,
+  clearAllLocalPendingCheckouts,
+  clearLocalPendingCheckout,
+  executeDurableShoppingCheckout,
+  executeShoppingCheckout,
+  generateShoppingCheckoutId,
+  isShoppingItemSafeForCrossDeviceCleanup,
+  isValidShoppingCheckoutId,
+  loadLocalPendingCheckout,
+  reconcileShoppingItemsForCleanup,
+  saveLocalPendingCheckout,
+  type ShoppingCheckoutSession,
+} from './shoppingCheckout';
+import {
+  acquirePwaEditLock,
+  acquirePwaWriteLock,
+  canTriggerSafeChunkReload,
+  clearSafeChunkReloadAttempts,
+  getPwaReloadBlockStatus,
+  isLikelyStaleChunkError,
+  recordSafeChunkReloadAttempt,
+  resetPwaGuardForTests,
+} from '../services/pwaUpdateGuard';
+import {
+  createScopedGlobalSearchCache,
+  filterGlobalExpenses,
+} from './globalSearch';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import {
   COMMON_ACCOUNT_ID,
+  type CustomCategory,
   type FurnitureItem,
   type GoalMovement,
   type Household,
   type HouseholdMember,
   type HouseholdSettings,
+  type InitialCost,
   type NidoBackupV1,
   type RecurringExpense,
   type SavingsGoal,
+  type ShoppingItem,
   type Transaction,
 } from '../types/nido';
 
@@ -2280,3 +2335,1690 @@ test('Fase 5: media de últimas 3 facturas, sugerencia de palabra clave CSV y re
   assert.equal(daysSinceLastBackup('2026-10-21', '2026-11-20'), 30);
   assert.equal(shouldShowBackupReminder('2026-10-21', '2026-11-20', 30), true);
 });
+
+test('17. Lista de la compra + autocompletado gratuito (ranking, sin precios, duplicados, decimales/unidad y sin spam de activity)', async () => {
+  // 1) Básicos genéricos sin precios ni marca Mercadona
+  assert.ok(GENERIC_STAPLES_CATALOG.length >= 25);
+  for (const item of GENERIC_STAPLES_CATALOG) {
+    assert.ok(item.name.trim().length > 0);
+    assert.ok(!/€|\beur\b|\d+[,.]\d{2}\s*€/i.test(item.name));
+  }
+
+  // 2) Formato decimal y unidad
+  assert.equal(formatShoppingQtyUnit(0.5, 'kg'), '0,5 kg');
+  assert.equal(formatShoppingQtyUnit(2, 'ud'), '2 ud');
+  assert.equal(formatShoppingQtyUnit(3, ''), '3');
+
+  // 3) Ranking insensible a tildes/mayúsculas + catálogo del hogar antes que Mercadona/genérico
+  const sampleMercadona: StaticMercadonaCatalogEntry[] = [
+    {
+      id: 'mc_atun_1',
+      name: 'Atún claro al natural',
+      brand: 'Hacendado',
+      format: 'Pack 6x80 g',
+      section: 'Despensa, arroz, pasta y conservas',
+      defaultUnit: 'paq',
+      sourceRef: '848000018001',
+      source: 'openfoodfacts_odbl',
+      addedAt: '2026-11-01',
+    },
+    ...Array.from({ length: 14 }, (_, idx) => ({
+      id: `mc_atun_extra_${idx}`,
+      name: `Atún variedad ${idx + 1}`,
+      brand: 'Hacendado',
+      section: 'Despensa, arroz, pasta y conservas' as const,
+      sourceRef: `extra_${idx}`,
+      source: 'openfoodfacts_odbl',
+      addedAt: '2026-11-01',
+    })),
+  ];
+  const preindexedMercadona = preindexMercadonaCatalog(sampleMercadona);
+
+  const householdCatalog = [
+    {
+      id: buildShoppingCatalogId('Atún al natural casa'),
+      text: 'Atún al natural casa',
+      defaultUnit: 'lata',
+      usageCount: 4,
+      lastUsedAt: '2026-11-15T10:00:00.000Z',
+      createdBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00.000Z',
+      updatedAt: '2026-11-15T10:00:00.000Z',
+    },
+  ];
+  const atunMatches = searchShoppingSuggestions('atun', householdCatalog, preindexedMercadona);
+  assert.ok(atunMatches.length >= 2);
+  assert.equal(atunMatches[0].source, 'hogar');
+  assert.equal(atunMatches[0].text, 'Atún al natural casa');
+  assert.ok(
+    atunMatches.some(
+      (s) => s.source === 'mercadona' && s.sourceType === 'mercadona' && s.text.includes('Atún')
+    )
+  );
+
+  // Paginación ("Ver más resultados")
+  const page1 = searchShoppingSuggestionsPaginated('atun', householdCatalog, preindexedMercadona, {
+    limit: 6,
+    offset: 0,
+  });
+  assert.equal(page1.items.length, 6);
+  assert.equal(page1.hasMore, true);
+  assert.equal(page1.totalCount, 16);
+
+  // Genéricos no se etiquetan como Mercadona
+  const platanoMatches = searchShoppingSuggestions('platano', [], preindexedMercadona);
+  assert.equal(platanoMatches[0].source, 'generico');
+  assert.equal(platanoMatches[0].sourceType, 'generic');
+
+  // Con input vacío solo sugiere ítems frecuentes del hogar (máximo limit)
+  const quickPicks = searchShoppingSuggestions('   ', householdCatalog, preindexedMercadona);
+  assert.equal(quickPicks.length, 1);
+  assert.equal(quickPicks[0].source, 'hogar');
+
+  // 4) Detección de duplicados pendientes:
+  // - misma palabra y unidad -> exactSameUnitMatch
+  // - distinta unidad -> differentUnitMatch (no auto-fusionar)
+  // - variante distinta ("Leche" vs "Leche desnatada") -> ningún match
+  const pending = [
+    {
+      id: 's1',
+      text: 'Leche entera',
+      qty: 2,
+      unit: 'L',
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00.000Z',
+      updatedAt: '2026-11-01T10:00:00.000Z',
+    },
+    {
+      id: 's2',
+      text: 'Tomates',
+      qty: 1,
+      unit: 'kg',
+      done: false,
+      addedBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00.000Z',
+      updatedAt: '2026-11-01T10:00:00.000Z',
+    },
+    {
+      id: 's_done',
+      text: 'Café molido',
+      qty: 1,
+      unit: 'paq',
+      done: true,
+      addedBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00.000Z',
+      updatedAt: '2026-11-01T10:00:00.000Z',
+    },
+  ];
+  const sameMatch = findPendingDuplicateMatch('  leche   entera ', 'L', pending);
+  assert.equal(sameMatch.exactSameUnitMatch?.id, 's1');
+  assert.equal(sameMatch.differentUnitMatch, null);
+
+  const diffUnit = findPendingDuplicateMatch('Tomates', 'ud', pending);
+  assert.equal(diffUnit.exactSameUnitMatch, null);
+  assert.equal(diffUnit.differentUnitMatch?.id, 's2');
+
+  const variant = findPendingDuplicateMatch('Leche desnatada', 'L', pending);
+  assert.equal(variant.exactSameUnitMatch, null);
+  assert.equal(variant.differentUnitMatch, null);
+
+  // Ítems ya comprados (done: true) no provocan prompt de duplicado pendiente
+  const boughtAgain = findPendingDuplicateMatch('Café molido', 'paq', pending);
+  assert.equal(boughtAgain.exactSameUnitMatch, null);
+
+  // 5) Repositorio: decimal qty/unit, upsertShoppingCatalogItem solo al confirmar y sin ensuciar activity
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  let beforeActivityLen = 0;
+  repo.subscribeActivity('demo_hogar_santsadurni', 50, (a) => {
+    beforeActivityLen = a.length;
+  })();
+
+  const shopId = await repo.upsertShoppingItem(
+    'demo_hogar_santsadurni',
+    { text: 'Aguacates maduros', qty: 0.75, unit: 'kg', done: false },
+    actor
+  );
+  await repo.upsertShoppingCatalogItem(
+    'demo_hogar_santsadurni',
+    { text: 'Aguacates maduros', defaultUnit: 'kg' },
+    actor
+  );
+  await repo.upsertShoppingCatalogItem(
+    'demo_hogar_santsadurni',
+    { text: 'Aguacates maduros', defaultUnit: 'kg' },
+    actor
+  );
+
+  let catalogItems: ReturnType<typeof searchShoppingSuggestions> = [];
+  repo.subscribeShoppingCatalog('demo_hogar_santsadurni', (items) => {
+    catalogItems = searchShoppingSuggestions('aguacates mad', items);
+    assert.ok(searchShoppingSuggestions('aguacates', items).some((s) => s.source === 'hogar'));
+    assert.equal(items[0].usageCount, 2);
+  })();
+  assert.equal(catalogItems[0].source, 'hogar');
+
+  let currentShopping: ShoppingItem[] = [];
+  repo.subscribeShopping('demo_hogar_santsadurni', (items) => {
+    currentShopping = items;
+  })();
+  const added = currentShopping.find((s) => s.id === shopId);
+  assert.equal(added?.qty, 0.75);
+  assert.equal(added?.unit, 'kg');
+
+  await repo.deleteShoppingItemsBulk('demo_hogar_santsadurni', [shopId]);
+  let afterActivityLen = 0;
+  repo.subscribeActivity('demo_hogar_santsadurni', 50, (a) => {
+    afterActivityLen = a.length;
+  })();
+  assert.equal(afterActivityLen, beforeActivityLen);
+});
+
+test('18. Categorías personalizadas (IDs estables, duplicados, Simple top-8, presupuestos, CSV keywords, archivo vs borrado y round-trip backup)', async () => {
+  const customGym: CustomCategory = {
+    id: 'cat_gimnasio',
+    name: 'Gimnasio y deporte',
+    color: '#0284C7',
+    icon: 'dumbbell',
+    order: 0,
+    archived: false,
+    csvKeywords: 'vivagym, decathlon',
+    createdAt: '2026-11-01T10:00:00.000Z',
+    updatedAt: '2026-11-01T10:00:00.000Z',
+  };
+  const customArchived: CustomCategory = {
+    id: 'cat_mascotas',
+    name: 'Mascotas',
+    color: '#B45309',
+    icon: 'paw-print',
+    order: 1,
+    archived: true,
+    csvKeywords: 'kiwoko',
+    createdAt: '2026-11-01T10:00:00.000Z',
+    updatedAt: '2026-11-01T10:00:00.000Z',
+  };
+
+  // 1) Generación de ID estable y detección de duplicados (insensible a tildes/mayúsculas)
+  assert.equal(generateCustomCategoryId('Gimnasio y deporte', []), 'cat_gimnasio_y_deporte');
+  assert.equal(
+    generateCustomCategoryId('Gimnasio y deporte', ['cat_gimnasio_y_deporte']),
+    'cat_gimnasio_y_deporte_2'
+  );
+  assert.equal(isCategoryDuplicateName('  Supermércado ', [customGym]), true); // choca con sistema
+  assert.equal(isCategoryDuplicateName('gimnasio y deporte', [customGym]), true);
+  assert.equal(isCategoryDuplicateName('gimnasio y deporte', [customGym], 'cat_gimnasio'), false);
+  assert.equal(isCategoryDuplicateName('Viajes', [customGym]), false);
+
+  // Las sugerencias nunca se auto-activan y filtran las ya existentes
+  const avail = getAvailableCategorySuggestions([customGym]);
+  assert.ok(!avail.some((s) => s.name === 'Gimnasio y deporte'));
+  assert.ok(avail.some((s) => s.name === 'Mascotas'));
+
+  // 2) Registry, archivada y fallback seguro para IDs desconocidos
+  const reg = buildCategoryRegistry([customGym, customArchived], { alquiler: '#7C3AED' });
+  assert.equal(reg.getLabel('cat_gimnasio'), 'Gimnasio y deporte');
+  assert.equal(reg.getColor('cat_gimnasio'), '#0284C7');
+  assert.equal(reg.getColor('alquiler'), '#7C3AED');
+  assert.equal(reg.isArchived('cat_mascotas'), true);
+  assert.ok(!reg.activeCategories.some((c) => c.id === 'cat_mascotas'));
+  const unknownMeta = reg.getMeta('cat_legacy_borrada');
+  assert.equal(unknownMeta.isUnknown, true);
+  assert.ok(unknownMeta.label.includes('legacy borrada'));
+
+  // 3) Modo Sencillo: top 8 + overflowCategories
+  const manyTxs: Transaction[] = [
+    makeTx({ id: 'g1', category: 'cat_gimnasio', monthKey: '2026-11' }),
+    makeTx({ id: 'g2', category: 'cat_gimnasio', monthKey: '2026-11' }),
+    makeTx({ id: 'g3', category: 'cat_gimnasio', monthKey: '2026-11' }),
+  ];
+  const { primaryCategories, overflowCategories } = pickSimpleWizardCategories(
+    reg.activeCategories,
+    manyTxs,
+    8
+  );
+  assert.equal(primaryCategories.length, 8);
+  assert.ok(primaryCategories.some((c) => c.id === 'cat_gimnasio'));
+  assert.equal(overflowCategories.length, reg.activeCategories.length - 8);
+
+  // 4) Presupuestos fusionados, alertas, comparativa, búsqueda global y CSV keywords
+  const mergedBudget = mergeMonthlyAndCustomBudgetLimits(
+    { monthKey: '2026-11', limits: { supermercado: 300 }, updatedAt: '' },
+    [{ id: '2026-11__cat_gimnasio', monthKey: '2026-11', categoryId: 'cat_gimnasio', limit: 100, updatedAt: '' }],
+    '2026-11'
+  );
+  const gymTx = makeTx({
+    id: 'tx_gym',
+    concept: 'Cuota mensual',
+    category: 'cat_gimnasio',
+    amount: 90,
+    date: '2026-11-10',
+    monthKey: '2026-11',
+  });
+  const prog = computeBudgetProgress([gymTx], mergedBudget);
+  const gymProg = prog.find((p) => p.category === 'cat_gimnasio');
+  assert.equal(gymProg?.limit, 100);
+  assert.equal(gymProg?.pct, 90);
+  assert.equal(gymProg?.status, 'ambar');
+
+  const alerts = getBudgetThresholdAlerts([gymTx], mergedBudget, 80);
+  assert.equal(alerts[0].category, 'cat_gimnasio');
+
+  const comp = computeCategoryComparison(
+    [
+      gymTx,
+      makeTx({ id: 'tx_gym_prev', category: 'cat_gimnasio', amount: 60, date: '2026-10-10', monthKey: '2026-10' }),
+    ],
+    '2026-11'
+  );
+  const compGym = comp.rows.find((r) => r.category === 'cat_gimnasio');
+  assert.equal(compGym?.current, 90);
+  assert.equal(compGym?.prev, 60);
+
+  const searchRes = filterGlobalTransactions(
+    [gymTx],
+    { text: 'deporte', amountQuery: '', category: 'todas' },
+    reg.labelsMap
+  );
+  assert.equal(searchRes.length, 1);
+
+  assert.equal(matchCategoryFromKeywords('ADEUDO VIVAGYM CLUB', {}, [customGym]), 'cat_gimnasio');
+
+  assert.equal(
+    isCategoryUsedInHouseholdData('cat_gimnasio', { transactions: [gymTx] }),
+    true
+  );
+  assert.equal(
+    isCategoryUsedInHouseholdData('cat_gimnasio', { transactions: [] }),
+    false
+  );
+
+  // 5) Repositorio Demo + round-trip export/import JSON + compatibilidad retroactiva con backup antiguo
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  const createdCatId = await repo.upsertCustomCategory(
+    'demo_hogar_santsadurni',
+    {
+      name: 'Viajes y escapadas',
+      color: '#2563EB',
+      icon: 'plane',
+      order: 0,
+      archived: false,
+      csvKeywords: 'renfe, vueling',
+    },
+    actor
+  );
+  await repo.saveAllBudgets(
+    'demo_hogar_santsadurni',
+    '2026-11',
+    { supermercado: 400, [createdCatId]: 250 },
+    [createdCatId],
+    actor
+  );
+  const exported = await repo.exportBackup('demo_hogar_santsadurni', 'demo_alex');
+  assert.ok(exported.customCategories?.some((c) => c.id === createdCatId && c.name === 'Viajes y escapadas'));
+  assert.ok(
+    exported.categoryBudgets?.some(
+      (b) => b.monthKey === '2026-11' && b.categoryId === createdCatId && b.limit === 250
+    )
+  );
+
+  // Validar migración de JSON exportado y también de un backup v1 antiguo sin campos nuevos
+  const revalidated = validateAndMigrateBackup(JSON.parse(JSON.stringify(exported)));
+  assert.equal(revalidated.customCategories?.length, 1);
+  assert.equal(revalidated.categoryBudgets?.length, 1);
+
+  const legacyValidated = validateAndMigrateBackup({
+    schemaVersion: 1,
+    app: 'nido',
+    exportedAt: '2026-01-01T00:00:00.000Z',
+    householdName: 'Piso antiguo',
+    settings: {
+      splitMode: 'preset',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 0,
+      incomeB: 0,
+      currency: 'EUR',
+    },
+    initialCosts: [],
+    checklist: [],
+    items: [],
+    recurring: [],
+    transactions: [],
+    budgets: [],
+    monthClosures: [],
+    goals: [],
+    goalMovements: [],
+  });
+  assert.equal(legacyValidated.householdName, 'Piso antiguo');
+  assert.equal(legacyValidated.shopping, undefined);
+  assert.equal(legacyValidated.customCategories, undefined);
+});
+
+test('19. Seguridad de categorías personalizadas y saneamiento de presupuestos del mes', async () => {
+  // 1) canSafelyDeleteCustomCategory bloquea si hay >1 miembro o si hay categoryBudgets históricos
+  const blockedPrivacy = canSafelyDeleteCustomCategory('cat_gym', {
+    memberCount: 2,
+    transactions: [],
+    recurring: [],
+    initialCosts: [],
+    categoryBudgets: [],
+  });
+  assert.equal(blockedPrivacy.canDelete, false);
+  assert.equal(blockedPrivacy.reason, 'multi_member_privacy');
+
+  const blockedBudget = canSafelyDeleteCustomCategory('cat_gym', {
+    memberCount: 1,
+    transactions: [],
+    recurring: [],
+    initialCosts: [],
+    categoryBudgets: [{ categoryId: 'cat_gym', limit: 45 }],
+  });
+  assert.equal(blockedBudget.canDelete, false);
+  assert.equal(blockedBudget.reason, 'in_use');
+
+  const safeSingle = canSafelyDeleteCustomCategory('cat_gym', {
+    memberCount: 1,
+    transactions: [],
+    recurring: [],
+    initialCosts: [],
+    categoryBudgets: [],
+  });
+  assert.equal(safeSingle.canDelete, true);
+
+  // 2) DemoHouseholdRepository: saveBudget filtra claves cat_* (evita PERMISSION_DENIED en /budgets/{monthKey})
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  await repo.saveBudget(
+    'demo_hogar_santsadurni',
+    '2026-11',
+    { supermercado: 320, cat_inventada: 90 } as Record<string, number>,
+    actor
+  );
+  let latestBudgetLimits: Record<string, number | undefined> = {};
+  repo.subscribeBudget('demo_hogar_santsadurni', '2026-11', (b) => {
+    latestBudgetLimits = b?.limits ?? {};
+  })();
+  assert.equal(latestBudgetLimits.supermercado, 320);
+  assert.equal('cat_inventada' in latestBudgetLimits, false);
+
+  // 3) DemoHouseholdRepository: deleteUnusedCustomCategory rechaza en hogar compartido y no borra categoryBudgets
+  const catId = await repo.upsertCustomCategory(
+    'demo_hogar_santsadurni',
+    {
+      name: 'Padel',
+      color: '#0284C7',
+      icon: 'dumbbell',
+      order: 0,
+      archived: false,
+      csvKeywords: 'padel',
+    },
+    actor
+  );
+  await repo.saveAllBudgets('demo_hogar_santsadurni', '2025-05', { [catId]: 60 }, [catId], actor);
+  await assert.rejects(
+    () => repo.deleteUnusedCustomCategory('demo_hogar_santsadurni', catId, 'Padel', actor),
+    /hogar compartido|presupuestos/i
+  );
+  const allCb = await repo.fetchAllCategoryBudgets('demo_hogar_santsadurni');
+  assert.ok(allCb.some((b) => b.categoryId === catId && b.monthKey === '2025-05'));
+});
+
+test('20. Mercadona metadata, favoritos, secciones y round-trip backup en lista de la compra', async () => {
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+  const catEntryId = await repo.upsertShoppingCatalogItem(
+    'demo_hogar_santsadurni',
+    {
+      text: 'Leche entera Hacendado',
+      defaultUnit: 'L',
+      catalogId: 'mc_leche_01',
+      brand: 'Hacendado',
+      format: 'Brick 1 L',
+      section: 'Lácteos, quesos y bebidas vegetales',
+      sourceType: 'mercadona',
+    },
+    actor
+  );
+  await repo.toggleShoppingCatalogFavorite('demo_hogar_santsadurni', catEntryId, true);
+
+  await repo.upsertShoppingItem(
+    'demo_hogar_santsadurni',
+    {
+      text: 'Leche entera Hacendado',
+      qty: 6,
+      unit: 'L',
+      done: false,
+      catalogId: 'mc_leche_01',
+      brand: 'Hacendado',
+      format: 'Brick 1 L',
+      section: 'Lácteos, quesos y bebidas vegetales',
+      sourceType: 'mercadona',
+    },
+    actor
+  );
+
+  // Formatos distintos no colisionan como duplicado idéntico
+  const pending: ShoppingItem[] = [];
+  repo.subscribeShopping('demo_hogar_santsadurni', (items) => {
+    pending.splice(0, pending.length, ...items);
+  })();
+  const sameFmt = findPendingDuplicateMatch('Leche entera Hacendado', 'L', pending, {
+    format: 'Brick 1 L',
+  });
+  assert.ok(sameFmt.exactSameUnitMatch);
+  const diffFmt = findPendingDuplicateMatch('Leche entera Hacendado', 'L', pending, {
+    format: 'Pack 6x1 L',
+  });
+  assert.equal(diffFmt.exactSameUnitMatch, null);
+
+  // Agrupación por secciones
+  const grouped = groupShoppingItemsBySection(pending);
+  assert.ok(grouped.some((g) => g.section === 'Lácteos, quesos y bebidas vegetales'));
+
+  // Round-trip backup v1 conserva metadata Mercadona y favorito
+  const exported = await repo.exportBackup('demo_hogar_santsadurni', 'demo_alex');
+  const validated = validateAndMigrateBackup(JSON.parse(JSON.stringify(exported)));
+  const backedItem = validated.shopping?.find((s) => s.catalogId === 'mc_leche_01');
+  assert.equal(backedItem?.brand, 'Hacendado');
+  assert.equal(backedItem?.sourceType, 'mercadona');
+  assert.equal(backedItem?.section, 'Lácteos, quesos y bebidas vegetales');
+  const backedCat = validated.shoppingCatalog?.find((c) => c.id === catEntryId);
+  assert.equal(backedCat?.favorite, true);
+  assert.equal(backedCat?.sourceType, 'mercadona');
+});
+
+test('21. Bloque 2 — Copiar presupuestos del mes anterior (sin/con sobrescritura, límite 0, archivadas y separación colecciones)', async () => {
+  const customCats: CustomCategory[] = [
+    {
+      id: 'cat_gimnasio',
+      name: 'Gimnasio',
+      color: '#0284C7',
+      icon: 'dumbbell',
+      order: 0,
+      archived: false,
+      csvKeywords: '',
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    },
+    {
+      id: 'cat_archivada',
+      name: 'Curso antiguo',
+      color: '#64748B',
+      icon: 'book',
+      order: 1,
+      archived: true,
+      csvKeywords: '',
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    },
+  ];
+
+  // Mes anterior tiene: supermercado 350, ocio 0 (límite válido!), transporte 90, cat_gimnasio 0, cat_archivada 45
+  // Mes actual ya tiene: supermercado 400, transporte 90 (igual)
+  const prevLimits = {
+    supermercado: 350,
+    ocio: 0,
+    transporte: 90,
+    cat_gimnasio: 0,
+    cat_archivada: 45,
+  };
+  const currentLimits = {
+    supermercado: 400,
+    transporte: 90,
+  };
+
+  // A) Por defecto NO sobrescribe existentes; rellena vacíos incluyendo 0; omite archivadas
+  const planNoOverwrite = planCopyPreviousMonthBudgets({
+    prevLimits,
+    currentLimits,
+    customCategories: customCats,
+    overwriteExisting: false,
+  });
+  assert.equal(planNoOverwrite.hasPreviousBudgets, true);
+  assert.equal(planNoOverwrite.toFill.length, 2);
+  assert.equal(planNoOverwrite.toOverwrite.length, 1);
+  assert.equal(planNoOverwrite.toOverwrite[0].categoryId, 'supermercado');
+  assert.equal(planNoOverwrite.unchanged.length, 1);
+  assert.equal(planNoOverwrite.skippedArchived.length, 1);
+  assert.equal(planNoOverwrite.skippedArchived[0].categoryId, 'cat_archivada');
+  assert.equal(planNoOverwrite.mergedLimits.supermercado, 400); // conservado
+  assert.equal(planNoOverwrite.mergedLimits.ocio, 0); // 0 copiado como válido
+  assert.equal(planNoOverwrite.mergedLimits.cat_gimnasio, 0); // 0 personalizado copiado
+  assert.equal('cat_archivada' in planNoOverwrite.mergedLimits, false);
+
+  // B) Con sobrescritura explícita sí actualiza supermercado a 350 y sigue omitiendo archivada
+  const planOverwrite = planCopyPreviousMonthBudgets({
+    prevLimits,
+    currentLimits,
+    customCategories: customCats,
+    overwriteExisting: true,
+  });
+  assert.equal(planOverwrite.mergedLimits.supermercado, 350);
+  assert.equal(planOverwrite.mergedLimits.ocio, 0);
+  assert.equal('cat_archivada' in planOverwrite.mergedLimits, false);
+
+  // C) Si el mes actual tiene límite 0 explícito, cuenta como existente (no vacío)
+  const planExistingZero = planCopyPreviousMonthBudgets({
+    prevLimits: { ocio: 120 },
+    currentLimits: { ocio: 0 },
+    customCategories: [],
+    overwriteExisting: false,
+  });
+  assert.equal(planExistingZero.toFill.length, 0);
+  assert.equal(planExistingZero.toOverwrite.length, 1);
+  assert.equal(planExistingZero.toOverwrite[0].previousCurrentLimit, 0);
+  assert.equal(planExistingZero.mergedLimits.ocio, 0);
+
+  // D) Persistencia en DemoHouseholdRepository: 0 se guarda y lee en sistema y personalizadas sin mezclar colecciones
+  const repo = new DemoHouseholdRepository();
+  const actor = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  const gymId = await repo.upsertCustomCategory(
+    'demo_hogar_santsadurni',
+    {
+      name: 'Deporte Cero',
+      color: '#0284C7',
+      icon: 'dumbbell',
+      order: 0,
+      archived: false,
+      csvKeywords: '',
+    },
+    actor
+  );
+  await repo.saveAllBudgets(
+    'demo_hogar_santsadurni',
+    '2026-08',
+    { ocio: 0, supermercado: 310, [gymId]: 0 },
+    [gymId],
+    actor
+  );
+  const fetchedPrev = await repo.fetchMonthBudgets('demo_hogar_santsadurni', '2026-08');
+  assert.equal(fetchedPrev.systemBudget?.limits.ocio, 0);
+  assert.equal(fetchedPrev.systemBudget?.limits.supermercado, 310);
+  assert.equal(gymId in (fetchedPrev.systemBudget?.limits ?? {}), false); // cat_* nunca en /budgets
+  const gymBudgetDoc = fetchedPrev.categoryBudgets.find((b) => b.categoryId === gymId);
+  assert.ok(gymBudgetDoc);
+  assert.equal(gymBudgetDoc?.limit, 0);
+
+  // E) computeBudgetProgress y getBudgetThresholdAlerts respetan límite 0
+  const merged = mergeMonthlyAndCustomBudgetLimits(
+    fetchedPrev.systemBudget,
+    fetchedPrev.categoryBudgets,
+    '2026-08'
+  );
+  const progressNoSpend = computeBudgetProgress([], merged);
+  const ocioNoSpend = progressNoSpend.find((p) => p.category === 'ocio');
+  assert.ok(ocioNoSpend);
+  assert.equal(ocioNoSpend?.hasLimit, true);
+  assert.equal(ocioNoSpend?.limit, 0);
+  assert.equal(ocioNoSpend?.status, 'verde');
+  assert.equal(getBudgetThresholdAlerts([], merged, 80).length, 0);
+
+  const txOverZero: Transaction = {
+    id: 'tx_over_zero',
+    monthKey: '2026-08',
+    concept: 'Cine',
+    category: 'ocio',
+    amount: 14,
+    date: '2026-08-10',
+    paidBy: 'uid_alex',
+    recurringId: null,
+    splitPctA: 50,
+    isSettlement: false,
+    settlementTo: '',
+    isPrivate: false,
+    createdBy: 'uid_alex',
+    notes: '',
+    createdAt: '2026-08-10',
+    updatedAt: '2026-08-10',
+  };
+  const progressWithSpend = computeBudgetProgress([txOverZero], merged);
+  const ocioOver = progressWithSpend.find((p) => p.category === 'ocio');
+  assert.equal(ocioOver?.status, 'rojo');
+  const alertsOver = getBudgetThresholdAlerts([txOverZero], merged, 80);
+  assert.equal(alertsOver.length, 1);
+  assert.equal(alertsOver[0].exceeded, true);
+  assert.equal(alertsOver[0].overAmount, 14);
+});
+
+test('22. Bloque 3 — Exploración del catálogo por secciones (combinada con texto, sin texto, paginación y favoritos)', () => {
+  const sampleMercadona = preindexMercadonaCatalog([
+    {
+      id: 'mc_1',
+      name: 'Leche entera',
+      brand: 'Hacendado',
+      format: '1 L',
+      section: 'Lácteos, quesos y bebidas vegetales',
+      defaultUnit: 'L',
+      sourceRef: 'off:1',
+      source: 'openfoodfacts_odbl',
+      addedAt: '2026-11-23',
+    },
+    {
+      id: 'mc_2',
+      name: 'Yogur natural',
+      brand: 'Hacendado',
+      format: '6x125 g',
+      section: 'Lácteos, quesos y bebidas vegetales',
+      defaultUnit: 'paq',
+      sourceRef: 'off:2',
+      source: 'openfoodfacts_odbl',
+      addedAt: '2026-11-23',
+    },
+    {
+      id: 'mc_3',
+      name: 'Agua mineral natural',
+      brand: 'Cortes',
+      format: '1,5 L',
+      section: 'Bebidas',
+      defaultUnit: 'botella',
+      sourceRef: 'off:3',
+      source: 'openfoodfacts_odbl',
+      addedAt: '2026-11-23',
+    },
+  ]);
+
+  const householdCatalog = [
+    {
+      id: 'hc_fav_queso',
+      text: 'Queso fresco batido',
+      defaultUnit: 'ud',
+      favorite: true,
+      usageCount: 12,
+      lastUsedAt: '2026-11-20',
+      section: 'Lácteos, quesos y bebidas vegetales' as const,
+      sourceType: 'custom' as const,
+      createdBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00.000Z',
+      updatedAt: '2026-11-20T10:00:00.000Z',
+    },
+  ];
+
+  // A) Navegar sección sin texto devuelve favoritos primero + productos de esa sección únicamente
+  const browseDairy = searchShoppingSuggestionsPaginated('', householdCatalog, sampleMercadona, {
+    section: 'Lácteos, quesos y bebidas vegetales',
+    limit: 2,
+    offset: 0,
+  });
+  assert.equal(browseDairy.totalCount, 3);
+  assert.equal(browseDairy.hasMore, true);
+  assert.equal(browseDairy.items.length, 2);
+  assert.equal(browseDairy.items[0].text, 'Queso fresco batido'); // favorito del hogar primero
+  assert.ok(
+    browseDairy.items.every((i) => i.section === 'Lácteos, quesos y bebidas vegetales')
+  );
+
+  // Página siguiente
+  const browseDairyPage2 = searchShoppingSuggestionsPaginated('', householdCatalog, sampleMercadona, {
+    section: 'Lácteos, quesos y bebidas vegetales',
+    limit: 2,
+    offset: 2,
+  });
+  assert.equal(browseDairyPage2.items.length, 1);
+  assert.equal(browseDairyPage2.hasMore, false);
+
+  // B) Combinar sección + texto filtra exactamente por ambos
+  const combined = searchShoppingSuggestionsPaginated('natural', householdCatalog, sampleMercadona, {
+    section: 'Bebidas',
+  });
+  assert.equal(combined.totalCount, 1);
+  assert.equal(combined.items[0].text, 'Agua mineral natural');
+
+  // C) "todas" busca en todas las secciones
+  const allNatural = searchShoppingSuggestionsPaginated('natural', householdCatalog, sampleMercadona, {
+    section: 'todas',
+  });
+  assert.equal(allNatural.totalCount, 2);
+});
+
+test('23. Bloque 4 — Finalizar compra: bloqueo doble clic y reintento de limpieza sin duplicar gasto', async () => {
+  const item1: ShoppingItem = {
+    id: 'shop_1',
+    text: 'Leche entera',
+    qty: 2,
+    unit: 'L',
+    done: true,
+    addedBy: 'uid_alex',
+    createdAt: '2026-11-01T10:00:00Z',
+    updatedAt: '2026-11-01T10:05:00Z',
+  };
+  const item2: ShoppingItem = {
+    id: 'shop_2',
+    text: 'Plátanos',
+    qty: 1,
+    unit: 'kg',
+    done: true,
+    addedBy: 'uid_alex',
+    createdAt: '2026-11-01T10:00:00Z',
+    updatedAt: '2026-11-01T10:06:00Z',
+  };
+
+  let liveItems: ShoppingItem[] = [item1, item2];
+  const session: ShoppingCheckoutSession = {
+    createdExpenseId: null,
+    snapshots: captureShoppingCheckoutSnapshots(liveItems),
+  };
+  const inFlightRef = { current: false };
+
+  let createExpenseCalls = 0;
+  let deleteCalls = 0;
+  let shouldFailDelete = true;
+
+  // 1) Doble confirmación simultánea: la segunda llamada queda bloqueada (ignored_in_flight)
+  const p1 = executeShoppingCheckout({
+    session,
+    inFlightRef,
+    createExpense: async () => {
+      createExpenseCalls += 1;
+      await new Promise((r) => setTimeout(r, 10));
+      return 'tx_compra_01';
+    },
+    getLiveShoppingItems: () => liveItems,
+    deleteItemsBulk: async (ids) => {
+      deleteCalls += 1;
+      if (shouldFailDelete) throw new Error('network error');
+      liveItems = liveItems.filter((i) => !ids.includes(i.id));
+    },
+  });
+
+  const p2 = executeShoppingCheckout({
+    session,
+    inFlightRef,
+    createExpense: async () => {
+      createExpenseCalls += 1;
+      return 'tx_duplicado';
+    },
+    getLiveShoppingItems: () => liveItems,
+    deleteItemsBulk: async () => {
+      deleteCalls += 1;
+    },
+  });
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r2.status, 'ignored_in_flight');
+  assert.equal(r1.status, 'cleanup_failed');
+  assert.equal(createExpenseCalls, 1);
+  assert.equal(deleteCalls, 1);
+  assert.equal(session.createdExpenseId, 'tx_compra_01');
+
+  // 2) Reintento tras fallo de limpieza: NO vuelve a crear el gasto; solo limpia
+  shouldFailDelete = false;
+  const r3 = await executeShoppingCheckout({
+    session,
+    inFlightRef,
+    createExpense: async () => {
+      createExpenseCalls += 1;
+      return 'tx_no_deberia_crearse';
+    },
+    getLiveShoppingItems: () => liveItems,
+    deleteItemsBulk: async (ids) => {
+      deleteCalls += 1;
+      liveItems = liveItems.filter((i) => !ids.includes(i.id));
+    },
+  });
+
+  assert.equal(r3.status, 'completed');
+  if (r3.status === 'completed') {
+    assert.equal(r3.expenseId, 'tx_compra_01');
+    assert.equal(r3.reusedExistingExpense, true);
+    assert.equal(r3.deletedCount, 2);
+  }
+  assert.equal(createExpenseCalls, 1); // NUNCA duplicado
+  assert.equal(deleteCalls, 2);
+  assert.equal(liveItems.length, 0);
+});
+
+test('24. Bloque 4 — Concurrencia de pareja en lista de la compra al finalizar compra', () => {
+  const initialChecked: ShoppingItem[] = [
+    {
+      id: 'i_unchanged',
+      text: 'Pan integral',
+      qty: 1,
+      unit: 'paq',
+      done: true,
+      addedBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00Z',
+      updatedAt: '2026-11-01T10:01:00Z',
+    },
+    {
+      id: 'i_modified_by_partner',
+      text: 'Leche entera',
+      qty: 2,
+      unit: 'L',
+      done: true,
+      addedBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00Z',
+      updatedAt: '2026-11-01T10:01:00Z',
+    },
+    {
+      id: 'i_unchecked_by_partner',
+      text: 'Huevos L',
+      qty: 1,
+      unit: 'docena',
+      done: true,
+      addedBy: 'uid_alex',
+      createdAt: '2026-11-01T10:00:00Z',
+      updatedAt: '2026-11-01T10:01:00Z',
+    },
+  ];
+  const snapshots = captureShoppingCheckoutSnapshots(initialChecked);
+
+  // Estado en vivo mientras el usuario confirmaba:
+  // - Pareja añadió 'Aceite de oliva' (nuevo, no estaba en snapshots)
+  // - Pareja cambió qty de 'Leche entera' de 2 a 6 y updatedAt
+  // - Pareja desmarcó 'Huevos L' (done: false)
+  // - 'Pan integral' sigue igual y marcado
+  const liveNow: ShoppingItem[] = [
+    initialChecked[0],
+    {
+      ...initialChecked[1],
+      qty: 6,
+      updatedAt: '2026-11-01T10:04:00Z',
+    },
+    {
+      ...initialChecked[2],
+      done: false,
+      updatedAt: '2026-11-01T10:04:30Z',
+    },
+    {
+      id: 'i_added_by_partner',
+      text: 'Aceite de oliva',
+      qty: 1,
+      unit: 'botella',
+      done: true, // incluso si la pareja ya lo marcó después, no estaba en esta compra
+      addedBy: 'uid_pareja',
+      createdAt: '2026-11-01T10:04:45Z',
+      updatedAt: '2026-11-01T10:04:45Z',
+    },
+  ];
+
+  const reconciled = reconcileShoppingItemsForCleanup(snapshots, liveNow);
+  assert.deepEqual(reconciled.safeToDeleteIds, ['i_unchanged']);
+  assert.equal(reconciled.skippedModified.length, 1);
+  assert.equal(reconciled.skippedModified[0].id, 'i_modified_by_partner');
+  assert.equal(reconciled.skippedUnchecked.length, 1);
+  assert.equal(reconciled.skippedUnchecked[0].id, 'i_unchecked_by_partner');
+  assert.equal(reconciled.safeToDeleteIds.includes('i_added_by_partner'), false);
+});
+
+test('25. Bloque 5 — Búsqueda global ampliada (origen, pagador, subtotales separados, privacidad y caché aislada)', async () => {
+  const txs: Transaction[] = [
+    {
+      id: 'tx_1',
+      monthKey: '2026-11',
+      concept: 'Compra Mercadona',
+      category: 'supermercado',
+      amount: 85.4,
+      date: '2026-11-12',
+      paidBy: 'comun', // legado -> debe normalizar a COMMON_ACCOUNT_ID
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: 'Semana',
+      createdAt: '2026-11-12',
+      updatedAt: '2026-11-12',
+    },
+    {
+      id: 'tx_liq',
+      monthKey: '2026-11',
+      concept: 'Ajuste noviembre',
+      category: 'liquidacion',
+      amount: 40,
+      date: '2026-11-15',
+      paidBy: 'uid_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: true,
+      settlementTo: 'uid_pareja',
+      isPrivate: false,
+      createdBy: 'uid_alex',
+      notes: '',
+      createdAt: '2026-11-15',
+      updatedAt: '2026-11-15',
+    },
+    {
+      id: 'tx_priv_other',
+      monthKey: '2026-11',
+      concept: 'Regalo sorpresa',
+      category: 'ocio',
+      amount: 60,
+      date: '2026-11-14',
+      paidBy: 'uid_pareja',
+      recurringId: null,
+      splitPctA: 0,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: true,
+      createdBy: 'uid_pareja',
+      notes: '',
+      createdAt: '2026-11-14',
+      updatedAt: '2026-11-14',
+    },
+  ];
+
+  const costs: InitialCost[] = [
+    {
+      id: 'ic_1',
+      concept: 'Fianza piso',
+      category: 'fianza',
+      amount: 900,
+      paidBy: COMMON_ACCOUNT_ID,
+      status: 'pagado',
+      dueDate: '2026-11-01',
+      notes: '2 meses',
+      createdAt: '2026-11-01',
+      updatedAt: '2026-11-01',
+    },
+    {
+      id: 'ic_2',
+      concept: 'Cerrajero bombín',
+      category: 'cerrajeria',
+      amount: 140,
+      paidBy: 'uid_alex',
+      status: 'pendiente',
+      dueDate: '2026-11-03',
+      notes: '',
+      createdAt: '2026-11-03',
+      updatedAt: '2026-11-03',
+    },
+  ];
+
+  // A) Filtro por pagador Cuenta común (incluye legado 'comun' + mudanza), subtotales separados y privacidad respetada
+  const comunRes = filterGlobalExpenses(
+    txs,
+    costs,
+    { origin: 'todos', payer: COMMON_ACCOUNT_ID, text: '', amountQuery: '', category: 'todas' },
+    { viewerUid: 'uid_alex' }
+  );
+  assert.equal(comunRes.monthlyCount, 1);
+  assert.equal(comunRes.monthlyExpenseTotal, 85.4);
+  assert.equal(comunRes.movingCount, 1);
+  assert.equal(comunRes.movingTotal, 900);
+  assert.equal(comunRes.movingPaidTotal, 900);
+  assert.equal(comunRes.movingPendingTotal, 0);
+
+  // B) Filtro por origen 'mudanza' solo devuelve InitialCost
+  const mudanzaOnly = filterGlobalExpenses(
+    txs,
+    costs,
+    { origin: 'mudanza', payer: 'todos', text: '', amountQuery: '', category: 'todas' },
+    { viewerUid: 'uid_alex' }
+  );
+  assert.equal(mudanzaOnly.monthlyCount, 0);
+  assert.equal(mudanzaOnly.movingCount, 2);
+  assert.equal(mudanzaOnly.movingTotal, 1040);
+  assert.equal(mudanzaOnly.movingPaidTotal, 900);
+  assert.equal(mudanzaOnly.movingPendingTotal, 140);
+
+  // C) Privado de uid_pareja nunca se filtra para uid_alex aunque coincida todo
+  const allForAlex = filterGlobalExpenses(
+    txs,
+    costs,
+    { origin: 'mensual', payer: 'todos', text: '', amountQuery: '', category: 'todas' },
+    { viewerUid: 'uid_alex' }
+  );
+  assert.equal(
+    allForAlex.items.some((r) => r.kind === 'mensual' && r.tx.id === 'tx_priv_other'),
+    false
+  );
+  // Liquidación aparece en listado pero no suma al subtotal de gastos mensuales
+  assert.equal(allForAlex.monthlyCount, 2);
+  assert.equal(allForAlex.monthlyExpenseTotal, 85.4);
+
+  // D) Caché aislada por (householdId, viewerUid) + invalidación
+  const cache = createScopedGlobalSearchCache();
+  cache.set('h_1', 'uid_alex', { transactions: [txs[0]], initialCosts: [costs[0]] });
+  cache.set('h_1', 'uid_pareja', { transactions: [txs[0], txs[2]], initialCosts: [costs[0]] });
+  cache.set('h_2', 'uid_alex', { transactions: [], initialCosts: [costs[1]] });
+
+  assert.equal(cache.get('h_1', 'uid_alex')?.transactions.length, 1);
+  assert.equal(cache.get('h_1', 'uid_pareja')?.transactions.length, 2);
+  assert.equal(cache.get('h_2', 'uid_alex')?.initialCosts[0].id, 'ic_2');
+
+  cache.invalidateScope('h_1', 'uid_alex');
+  assert.equal(cache.get('h_1', 'uid_alex'), null);
+  assert.ok(cache.get('h_1', 'uid_pareja')); // otro usuario aislado
+
+  cache.invalidateHousehold('h_1');
+  assert.equal(cache.get('h_1', 'uid_pareja'), null);
+  assert.ok(cache.get('h_2', 'uid_alex')); // otro hogar aislado
+
+  cache.clearAll();
+  assert.equal(cache.size(), 0);
+
+  // E) DemoHouseholdRepository.fetchAllInitialCosts funciona bajo demanda
+  const repo = new DemoHouseholdRepository();
+  const demoCosts = await repo.fetchAllInitialCosts('demo_hogar_santsadurni');
+  assert.ok(demoCosts.length > 0);
+});
+
+test('26. Fiabilidad — Finalizar compra: idempotencia duradera (recarga/respuesta perdida), sin falsos duplicados y solapamiento entre pareja', async () => {
+  const repo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  const actorMarta = { uid: 'demo_marta', displayName: 'Marta', photoURL: '' };
+
+  let liveShopping: ShoppingItem[] = [];
+  let novTxs: Transaction[] = [];
+  const uShop = repo.subscribeShopping(hid, (items) => {
+    liveShopping = items;
+  });
+  const uTx = repo.subscribeTransactionsByMonth(hid, 'demo_alex', '2026-11', (txs) => {
+    novTxs = txs;
+  });
+
+  // Limpiar previos de la demo para tener carrito controlado
+  if (liveShopping.length > 0) {
+    await repo.deleteShoppingItemsBulk(
+      hid,
+      liveShopping.map((i) => i.id)
+    );
+  }
+
+  const idA = await repo.upsertShoppingItem(hid, { text: 'Leche entera', qty: 2, unit: 'L', done: true }, actorAlex);
+  const idB = await repo.upsertShoppingItem(hid, { text: 'Pan molde', qty: 1, unit: 'ud', done: true }, actorAlex);
+
+  const snaps1 = captureShoppingCheckoutSnapshots(liveShopping.filter((i) => i.id === idA || i.id === idB));
+  assert.equal(snaps1.length, 2);
+
+  // A) Idempotencia tras fallo de red / recarga de app con el MISMO checkoutId
+  const checkoutId1 = generateShoppingCheckoutId();
+  assert.equal(isValidShoppingCheckoutId(checkoutId1), true);
+  const expectedExpenseId1 = buildCheckoutExpenseId(checkoutId1);
+
+  const txsBefore = novTxs.length;
+  const phase1First = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: checkoutId1,
+      monthKey: '2026-11',
+      concept: 'Compra Mercadona',
+      amount: 32.4,
+      date: '2026-11-18',
+      paidBy: 'demo_alex',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: 'Lista de la compra: Leche entera, Pan molde',
+      snapshots: snaps1,
+    },
+    actorAlex
+  );
+  assert.equal(phase1First.status, 'committed');
+  assert.equal(phase1First.expenseId, expectedExpenseId1);
+  assert.equal(phase1First.deletedIds.length, 2);
+  assert.equal(novTxs.length, txsBefore + 1);
+
+  // Simular que la respuesta se perdió en red y tras recargar se reintenta con el MISMO checkoutId
+  const phase1RetryAfterReload = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: checkoutId1,
+      monthKey: '2026-11',
+      concept: 'Compra Mercadona',
+      amount: 32.4,
+      date: '2026-11-18',
+      paidBy: 'demo_alex',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: 'Lista de la compra: Leche entera, Pan molde',
+      snapshots: snaps1,
+    },
+    actorAlex
+  );
+  assert.equal(phase1RetryAfterReload.status, 'already_committed');
+  assert.equal(phase1RetryAfterReload.expenseId, expectedExpenseId1);
+  // Cero duplicados
+  assert.equal(novTxs.length, txsBefore + 1);
+
+  // B) Dos compras reales distintas con MISMA fecha, MISMO importe y MISMO concepto NO deben deduplicarse erróneamente
+  const idC = await repo.upsertShoppingItem(hid, { text: 'Fruta', qty: 1, unit: 'kg', done: true }, actorAlex);
+  const snaps2 = captureShoppingCheckoutSnapshots(liveShopping.filter((i) => i.id === idC));
+  const checkoutId2 = generateShoppingCheckoutId();
+  assert.notEqual(checkoutId2, checkoutId1);
+
+  const phase1SecondRealPurchase = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: checkoutId2,
+      monthKey: '2026-11',
+      concept: 'Compra Mercadona',
+      amount: 32.4,
+      date: '2026-11-18',
+      paidBy: 'demo_alex',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: 'Lista de la compra: Fruta',
+      snapshots: snaps2,
+    },
+    actorAlex
+  );
+  assert.equal(phase1SecondRealPurchase.status, 'committed');
+  assert.equal(novTxs.length, txsBefore + 2);
+
+  // C) Ambos miembros intentan finalizar los mismos productos simultáneamente:
+  // Alex confirma y elimina idD/idE; Marta intenta luego con snapshots capturados antes -> overlap_conflict, 0 gasto extra
+  const idD = await repo.upsertShoppingItem(hid, { text: 'Huevos', qty: 1, unit: 'docena', done: true }, actorAlex);
+  const idE = await repo.upsertShoppingItem(hid, { text: 'Yogures', qty: 6, unit: 'ud', done: true }, actorMarta);
+  const sharedSnaps = captureShoppingCheckoutSnapshots(liveShopping.filter((i) => i.id === idD || i.id === idE));
+
+  const alexCheckoutId = generateShoppingCheckoutId();
+  const martaCheckoutId = generateShoppingCheckoutId();
+
+  const alexRes = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: alexCheckoutId,
+      monthKey: '2026-11',
+      concept: 'Compra conjunta',
+      amount: 14.2,
+      date: '2026-11-19',
+      paidBy: 'demo_alex',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: 'Huevos, Yogures',
+      snapshots: sharedSnaps,
+    },
+    actorAlex
+  );
+  assert.equal(alexRes.status, 'committed');
+  assert.equal(novTxs.length, txsBefore + 3);
+
+  const martaRes = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: martaCheckoutId,
+      monthKey: '2026-11',
+      concept: 'Compra conjunta',
+      amount: 14.2,
+      date: '2026-11-19',
+      paidBy: 'demo_marta',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: 'Huevos, Yogures',
+      snapshots: sharedSnaps,
+    },
+    actorMarta
+  );
+  assert.equal(martaRes.status, 'overlap_conflict');
+  assert.equal(martaRes.alreadyGoneIds.length, 2);
+  // Marta NO creó gasto duplicado
+  assert.equal(novTxs.length, txsBefore + 3);
+
+  // D) Cancelar antes de confirmar no toca ni la lista ni los gastos
+  const idKeep = await repo.upsertShoppingItem(hid, { text: 'Café molido', qty: 1, unit: 'paquete', done: true }, actorAlex);
+  const cancelSnapshots = captureShoppingCheckoutSnapshots(liveShopping.filter((i) => i.id === idKeep));
+  assert.equal(cancelSnapshots.length, 1);
+  // Sin invocar commitShoppingCheckoutPhase1 -> artículo intacto y transacciones iguales
+  assert.ok(liveShopping.some((i) => i.id === idKeep && i.done === true));
+  assert.equal(novTxs.length, txsBefore + 3);
+
+  uShop();
+  uTx();
+});
+
+test('27. Fiabilidad — Limpieza multi-lote (>10 productos), fallo intermedio, ediciones concurrentes de pareja y reanudación desde segundo dispositivo', async () => {
+  const repo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  const actorMarta = { uid: 'demo_marta', displayName: 'Marta', photoURL: '' };
+
+  let liveShopping: ShoppingItem[] = [];
+  let pendingCheckouts: import('../types/nido').PendingShoppingCheckout[] = [];
+  let novTxs: Transaction[] = [];
+
+  const uShop = repo.subscribeShopping(hid, (items) => {
+    liveShopping = items;
+  });
+  const uPend = repo.subscribePendingShoppingCheckouts(hid, 'demo_alex', (list) => {
+    pendingCheckouts = list;
+  });
+  const uTx = repo.subscribeTransactionsByMonth(hid, 'demo_alex', '2026-11', (txs) => {
+    novTxs = txs;
+  });
+
+  if (liveShopping.length > 0) {
+    await repo.deleteShoppingItemsBulk(
+      hid,
+      liveShopping.map((i) => i.id)
+    );
+  }
+
+  // Crear 14 productos marcados (10 en lote 1 + 4 en lote 2) + 1 pendiente sin marcar
+  const createdIds: string[] = [];
+  for (let i = 1; i <= 14; i++) {
+    const id = await repo.upsertShoppingItem(
+      hid,
+      { text: `Producto ${String(i).padStart(2, '0')}`, qty: 1, unit: 'ud', done: true },
+      actorAlex
+    );
+    createdIds.push(id);
+  }
+  const uncheckedId = await repo.upsertShoppingItem(
+    hid,
+    { text: 'Artículo pendiente sin coger', qty: 1, unit: 'ud', done: false },
+    actorAlex
+  );
+
+  // Asegurar que las fechas de los artículos quedan estrictamente antes de la compra (para el chequeo cross-device)
+  await new Promise((r) => setTimeout(r, 15));
+
+  const snaps = captureShoppingCheckoutSnapshots(liveShopping.filter((i) => i.done));
+  assert.equal(snaps.length, 14);
+  assert.equal(MAX_CHECKOUT_BATCH_ITEMS, 10);
+
+  const checkoutId = generateShoppingCheckoutId();
+  const inFlightRef = { current: false };
+  const txsBefore = novTxs.length;
+
+  // Primer intento: Fase 1 compromete gasto + 10 borrados + crea pendingShoppingCheckouts con 4 pendientes;
+  // pero el lote 2 falla por corte de red simulado.
+  const firstRun = await executeDurableShoppingCheckout({
+    input: {
+      checkoutId,
+      monthKey: '2026-11',
+      concept: 'Compra grande semanal',
+      amount: 112.8,
+      date: '2026-11-20',
+      paidBy: 'demo_alex',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '14 artículos',
+      snapshots: snaps,
+    },
+    inFlightRef,
+    commitPhase1: (inp) => repo.commitShoppingCheckoutPhase1(hid, inp, actorAlex),
+    cleanupBatch: async () => {
+      throw new Error('Corte de red simulado en lote 2');
+    },
+  });
+
+  assert.equal(firstRun.status, 'cleanup_partial');
+  assert.equal(firstRun.deletedCount, 10);
+  assert.equal(firstRun.remainingItemIds.length, 4);
+  assert.equal(novTxs.length, txsBefore + 1);
+  assert.equal(pendingCheckouts.length, 1);
+  assert.equal(pendingCheckouts[0].id, checkoutId);
+  assert.equal(pendingCheckouts[0].pendingItemIds.length, 4);
+
+  // Antes de reanudar el lote 2, la pareja (Marta) modifica concurrentemente los 4 restantes:
+  // - remaining[0]: Marta edita cantidad (1 -> 3) -> debe conservarse
+  // - remaining[1]: Marta desmarca (done: false) -> debe conservarse
+  // - remaining[2] y remaining[3]: sin tocar -> deben borrarse
+  // - Marta añade un producto nuevo marcado -> jamás debe borrarse
+  const remainingIds = [...pendingCheckouts[0].pendingItemIds];
+  const editedTarget = liveShopping.find((i) => i.id === remainingIds[0])!;
+  const uncheckedTarget = liveShopping.find((i) => i.id === remainingIds[1])!;
+
+  await new Promise((r) => setTimeout(r, 15));
+  await repo.upsertShoppingItem(
+    hid,
+    { id: editedTarget.id, text: editedTarget.text, qty: 3, unit: editedTarget.unit, done: true },
+    actorMarta
+  );
+  await repo.upsertShoppingItem(
+    hid,
+    { id: uncheckedTarget.id, text: uncheckedTarget.text, qty: uncheckedTarget.qty, unit: uncheckedTarget.unit, done: false },
+    actorMarta
+  );
+  const partnerNewId = await repo.upsertShoppingItem(
+    hid,
+    { text: 'Nuevo artículo de Marta', qty: 1, unit: 'ud', done: true },
+    actorMarta
+  );
+
+  // Reanudar desde un SEGUNDO DISPOSITIVO (sin snapshotsById local -> usa verificación por updatedAt <= checkout.createdAt)
+  const batch2Res = await repo.cleanupShoppingCheckoutBatch(hid, checkoutId, undefined);
+  assert.equal(batch2Res.completed, true);
+  assert.equal(batch2Res.remainingItemIds.length, 0);
+  assert.deepEqual(
+    [...batch2Res.deletedIds].sort(),
+    [remainingIds[2], remainingIds[3]].sort()
+  );
+  assert.deepEqual(
+    [...batch2Res.skippedConcurrentIds].sort(),
+    [editedTarget.id, uncheckedTarget.id].sort()
+  );
+
+  // El gasto NO se duplicó y el documento pendingShoppingCheckouts se eliminó al terminar
+  assert.equal(novTxs.length, txsBefore + 1);
+  assert.equal(pendingCheckouts.length, 0);
+
+  // Verificar exactamente qué sobrevivió en la lista viva
+  const survivingIds = new Set(liveShopping.map((i) => i.id));
+  assert.equal(survivingIds.has(uncheckedId), true);
+  assert.equal(survivingIds.has(editedTarget.id), true);
+  assert.equal(liveShopping.find((i) => i.id === editedTarget.id)?.qty, 3);
+  assert.equal(survivingIds.has(uncheckedTarget.id), true);
+  assert.equal(liveShopping.find((i) => i.id === uncheckedTarget.id)?.done, false);
+  assert.equal(survivingIds.has(partnerNewId), true);
+  assert.equal(survivingIds.has(remainingIds[2]), false);
+  assert.equal(survivingIds.has(remainingIds[3]), false);
+
+  // Comprobar también función pura isShoppingItemSafeForCrossDeviceCleanup
+  assert.equal(
+    isShoppingItemSafeForCrossDeviceCleanup(
+      { done: true, updatedAt: '2026-11-20T10:00:00.000Z' },
+      '2026-11-20T10:00:05.000Z'
+    ),
+    true
+  );
+  assert.equal(
+    isShoppingItemSafeForCrossDeviceCleanup(
+      { done: true, updatedAt: '2026-11-20T10:00:06.000Z' },
+      '2026-11-20T10:00:05.000Z'
+    ),
+    false
+  );
+  assert.equal(
+    isShoppingItemSafeForCrossDeviceCleanup(
+      { done: false, updatedAt: '2026-11-20T09:59:00.000Z' },
+      '2026-11-20T10:00:05.000Z'
+    ),
+    false
+  );
+
+  uShop();
+  uPend();
+  uTx();
+});
+
+test('28. Fiabilidad — Estado local de checkout pendiente aislado por (householdId, viewerUid)', () => {
+  const mem = new Map<string, string>();
+  const prevStorage = globalThis.localStorage;
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      get length() {
+        return mem.size;
+      },
+      key(index: number) {
+        return Array.from(mem.keys())[index] ?? null;
+      },
+      getItem(k: string) {
+        return mem.get(k) ?? null;
+      },
+      setItem(k: string, v: string) {
+        mem.set(k, v);
+      },
+      removeItem(k: string) {
+        mem.delete(k);
+      },
+      clear() {
+        mem.clear();
+      },
+    },
+  });
+
+  try {
+    const cid = generateShoppingCheckoutId();
+    saveLocalPendingCheckout({
+      checkoutId: cid,
+      expenseId: buildCheckoutExpenseId(cid),
+      householdId: 'h_1',
+      viewerUid: 'uid_alex',
+      monthKey: '2026-11',
+      concept: 'Compra',
+      amount: 45,
+      date: '2026-11-20',
+      paidBy: 'uid_alex',
+      splitPctA: 50,
+      isPrivate: true,
+      notes: '',
+      snapshots: [],
+      state: 'committing',
+      createdAt: '2026-11-20T10:00:00.000Z',
+      updatedAt: '2026-11-20T10:00:00.000Z',
+    });
+
+    assert.equal(loadLocalPendingCheckout('h_1', 'uid_alex')?.checkoutId, cid);
+    // Aislamiento estricto: otro usuario u otro hogar no lo ve
+    assert.equal(loadLocalPendingCheckout('h_1', 'uid_marta'), null);
+    assert.equal(loadLocalPendingCheckout('h_2', 'uid_alex'), null);
+
+    clearLocalPendingCheckout('h_1', 'uid_alex');
+    assert.equal(loadLocalPendingCheckout('h_1', 'uid_alex'), null);
+
+    saveLocalPendingCheckout({
+      checkoutId: cid,
+      expenseId: buildCheckoutExpenseId(cid),
+      householdId: 'h_1',
+      viewerUid: 'uid_alex',
+      monthKey: '2026-11',
+      concept: 'Compra',
+      amount: 45,
+      date: '2026-11-20',
+      paidBy: 'uid_alex',
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '',
+      snapshots: [],
+      state: 'committing',
+      createdAt: '2026-11-20T10:00:00.000Z',
+      updatedAt: '2026-11-20T10:00:00.000Z',
+    });
+    clearAllLocalPendingCheckouts();
+    assert.equal(loadLocalPendingCheckout('h_1', 'uid_alex'), null);
+  } finally {
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: prevStorage,
+    });
+  }
+});
+
+test('29. Fiabilidad — Meses cerrados protegidos en capa de datos (gastos, presupuestos, checkout e importación)', async () => {
+  const repo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+  let octTxs: Transaction[] = [];
+  const uTx = repo.subscribeTransactionsByMonth(hid, 'demo_alex', '2026-10', (txs) => {
+    octTxs = txs;
+  });
+
+  // Crear gasto y presupuesto en 2026-10 estando abierto
+  const txOctId = await repo.upsertTransaction(
+    hid,
+    {
+      monthKey: '2026-10',
+      concept: 'Gasto octubre abierto',
+      category: 'supermercado',
+      amount: 50,
+      date: '2026-10-12',
+      paidBy: 'demo_alex',
+      recurringId: null,
+      splitPctA: 50,
+      isSettlement: false,
+      settlementTo: '',
+      isPrivate: false,
+      createdBy: 'demo_alex',
+      notes: '',
+    },
+    actorAlex
+  );
+  await repo.saveBudget(hid, '2026-10', { supermercado: 400 }, actorAlex);
+
+  // Cerrar 2026-10
+  await repo.closeMonth(
+    hid,
+    {
+      monthKey: '2026-10',
+      totalSpent: 50,
+      paidA: 50,
+      paidB: 0,
+      paidComun: 0,
+      shareA: 25,
+      shareB: 25,
+      balanceA: 25,
+      settlementText: 'Cerrado prueba',
+      closedBy: 'demo_alex',
+    },
+    actorAlex
+  );
+
+  // Crear, editar, borrar gasto y guardar presupuesto o finalizar compra en mes cerrado deben fallar
+  await assert.rejects(
+    () =>
+      repo.upsertTransaction(
+        hid,
+        {
+          monthKey: '2026-10',
+          concept: 'Intento en mes cerrado',
+          category: 'ocio',
+          amount: 20,
+          date: '2026-10-15',
+          paidBy: 'demo_alex',
+          recurringId: null,
+          splitPctA: 50,
+          isSettlement: false,
+          settlementTo: '',
+          isPrivate: false,
+          createdBy: 'demo_alex',
+          notes: '',
+        },
+        actorAlex
+      ),
+    /cerrado/i
+  );
+
+  await assert.rejects(
+    () => repo.deleteTransaction(hid, txOctId, 'Gasto octubre abierto', actorAlex),
+    /cerrado/i
+  );
+
+  await assert.rejects(
+    () => repo.saveBudget(hid, '2026-10', { supermercado: 999 }, actorAlex),
+    /cerrado/i
+  );
+
+  const shopForClosedId = await repo.upsertShoppingItem(
+    hid,
+    { text: 'Pan octubre', qty: 1, unit: 'ud', done: true },
+    actorAlex
+  );
+  await assert.rejects(
+    () =>
+      repo.commitShoppingCheckoutPhase1(
+        hid,
+        {
+          checkoutId: generateShoppingCheckoutId(),
+          monthKey: '2026-10',
+          concept: 'Compra en mes cerrado',
+          amount: 30,
+          date: '2026-10-18',
+          paidBy: 'demo_alex',
+          splitPctA: 50,
+          isPrivate: false,
+          notes: '',
+          snapshots: [
+            {
+              id: shopForClosedId,
+              text: 'Pan octubre',
+              qty: 1,
+              unit: 'ud',
+              done: true,
+              updatedAt: new Date().toISOString(),
+            },
+          ],
+        },
+        actorAlex
+      ),
+    /cerrado/i
+  );
+
+  // importBackup NO sobrescribe el mes ya cerrado 2026-10
+  const backup = await repo.exportBackup(hid, 'demo_alex');
+  const modifiedBackup: NidoBackupV1 = {
+    ...backup,
+    transactions: [
+      ...backup.transactions,
+      {
+        id: 'tx_injected_closed_oct',
+        monthKey: '2026-10',
+        concept: 'Inyectado en mes cerrado',
+        category: 'otros',
+        amount: 999,
+        date: '2026-10-25',
+        paidBy: 'demo_alex',
+        recurringId: null,
+        splitPctA: 50,
+        isSettlement: false,
+        settlementTo: '',
+        isPrivate: false,
+        createdBy: 'demo_alex',
+        notes: '',
+      },
+    ],
+  };
+  await repo.importBackup(hid, modifiedBackup, actorAlex);
+  assert.equal(
+    octTxs.some((t) => t.id === 'tx_injected_closed_oct'),
+    false
+  );
+
+  // Reabrir 2026-10 vuelve a permitir editar
+  await repo.reopenMonth(hid, '2026-10', actorAlex);
+  await repo.saveBudget(hid, '2026-10', { supermercado: 420 }, actorAlex);
+
+  uTx();
+});
+
+test('30. Fiabilidad — PWA update guard: bloqueos de edición/escritura, detección de chunk obsoleto y anti-bucle de recarga', () => {
+  resetPwaGuardForTests();
+  assert.equal(getPwaReloadBlockStatus().blocked, false);
+
+  const releaseEdit = acquirePwaEditLock();
+  assert.equal(getPwaReloadBlockStatus().blocked, true);
+  assert.equal(getPwaReloadBlockStatus().reason, 'unsaved_form');
+
+  // Escritura pendiente tiene prioridad sobre formulario abierto
+  const releaseWrite = acquirePwaWriteLock();
+  assert.equal(getPwaReloadBlockStatus().reason, 'pending_write');
+
+  releaseWrite();
+  assert.equal(getPwaReloadBlockStatus().reason, 'unsaved_form');
+
+  releaseEdit();
+  assert.equal(getPwaReloadBlockStatus().blocked, false);
+
+  // Anti-bucle de recarga ante chunks obsoletos
+  const mem = new Map<string, string>();
+  const mockSession = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      mem.set(k, v);
+    },
+    removeItem: (k: string) => {
+      mem.delete(k);
+    },
+  };
+
+  const t0 = 1_700_000_000_000;
+  assert.equal(canTriggerSafeChunkReload(t0, mockSession), true);
+  assert.equal(recordSafeChunkReloadAttempt(t0, mockSession), true);
+  // 2º intento dentro de 60s queda bloqueado para evitar bucles infinitos
+  assert.equal(canTriggerSafeChunkReload(t0 + 10_000, mockSession), false);
+  assert.equal(recordSafeChunkReloadAttempt(t0 + 10_000, mockSession), false);
+  // Pasada la ventana de 60s vuelve a permitirse
+  assert.equal(canTriggerSafeChunkReload(t0 + 61_000, mockSession), true);
+
+  clearSafeChunkReloadAttempts(mockSession);
+  assert.equal(canTriggerSafeChunkReload(t0 + 5_000, mockSession), true);
+
+  // Detección de errores de chunks obsoletos
+  assert.equal(
+    isLikelyStaleChunkError(new Error('Failed to fetch dynamically imported module: /assets/AhorrosView-abc.js')),
+    true
+  );
+  assert.equal(isLikelyStaleChunkError(new Error('Importing a module script failed.')), true);
+  assert.equal(isLikelyStaleChunkError(new Error('Error genérico de validación')), false);
+});
+
+
+
+

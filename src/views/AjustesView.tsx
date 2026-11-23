@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PWAInstallButton } from '../components/PWAInstallButton';
+import { CategoryManagerSection } from '../components/ajustes/CategoryManagerSection';
 import { CategoryColorModal } from '../components/mensual/CategoryColorModal';
 import { useNido } from '../context/NidoContext';
 import {
@@ -47,10 +48,10 @@ import {
   type LocalNoticeDaysAhead,
   type LocalNoticeSettings,
 } from '../domain/localNotifications';
-import { SPLIT_PRESETS, TRANSACTION_CATEGORY_LABELS } from '../domain/presets';
+import { SPLIT_PRESETS } from '../domain/presets';
 import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
-import { exportNidoPDF } from '../services/pdfExport';
+import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
 import type { HouseholdSettings, NidoBackupV1, SplitMode } from '../types/nido';
 
 export const AjustesView: React.FC = () => {
@@ -70,6 +71,7 @@ export const AjustesView: React.FC = () => {
     recentTransactions,
     monthClosures,
     currentMonthBudget,
+    categoryRegistry,
     repo,
     logout,
     joinHousehold,
@@ -97,10 +99,12 @@ export const AjustesView: React.FC = () => {
   const [reportFrom, setReportFrom] = useState(() => `${shiftMonthKey(todayISO.slice(0, 7), -2)}-01`);
   const [reportTo, setReportTo] = useState(todayISO);
 
-  // JSON import state
+  // JSON import & PDF export state
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingBackup, setPendingBackup] = useState<NidoBackupV1 | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [pdfExportError, setPdfExportError] = useState<string | null>(null);
 
   // Device-local foreground reminders (opt-in)
   const noticeStorageKey =
@@ -287,17 +291,21 @@ export const AjustesView: React.FC = () => {
 
   const handleExportJSON = async () => {
     if (!householdId || !currentUserProfile) return;
-    const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
-    downloadTextFile(
-      `nido-backup-${todayISO}.json`,
-      JSON.stringify(backup, null, 2),
-      'application/json'
-    );
-    if (backupStorageKey) {
-      saveLastBackupRequestedAt(backupStorageKey, todayISO);
-      setLastBackupDate(todayISO);
+    try {
+      const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
+      downloadTextFile(
+        `nido-backup-${todayISO}.json`,
+        JSON.stringify(backup, null, 2),
+        'application/json'
+      );
+      if (backupStorageKey) {
+        saveLastBackupRequestedAt(backupStorageKey, todayISO);
+        setLastBackupDate(todayISO);
+      }
+      showToast('Copia de seguridad JSON descargada');
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo exportar la copia de seguridad.'));
     }
-    showToast('Copia de seguridad JSON descargada');
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -342,7 +350,7 @@ export const AjustesView: React.FC = () => {
           formatDateES(t.date),
           t.monthKey,
           t.concept,
-          TRANSACTION_CATEGORY_LABELS[t.category],
+          categoryRegistry.getLabel(t.category),
           t.paidBy === 'cuenta_comun'
             ? 'Cuenta común'
             : members.find((m) => m.uid === t.paidBy)?.displayName?.split(' ')[0] || t.paidBy,
@@ -359,10 +367,12 @@ export const AjustesView: React.FC = () => {
   };
 
   const handleFullReportPDF = async () => {
-    if (!household || !householdId || !currentUserProfile) return;
+    if (!household || !householdId || !currentUserProfile || exportingPdf) return;
+    setExportingPdf(true);
+    setPdfExportError(null);
     try {
       const backup = await repo.exportBackup(householdId, currentUserProfile.uid);
-      exportNidoPDF({
+      await loadAndExportNidoPDF({
         scope: 'completo',
         household,
         members,
@@ -373,10 +383,15 @@ export const AjustesView: React.FC = () => {
         items: backup.items.map((it) => ({ ...it, createdAt: '', updatedAt: '' })),
         goals: backup.goals.map((g) => ({ ...g, createdAt: '', updatedAt: '' })),
         goalMovements: backup.goalMovements.map((m) => ({ ...m, createdAt: '' })),
+        categoryLabels: categoryRegistry.labelsMap,
       });
       showToast('Informe completo PDF descargado');
     } catch (err) {
-      showToast(toUserFriendlyErrorMessage(err, 'No se pudo generar el informe PDF.'));
+      setPdfExportError(
+        toUserFriendlyErrorMessage(err, 'No se pudo generar el informe PDF. Inténtalo de nuevo.')
+      );
+    } finally {
+      setExportingPdf(false);
     }
   };
 
@@ -735,16 +750,19 @@ export const AjustesView: React.FC = () => {
                 <button
                   type="button"
                   aria-label="Regenerar código de invitación"
-                  onClick={() =>
-                    householdId &&
-                    household &&
-                    currentUserProfile &&
-                    void repo.regenerateInviteCode(
-                      householdId,
-                      household.inviteCode,
-                      currentUserProfile
-                    )
-                  }
+                  onClick={async () => {
+                    if (!householdId || !household || !currentUserProfile) return;
+                    try {
+                      await repo.regenerateInviteCode(
+                        householdId,
+                        household.inviteCode,
+                        currentUserProfile
+                      );
+                      showToast('Código de invitación actualizado');
+                    } catch (err) {
+                      showToast(toUserFriendlyErrorMessage(err, 'No se pudo regenerar el código de invitación.'));
+                    }
+                  }}
                   className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] flex items-center justify-center"
                 >
                   <RefreshCw className="w-4 h-4" />
@@ -822,6 +840,9 @@ export const AjustesView: React.FC = () => {
         </div>
       </div>
 
+      {/* Custom Expense Categories Manager */}
+      <CategoryManagerSection />
+
       {/* Full Reports & JSON Backup */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
@@ -859,13 +880,33 @@ export const AjustesView: React.FC = () => {
             </button>
             <button
               type="button"
+              disabled={exportingPdf}
               onClick={() => void handleFullReportPDF()}
-              className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5"
+              className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50"
             >
               <Download className="w-4 h-4" />
-              <span>Generar informe PDF</span>
+              <span>{exportingPdf ? 'Generando PDF...' : 'Generar informe PDF'}</span>
             </button>
           </div>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            El generador PDF se descarga bajo demanda la primera vez que lo utilizas (requiere conexión si aún no se ha cargado en este dispositivo).
+          </p>
+          {pdfExportError && (
+            <div
+              role="alert"
+              className="rounded-xl bg-[#B42318]/10 text-[#B42318] dark:text-[#FCA5A5] p-3 text-xs font-medium flex flex-wrap items-center justify-between gap-2"
+            >
+              <span>{pdfExportError}</span>
+              <button
+                type="button"
+                disabled={exportingPdf}
+                onClick={() => void handleFullReportPDF()}
+                className="min-h-[44px] px-3 rounded-lg bg-[#0E5A64] text-white font-semibold disabled:opacity-50 shrink-0"
+              >
+                Reintentar
+              </button>
+            </div>
+          )}
         </section>
 
         <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
