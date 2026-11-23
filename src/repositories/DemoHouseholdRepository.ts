@@ -1634,11 +1634,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.assertMonthNotClosed(input.monthKey);
 
     const batch1 = ordered.slice(0, MAX_CHECKOUT_BATCH_ITEMS);
-    const remainingIds = ordered.slice(MAX_CHECKOUT_BATCH_ITEMS).map((s) => s.id);
+    const remainingSnapshots = ordered.slice(MAX_CHECKOUT_BATCH_ITEMS);
     const liveById = new Map(this.state.shopping.map((item) => [item.id, item]));
 
     const alreadyGoneIds: string[] = [];
     const deletedIds: string[] = [];
+    const validRemainingIds: string[] = [];
     const skippedConcurrentIds: string[] = [];
 
     for (const expected of batch1) {
@@ -1654,11 +1655,24 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       }
     }
 
+    for (const expected of remainingSnapshots) {
+      const liveItem = liveById.get(expected.id);
+      if (!liveItem) {
+        alreadyGoneIds.push(expected.id);
+        continue;
+      }
+      if (isShoppingItemUnchangedForCheckout(expected, liveItem)) {
+        validRemainingIds.push(expected.id);
+      } else {
+        skippedConcurrentIds.push(expected.id);
+      }
+    }
+
     if (alreadyGoneIds.length > 0) {
       return { status: 'overlap_conflict', alreadyGoneIds };
     }
 
-    if (deletedIds.length === 0 && remainingIds.length === 0) {
+    if (deletedIds.length === 0 && validRemainingIds.length === 0) {
       return {
         status: 'all_modified_or_gone',
         skippedConcurrentIds,
@@ -1710,7 +1724,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       this.state.shopping = this.state.shopping.filter((s) => !delSet.has(s.id));
     }
 
-    if (remainingIds.length > 0) {
+    if (validRemainingIds.length > 0) {
       this.state.pendingShoppingCheckouts = [
         ...this.state.pendingShoppingCheckouts.filter((c) => c.id !== input.checkoutId),
         {
@@ -1719,7 +1733,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
           monthKey: input.monthKey,
           amount: isPrivate ? 0 : cleanAmount,
           concept: isPrivate ? 'Compra privada' : cleanConcept,
-          pendingItemIds: remainingIds,
+          pendingItemIds: validRemainingIds,
           totalItemCount: ordered.length,
           isPrivate,
           createdBy: actor.uid,
@@ -1735,7 +1749,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       expenseId,
       deletedIds,
       skippedConcurrentIds,
-      pendingItemIds: remainingIds,
+      pendingItemIds: validRemainingIds,
     };
   }
 

@@ -70,6 +70,7 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
     memberB,
     effectiveSplitPctA,
     monthClosures,
+    pendingShoppingCheckouts,
     uiMode,
     repo,
     showToast,
@@ -83,9 +84,7 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
     : !memberB || currentUserProfile?.uid !== memberB.uid;
 
   const [amount, setAmount] = useState('');
-  const [paidBy, setPaidBy] = useState<string>(
-    () => currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID
-  );
+  const [paidBy, setPaidBy] = useState<string>(COMMON_ACCOUNT_ID);
   const [showDetails, setShowDetails] = useState(false);
   const [date, setDate] = useState(() => getTodayLocalISO());
   const [concept, setConcept] = useState('Compra supermercado');
@@ -96,7 +95,10 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [overlapConflict, setOverlapConflict] = useState<{ count: number } | null>(null);
+  const [overlapConflict, setOverlapConflict] = useState<{
+    count: number;
+    inProgressOtherCheckout?: boolean;
+  } | null>(null);
   const [cleanupRecovery, setCleanupRecovery] = useState<{
     checkoutId: string;
     expenseId: string;
@@ -166,6 +168,22 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
       }
       if (isMonthClosed) {
         setError('Ese mes está cerrado. Cambia la fecha o desbloquea el mes en Avanzado.');
+        return;
+      }
+      // Si ya existe otro cierre multi-lote pendiente en el hogar que incluye alguno de estos productos,
+      // bloqueamos antes de comprometer la Fase 1 para evitar solapamiento en lotes posteriores.
+      const otherPendingItemIds = new Set(
+        pendingShoppingCheckouts
+          .filter((c) => c.id !== checkoutIdRef.current)
+          .flatMap((c) => c.pendingItemIds)
+      );
+      const overlappingWithPending = snapshots.filter((s) => otherPendingItemIds.has(s.id));
+      if (overlappingWithPending.length > 0) {
+        setOverlapConflict({
+          count: overlappingWithPending.length,
+          inProgressOtherCheckout: true,
+        });
+        setError(null);
         return;
       }
     }
@@ -305,18 +323,22 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
       result.skippedConcurrentCount > 0
         ? ` · ${result.skippedConcurrentCount} conservados por cambios recientes`
         : '';
+    const alreadyGoneSuffix =
+      result.alreadyGoneCount > 0
+        ? ` · Aviso: ${result.alreadyGoneCount} ya habían sido retirados en otro cierre (revisa los gastos recientes)`
+        : '';
 
     if (result.reusedExistingExpense) {
       showToast(
         `Compra confirmada sin duplicar gasto (${result.deletedCount} ${
           result.deletedCount === 1 ? 'producto retirado' : 'productos retirados'
-        })${concurrentSuffix}`
+        })${concurrentSuffix}${alreadyGoneSuffix}`
       );
     } else {
       showToast(
         `Compra finalizada: ${formatEUR(cleanAmount)} confirmado y ${result.deletedCount} ${
           result.deletedCount === 1 ? 'producto retirado' : 'productos retirados'
-        }${concurrentSuffix}`
+        }${concurrentSuffix}${alreadyGoneSuffix}`
       );
     }
     onCompleted();
@@ -343,16 +365,22 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
             <AlertTriangle className="w-5 h-5 text-amber-700 dark:text-amber-300 shrink-0 mt-0.5" />
             <div className="space-y-1 text-xs">
               <p className="font-bold text-amber-950 dark:text-amber-100 text-sm">
-                Esta compra ya cambió desde otro dispositivo
+                {overlapConflict.inProgressOtherCheckout
+                  ? 'Hay otro cierre de compra en curso con estos productos'
+                  : 'Estos productos ya fueron procesados'}
               </p>
               <p className="text-amber-900 dark:text-amber-200">
-                {overlapConflict.count === 1
-                  ? 'Uno de los productos seleccionados ya fue retirado o finalizado.'
-                  : `${overlapConflict.count} de los productos seleccionados ya fueron retirados o finalizados.`}
+                {overlapConflict.inProgressOtherCheckout
+                  ? overlapConflict.count === 1
+                    ? 'Uno de los productos seleccionados pertenece a una limpieza pendiente en el hogar.'
+                    : `${overlapConflict.count} de los productos seleccionados pertenecen a una limpieza pendiente en el hogar.`
+                  : overlapConflict.count === 1
+                    ? 'Uno de los productos seleccionados ya fue retirado o finalizado (por tu pareja o por un intento anterior ya confirmado en el servidor tras perder conexión o cerrar sesión).'
+                    : `${overlapConflict.count} de los productos seleccionados ya fueron retirados o finalizados (por tu pareja o por un intento anterior ya confirmado en el servidor tras perder conexión o cerrar sesión).`}
               </p>
               <p className="text-amber-800 dark:text-amber-300">
-                No se ha creado ningún gasto para evitar duplicados. Revisa la lista actualizada y
-                los gastos del mes antes de volver a guardar.
+                No se ha creado ningún gasto para evitar duplicados. Revisa los gastos recientes del
+                mes y la lista actualizada antes de volver a guardar.
               </p>
             </div>
           </div>

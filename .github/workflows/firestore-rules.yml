@@ -1,0 +1,69 @@
+name: Verificación de reglas de Firestore
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'firestore.rules'
+      - 'firestore.rules.test.ts'
+      - 'firebase.json'
+      - 'package.json'
+      - 'src/**'
+      - '.github/workflows/firestore-rules.yml'
+  pull_request:
+    paths:
+      - 'firestore.rules'
+      - 'firestore.rules.test.ts'
+      - 'firebase.json'
+      - 'package.json'
+      - 'src/**'
+      - '.github/workflows/firestore-rules.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firestore-rules-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firestore-rules-emulator:
+    name: Tests de firestore.rules (Emulador local)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configurar Java 21 (requerido por Firestore Emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Instalar dependencias del proyecto
+        run: npm install --no-audit --no-fund
+
+      - name: Comprobar tipado TypeScript
+        run: npm run lint
+
+      - name: Validar sintaxis y seguridad de firestore.rules
+        run: npx eslint firestore.rules
+
+      - name: Ejecutar pruebas unitarias de dominio y repositorios
+        run: npm run test:unit
+
+      - name: Instalar Firebase CLI (solo para emulador local, sin credenciales ni despliegue)
+        run: npm install --global --no-audit --no-fund firebase-tools
+
+      - name: Ejecutar tests de reglas contra Firestore Emulator (proyecto demo local)
+        env:
+          CI: 'true'
+        run: npm run test:rules

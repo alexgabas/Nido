@@ -116,6 +116,7 @@ export type DurableShoppingCheckoutResult =
       expenseId: string;
       deletedCount: number;
       skippedConcurrentCount: number;
+      alreadyGoneCount: number;
       remainingItemIds: string[];
       reusedExistingExpense: boolean;
       error: unknown;
@@ -126,6 +127,7 @@ export type DurableShoppingCheckoutResult =
       expenseId: string;
       deletedCount: number;
       skippedConcurrentCount: number;
+      alreadyGoneCount: number;
       reusedExistingExpense: boolean;
     };
 
@@ -475,6 +477,7 @@ export async function executeDurableShoppingCheckout(params: {
     let deletedCount = phase1.status === 'committed' ? phase1.deletedIds.length : 0;
     let skippedConcurrentCount =
       phase1.status === 'committed' ? phase1.skippedConcurrentIds.length : 0;
+    let alreadyGoneCount = 0;
     let pendingItemIds = [...phase1.pendingItemIds];
 
     onPhase1Confirmed?.(expenseId, pendingItemIds);
@@ -488,6 +491,7 @@ export async function executeDurableShoppingCheckout(params: {
         const batchRes = await cleanupBatch(input.checkoutId, snapshotsById);
         deletedCount += batchRes.deletedIds.length;
         skippedConcurrentCount += batchRes.skippedConcurrentIds.length;
+        alreadyGoneCount += batchRes.alreadyGoneIds.length;
         pendingItemIds = batchRes.remainingItemIds;
         onBatchProgress?.(pendingItemIds);
         if (batchRes.completed || pendingItemIds.length === 0) {
@@ -500,6 +504,7 @@ export async function executeDurableShoppingCheckout(params: {
           expenseId,
           deletedCount,
           skippedConcurrentCount,
+          alreadyGoneCount,
           remainingItemIds: pendingItemIds,
           reusedExistingExpense,
           error,
@@ -514,6 +519,7 @@ export async function executeDurableShoppingCheckout(params: {
       expenseId,
       deletedCount,
       skippedConcurrentCount,
+      alreadyGoneCount,
       reusedExistingExpense,
     };
   } finally {

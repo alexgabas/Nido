@@ -2938,7 +2938,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     const expenseId = buildCheckoutExpenseId(input.checkoutId);
     const batch1 = ordered.slice(0, MAX_CHECKOUT_BATCH_ITEMS);
-    const remainingIds = ordered.slice(MAX_CHECKOUT_BATCH_ITEMS).map((s) => s.id);
+    const remainingSnapshots = ordered.slice(MAX_CHECKOUT_BATCH_ITEMS);
     const isPrivate = Boolean(input.isPrivate);
     const cleanConcept = clampStr(input.concept || 'Compra supermercado', MAX_LENGTHS.concept) || 'Compra supermercado';
     const cleanNotes = clampStr(input.notes || '', MAX_LENGTHS.notes);
@@ -2952,11 +2952,11 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
     try {
       return await runTransaction(db, async (trx) => {
-        const [closureSnap, txSnap, checkoutSnap, ...batch1Snaps] = await Promise.all([
+        const [closureSnap, txSnap, checkoutSnap, ...allItemSnaps] = await Promise.all([
           trx.get(monthClosureRef),
           trx.get(txRef),
           trx.get(checkoutRef),
-          ...batch1.map((snap) => trx.get(doc(db, 'households', householdId, 'shopping', snap.id))),
+          ...ordered.map((snap) => trx.get(doc(db, 'households', householdId, 'shopping', snap.id))),
         ]);
 
         // Idempotencia duradera: si el gasto ya existe para este checkoutId, NO duplicar.
@@ -2979,11 +2979,12 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
 
         const alreadyGoneIds: string[] = [];
         const deletedIds: string[] = [];
+        const validRemainingIds: string[] = [];
         const skippedConcurrentIds: string[] = [];
 
         for (let i = 0; i < batch1.length; i++) {
           const expected = batch1[i];
-          const liveSnap = batch1Snaps[i];
+          const liveSnap = allItemSnaps[i];
           if (!liveSnap.exists()) {
             alreadyGoneIds.push(expected.id);
             continue;
@@ -2996,7 +2997,25 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           }
         }
 
-        // Protección frente a cierre simultáneo de dos dispositivos sobre los mismos productos.
+        // Verificar también lotes posteriores (≥ 11) dentro de la misma transacción
+        // para detectar solapamientos antes de crear el gasto sin superar ≤ 13 escrituras.
+        for (let i = 0; i < remainingSnapshots.length; i++) {
+          const expected = remainingSnapshots[i];
+          const liveSnap = allItemSnaps[batch1.length + i];
+          if (!liveSnap.exists()) {
+            alreadyGoneIds.push(expected.id);
+            continue;
+          }
+          const liveItem = mapShoppingItem(liveSnap.id, liveSnap.data());
+          if (isShoppingItemUnchangedForCheckout(expected, liveItem)) {
+            validRemainingIds.push(expected.id);
+          } else {
+            skippedConcurrentIds.push(expected.id);
+          }
+        }
+
+        // Protección frente a cierre simultáneo o repetición tras pérdida de red/sesión
+        // tanto en el lote 1 como en lotes posteriores.
         if (alreadyGoneIds.length > 0) {
           return {
             status: 'overlap_conflict',
@@ -3004,7 +3023,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           };
         }
 
-        if (deletedIds.length === 0 && remainingIds.length === 0) {
+        if (deletedIds.length === 0 && validRemainingIds.length === 0) {
           return {
             status: 'all_modified_or_gone',
             skippedConcurrentIds,
@@ -3048,13 +3067,13 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           trx.delete(doc(db, 'households', householdId, 'shopping', itemId));
         }
 
-        if (remainingIds.length > 0) {
+        if (validRemainingIds.length > 0) {
           trx.set(checkoutRef, {
             expenseId,
             monthKey: input.monthKey,
             amount: isPrivate ? 0 : cleanAmount,
             concept: isPrivate ? 'Compra privada' : cleanConcept,
-            pendingItemIds: remainingIds,
+            pendingItemIds: validRemainingIds,
             totalItemCount: ordered.length,
             isPrivate,
             createdBy: actor.uid,
@@ -3068,7 +3087,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           expenseId,
           deletedIds,
           skippedConcurrentIds,
-          pendingItemIds: remainingIds,
+          pendingItemIds: validRemainingIds,
         };
       });
     } catch (error) {

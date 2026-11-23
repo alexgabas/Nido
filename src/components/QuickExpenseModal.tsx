@@ -174,7 +174,13 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       setAmount(prefill?.amount ? prefill.amount.trim().replace('.', ',') : '');
       setConcept(initialConcept);
       setCategory(initialCategory);
-      setPaidBy(prefill?.paidBy || currentUserProfile?.uid || memberA?.uid || COMMON_ACCOUNT_ID);
+      setPaidBy(
+        prefill?.paidBy
+          ? prefill.paidBy === 'comun'
+            ? COMMON_ACCOUNT_ID
+            : prefill.paidBy
+          : COMMON_ACCOUNT_ID
+      );
       setDate(defaultDate);
       setSplitChoice(inferSplitChoice(defaultSplit, viewerIsMemberA, effectiveSplitPctA));
       setSplitPctInput(String(defaultSplit));

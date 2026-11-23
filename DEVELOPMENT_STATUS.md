@@ -6,82 +6,79 @@
 
 - **Aplicación**: **Nido** (finanzas compartidas del hogar, gastos de mudanza, presupuestos, metas de ahorro y lista de la compra compartida). Idioma: español de España (`es-ES`). Moneda: `EUR`.
 - **Arquitectura**: SPA React + TypeScript + Vite + Tailwind + PWA offline-first (`vite-plugin-pwa`) + Firebase Auth / Firestore en plan gratuito Spark (coste cero: sin Cloud Functions, Cloud Billing ni servicios de pago), con paridad funcional en modo demostración local (`DemoHouseholdRepository`).
-- **Estado actual**: Iteración dirigida de fiabilidad completada en los 4 frentes solicitados (idempotencia duradera al finalizar compra, atomicidad y concurrencia en limpieza de productos, endurecimiento y despliegue de `firestore.rules`, y ciclo de vida PWA/offline/chunks obsoletos), con **37/37 pruebas unitarias**, build de producción, **2 suites E2E en Chromium sobre `vite preview`**, ESLint de `firestore.rules` y despliegue real de reglas en Firestore.
+- **Estado actual**: Cierre de verificaciones pendientes y endurecimiento de los casos límite solicitados completado en código y pruebas locales (**39/39 pruebas unitarias**, `tsc --noEmit`, ESLint de `firestore.rules`, build de producción + PWA y **2 suites E2E en Chromium**). Quedan pendientes exclusivamente la ejecución en GitHub Actions / máquina con Java 21+ del workflow de emulador de `firestore.rules` (preparado pero no ejecutado aún) y el checklist manual de 8 pruebas con 2 cuentas y 2 dispositivos (`/MANUAL_ACCEPTANCE_CHECKLIST.md`).
 
 ---
 
-## 2. Completado en la iteración de fiabilidad
+## 2. Código implementado
 
-### 1) Finalizar compra: idempotencia duradera y recuperación
-- **Identidad estable por operación**: cada confirmación genera un `checkoutId` (`chk_<ts>_<rand>`) y deriva un ID de gasto determinista `expenseId = tx_${checkoutId}` (`src/domain/shoppingCheckout.ts`). Dos compras reales distintas con igual fecha, importe y concepto obtienen `checkoutId` distintos y nunca sufren falsos duplicados.
-- **Recuperación duradera local y en servidor**:
-  - Estado local mínimo persistido en `localStorage` bajo clave estrictamente aislada por `(householdId, viewerUid)` (`nido_pending_checkout_v1:${householdId}:${viewerUid}`), limpiado al cerrar sesión o cambiar de modo/hogar.
-  - Estado compartido/privado mínimo en servidor (`households/{hid}/shoppingCheckouts/{checkoutId}`) creado **únicamente** si el carro supera `MAX_CHECKOUT_BATCH_ITEMS = 10` artículos y eliminado atómicamente al terminar el último lote (0 documentos en reposo).
-- **Transacción atómica en Fase 1 (`commitShoppingCheckoutPhase1`)**: en `FirestoreHouseholdRepository` (y paridad en `DemoHouseholdRepository`), una única `runTransaction` (≤ 13 escrituras):
-  - Comprueba si `transactions/tx_${checkoutId}` ya existe → devuelve `already_committed` sin duplicar gasto ni recargar tras respuesta de red perdida o cierre/recarga de la app.
-  - Verifica `monthClosures/{monthKey}` en servidor.
-  - Ordena deterministamente los `snapshots` por `id` y lee el lote 1 (≤ 10 documentos de `shopping`): si algún artículo ya fue borrado por la pareja en un cierre simultáneo, aborta con `overlap_conflict` **sin crear gasto duplicado**.
-  - Compromete atómicamente el gasto, la entrada de actividad (solo si no es privado), la eliminación de los artículos sin modificar del lote 1 y, si quedan artículos, el documento de continuación `shoppingCheckouts/{checkoutId}`.
-- **Honestidad offline y UI de recuperación**: en modo real sin conexión se bloquea el cierre transaccional con aviso honesto (no se simula confirmación de servidor). Tanto en `InicioView` como en `ShoppingListSection` se muestran avisos accionables para comprobar un cierre local incierto o reanudar/descartar limpiezas multi-lote desde cualquier dispositivo sin duplicar el gasto. Cancelar antes de confirmar no genera estado local ni altera la lista.
+### A) Cierre de verificaciones y casos límite de compra (última iteración)
+- **Pagador por defecto = Cuenta común (`COMMON_ACCOUNT_ID`) en nuevos gastos**:
+  - `src/components/QuickExpenseModal.tsx`: al crear un gasto nuevo, `paidBy` se inicializa a `COMMON_ACCOUNT_ID` (salvo `prefill.paidBy` explícito); al editar gastos existentes se respeta el pagador guardado y al marcar **Gasto solo mío (privado)** se fuerza `currentUserProfile.uid`.
+  - `src/components/ShoppingCheckoutPanel.tsx`: `paidBy` inicializado a `COMMON_ACCOUNT_ID` (coherente con `RecurringTemplateModal`, `MudanzaView` y `BankCsvImportModal`).
+- **Recuperación en compras ≤10 artículos tras respuesta perdida + cierre de sesión/cambio de hogar + reentrada**:
+  - Al cerrarse de forma atómica en Fase 1 (`transactions/tx_${checkoutId}` + borrado de `≤10` artículos sin crear `shoppingCheckouts`), cerrar sesión borra `localStorage` (`clearAllLocalPendingCheckouts()`, cero fuga de datos privados). Al reentrar, el estado sincronizado ya muestra el gasto una sola vez y los artículos retirados; incluso si un cliente desactualizado reintenta con un nuevo `checkoutId` sobre las instantáneas antiguas, el servidor aborta con `overlap_conflict` sin duplicar gasto.
+  - `src/components/ShoppingCheckoutPanel.tsx`: mensaje de conflicto actualizado para explicar ambas causas (cierre por la pareja o intento previo confirmado en servidor tras corte de red o cierre de sesión).
+- **Solapamiento en compras >10 artículos exclusivo en lotes posteriores (lote 2+)**:
+  - `src/repositories/FirestoreHouseholdRepository.ts` y `src/repositories/DemoHouseholdRepository.ts`: `commitShoppingCheckoutPhase1` verifica ahora **todos** los artículos seleccionados (`ordered`, lote 1 y lotes posteriores `≥11`) dentro de la misma `runTransaction`, manteniendo el límite de escrituras en Fase 1 (`≤10` borrados, `≤13` escrituras totales). Si cualquier artículo de lote 2+ ya fue retirado, aborta con `overlap_conflict` sin crear gasto; si algún artículo de lote 2+ fue editado/desmarcado concurrentemente, se excluye de `pendingItemIds`.
+  - `src/components/ShoppingCheckoutPanel.tsx`: comprobación previa frente a `pendingShoppingCheckouts` activos en el hogar para bloquear inmediatamente solapamientos sobre lotes pendientes de otro cierre en curso.
+  - `src/domain/shoppingCheckout.ts` y `src/context/NidoContext.tsx`: acumulación explícita de `alreadyGoneCount` en `executeDurableShoppingCheckout` y `resumePendingShoppingCheckout`, mostrando aviso visible si en una carrera simultánea en Fase 1 con lotes 1 disjuntos algún artículo de lote 2+ ya había sido retirado por otro cierre.
+- **Workflow reproducible de emulador de reglas (sin credenciales ni producción)**:
+  - `package.json`: script `test:rules` fijado con `--project demo-nido-rules-test` para ejecución 100 % local sin credenciales ni acceso a producción.
+  - `.github/workflows/firestore-rules.yml`: workflow preparado para GitHub Actions con Node 22 + Java 21 + `firebase-tools` ejecutando `npm run lint`, `npx eslint firestore.rules`, `npm run test:unit` y `npm run test:rules` (solo lectura de código, cero secretos, cero despliegues, coste cero).
+- **Checklist manual acotado (8 pruebas)**:
+  - `MANUAL_ACCEPTANCE_CHECKLIST.md`: 8 recorridos concretos para 2 cuentas y 2 dispositivos (todos marcados como pendientes).
 
-### 2) Limpieza de productos y concurrencia
-- **Cierre de la ventana TOCTOU**: la lectura del estado vivo de cada artículo de `shopping`, su verificación y su borrado se ejecutan ahora dentro de la misma `runTransaction` en servidor (`commitShoppingCheckoutPhase1` y `cleanupShoppingCheckoutBatch`), con lotes acotados a `≤ 10` artículos por transacción (`≤ 15` escrituras totales).
-- **Preservación de cambios de la pareja**:
-  - En el mismo dispositivo: `isShoppingItemUnchangedForCheckout` exige `done === true`, mismo `text`, `qty`, `unit` y `updatedAt`.
-  - Desde un segundo dispositivo sin instantánea local: `isShoppingItemSafeForCrossDeviceCleanup` solo permite eliminar artículos con `done === true` y `updatedAt <= checkout.createdAt`.
-  - Cualquier artículo editado, desmarcado o añadido recientemente por la pareja se conserva intacto.
-- **Reanudación sin recrear gasto**: `cleanupShoppingCheckoutBatch` jamás escribe en `transactions`; reduce `pendingItemIds` de forma estrictamente decreciente o elimina el documento `shoppingCheckouts/{checkoutId}` al finalizar.
-
-### 3) Firestore Rules, consultas reales y despliegue
-- **Causa raíz corregida en reglas (`firestore.rules` y `firebase-blueprint.json`)**:
-  - **Meses cerrados en capa de servidor**: añadida `isMonthClosed(hid, monthKey)` y exigida (`!isMonthClosed(...)`) en `create`, `update` y `delete` de `transactions`, `budgets` y `categoryBudgets`, cerrando el hueco donde el bloqueo existía solo en cliente. También se protegió `importBackup` en ambos repositorios para no sobrescribir meses ya cerrados.
-  - **Subcolección `shoppingCheckouts/{checkoutId}`**: reglas estrictas con validación de ID, existencia enlazada (`exists`/`existsAfter`) de `transactions/tx_${checkoutId}`, privacidad `isPrivate`/`createdBy` (los cierres privados obligan a `amount == 0` y `concept == 'Compra privada'`), inmutabilidad de campos y `pendingItemIds.size() < existing().pendingItemIds.size()` en `update`.
-- **Causa raíz corregida en consultas (`FirestoreHouseholdRepository.ts`)**:
-  - `deleteUnusedCustomCategory` utilizaba consultas compuestas `where` de 2 campos sobre `transactions` (`isPrivate + category` y `createdBy + category`) sin índice compuesto declarado; sustituido por `fetchVisibleTransactionsMap` (dos consultas de un solo campo coherentes con `firestore.rules` y sin índices compuestos extra).
-  - Eliminada una duplicación accidental de `mapPendingShoppingCheckout` y los métodos de checkout en `FirestoreHouseholdRepository.ts` detectada al compilar con Rolldown.
-- **Ampliación de `firestore.rules.test.ts`**: añadidos tests 18 (meses cerrados + reapertura), 19 (`shoppingCheckouts` atómicos, privacidad y progreso decreciente) y 20 (consultas reales de `FirestoreHouseholdRepository`).
-- **Despliegue ejecutado**: `firestore.rules` validado con `npx eslint firestore.rules` (0 errores) y desplegado al proyecto de Firestore mediante `DeployRules`.
-
-### 4) PWA: actualizaciones, chunks obsoletos y offline
-- **Registro único y protección de edición (`src/services/pwaUpdateGuard.ts`, `src/main.tsx`, `src/components/PWAUpdateBanner.tsx`)**:
-  - Eliminado el doble `registerSW` en `main.tsx`; registro único centralizado en `PWAUpdateBanner` con comprobación al volver al foco si hay red.
-  - Bloqueo de recarga durante escrituras activas (`pending_write`) y aviso con doble confirmación explícita (`Seguir editando` / `Recargar igualmente`) cuando hay un formulario modal o inline abierto (`unsaved_form`, incluyendo `CategoryManagerSection`, `QuickExpenseModal`, `ShoppingCheckoutPanel`, etc.). Nunca recarga automáticamente.
-  - Freno anti-bucle en `sessionStorage` (`nido_chunk_reload_guard_v1`, máximo 1 recarga en ventana de 60 s).
-- **Reintento real de chunks tras volver online (corrección de mapa de módulos de Chromium/WebKit)**:
-  - Corregido `vite:preloadError` en `main.tsx` (retirado `event.preventDefault()` que convertía el rechazo en `undefined` y ocultaba el error real de chunk).
-  - En `src/App.tsx` (`getRetryableLazyView`) y `src/services/pdfExportLoader.ts`, cuando una importación dinámica falla offline y el navegador cachea `null` en su mapa de módulos (especificación HTML), el botón **Reintentar** reintenta con una ruta del mismo origen validada `/assets/*.js?nido_retry=N`, permitiendo recuperar vistas y PDF al volver la conexión sin perder el estado ni recargar.
-  - `vite.config.ts`: añadidos `cleanupOutdatedCaches: true`, `navigateFallbackDenylist: [/^\/assets\//, /^\/data\//]`, `cacheableResponse: { statuses: [200] }` y `matchOptions: { ignoreSearch: true }` en `nido-pdf-module-v1` para que el PDF descargado tras reintento quede usable offline incluso tras recargar.
-- **Validación del catálogo Mercadona en caché (`src/services/mercadonaCatalogLoader.ts` y `ShoppingListSection.tsx`)**:
-  - Valida `content-type` y esquema JSON no vacío antes de guardar en `CacheStorage`, expulsa entradas corruptas/HTML en lugar de fallar permanentemente y muestra mensaje honesto en español cuando aún no se ha descargado offline.
+### B) Base de fiabilidad ya implementada anteriormente
+- Idempotencia duradera de `Finalizar compra` (`chk_<ts>_<rand>`, `tx_${checkoutId}`, estado local aislado por `(householdId, viewerUid)` y `shoppingCheckouts/{checkoutId}` solo si `>10` artículos).
+- Limpieza atómica por lotes (`≤10` artículos/transacción) con preservación de ediciones/desmarcados/altas concurrentes de pareja.
+- Endurecimiento de `firestore.rules` (bloqueo de meses cerrados en servidor en `transactions`, `budgets` y `categoryBudgets`; reglas estrictas para `shoppingCheckouts`; consultas sin índices compuestos faltantes) ya desplegado en la iteración anterior.
+- Protección PWA (registro único, bloqueo de recarga durante edición/escritura, reintento real de chunks tras volver online con bypass de caché de módulo fallido, validación de caché de catálogo Mercadona y freno anti-bucle de 60 s).
 
 ---
 
-## 3. Pruebas ejecutadas y estado de verificación
+## 3. Pruebas ejecutadas (verificadas localmente)
 
 | Comprobación | Estado | Evidencia real |
 |---|---|---|
-| Comprobación de tipos (`npm run lint` / `tsc --noEmit`) | **Verificado mediante prueba ejecutada** | 0 errores (incluidos `src/` y `firestore.rules.test.ts`) |
-| Pruebas unitarias (`npm run test:unit`) | **Verificado mediante prueba ejecutada** | **37/37 en verde** (`src/domain/finance.test.ts`, pruebas 26–30 nuevas: idempotencia duradera tras recarga/red perdida, sin falsos duplicados, solapamiento simultáneo de pareja, limpieza multi-lote >10 con fallo intermedio + edición/desmarcado/alta concurrente + reanudación cross-device, aislamiento de estado local, meses cerrados en capa de datos e importación, guardas PWA y anti-bucle) |
+| Comprobación de tipos (`npm run lint` / `tsc --noEmit`) | **Verificado mediante prueba ejecutada** | 0 errores (`src/` y `firestore.rules.test.ts`) |
+| Pruebas unitarias (`npm run test:unit`) | **Verificado mediante prueba ejecutada** | **39/39 en verde** (`src/domain/finance.test.ts`, incluyendo nuevas pruebas **31**: recuperación ≤10 artículos tras respuesta perdida + logout + reentrada sin duplicar gasto, y **32**: solapamiento exclusivo en lote 2+ tanto secuencial como carrera simultánea en Fase 1) |
 | Lint de Security Rules (`npx eslint firestore.rules`) | **Verificado mediante prueba ejecutada** | 0 errores, 0 advertencias |
-| Despliegue de Security Rules (`DeployRules`) | **Verificado mediante prueba ejecutada** | Desplegado sin errores al proyecto configurado |
 | Build de producción + PWA (`npm run build`) | **Verificado mediante prueba ejecutada** | `dist/sw.js` generado (29 entradas precacheadas, PDF y catálogo Mercadona diferidos bajo demanda) |
-| E2E general móvil/escritorio (`node scripts/verify_nido_e2e.mjs`) | **Verificado mediante prueba ejecutada** | `E2E_PASS` (móvil `390×844` y escritorio `1280×800`, 0 errores de consola/página, 0 desbordamiento) |
-| E2E fiabilidad PWA/offline/chunks (`node scripts/verify_pwa_reliability.mjs`) | **Verificado mediante prueba ejecutada** | `PWA_RELIABILITY_PASS` sobre build de producción (`vite preview` con Service Worker real): 8/8 escenarios en verde (arranque online + SW activo, recarga offline, Mercadona no descargado vs descargado offline, vista cacheada vs no disponible + reintento real online, PDF no descargado vs descargado offline tras recarga, formulario sin guardar protegido ante aviso de actualización, chunk 404 + banner + anti-bucle, cancelar checkout sin alterar lista + cierre completo) |
-| Suite de reglas contra emulador (`npm run test:rules`) | **Pendiente de verificar (bloqueado por entorno)** | No existe `java` en este contenedor (`java: not found`), por lo que el emulador local de Firestore no puede arrancarse aquí. Ejecutar en máquina con Java 21+: `npm run test:rules` |
-| Validación en producción con 2 cuentas y 2 dispositivos reales | **Pendiente de verificar** | Requiere prueba manual en el entorno desplegado con las dos cuentas reales de pareja |
+| E2E general móvil/escritorio (`node scripts/verify_nido_e2e.mjs`) | **Verificado mediante prueba ejecutada** | `E2E_PASS` (móvil `390×844` y escritorio `1280×800`, 0 errores) |
+| E2E fiabilidad PWA/offline/chunks (`node scripts/verify_pwa_reliability.mjs`) | **Verificado mediante prueba ejecutada** | `PWA_RELIABILITY_PASS` sobre `vite preview` con Service Worker real (8/8 escenarios en verde) |
 
 ---
 
-## 4. Riesgos conocidos y limitaciones
+## 4. Workflow preparado pero no ejecutado
 
-- **Emulador de Firestore pendiente en entorno con Java 21+**: `firestore.rules` superó ESLint y el despliegue real en Firebase (que compila las reglas en servidor), pero los 20 casos de `firestore.rules.test.ts` deben ejecutarse en local con `npm run test:rules` donde haya Java 21+.
-- **Límite de 100 artículos por cierre de compra**: `MAX_CHECKOUT_PENDING_ITEMS = 100` (procesado en transacciones de `≤ 10` artículos). Si una compra superase 100 líneas simultáneas en el carro, habría que dividirla en dos cierres.
-- **Límite del borrado en `shoppingCheckouts` desde segundo dispositivo**: al reanudar desde otro dispositivo sin instantánea local, se protege cualquier artículo cuya `updatedAt` sea posterior a `checkout.createdAt`; si el reloj de un cliente desincronizado escribiese fechas locales (no ocurre en Firestore porque usa `serverTimestamp()`), el servidor impone su propia marca temporal.
-- **Offline real en Firestore**: Nido no finge que un cierre de compra o escritura offline esté confirmado por el servidor; el cierre de compra exige conexión activa para garantizar atomicidad real y evitar duplicados entre pareja.
+- **Archivo**: `.github/workflows/firestore-rules.yml`
+- **Estado**: **Preparado, pendiente de ejecución en GitHub Actions** (en este contenedor no existe Java, por lo que no se ha ejecutado `npm run test:rules` ni se ha ejecutado el workflow en GitHub; no se afirma que los 20 tests del emulador hayan pasado todavía).
+- **Qué ejecuta**: `npm run lint`, `npx eslint firestore.rules`, `npm run test:unit` y `npm run test:rules` (`firebase emulators:exec --project demo-nido-rules-test --only firestore "npx tsx --test firestore.rules.test.ts"`) usando únicamente el proyecto demo local del emulador, sin secretos, sin acceso a producción y sin despliegues.
+- **Cómo activarlo**:
+  1. Hacer commit y push de `.github/workflows/firestore-rules.yml` y `package.json` a la rama `main` (o `master`) en GitHub, o abrir una Pull Request.
+  2. En el repositorio de GitHub, abrir la pestaña **Actions** (habilitar GitHub Actions si estuviera desactivado).
+  3. Ejecutar automáticamente con el push/PR o manualmente mediante **Verificación de reglas de Firestore → Run workflow** (`workflow_dispatch`).
+  4. Como alternativa local en cualquier equipo con **Java 21+** y `firebase-tools`: ejecutar directamente `npm run test:rules`.
 
 ---
 
-## 5. Siguiente paso exacto
+## 5. Pruebas manuales pendientes
 
-1. En un equipo con **Java 21+** y `firebase-tools`, ejecutar `npm run test:rules` para verificar los 20 tests de `firestore.rules.test.ts` contra el emulador local de Firestore.
-2. Completar el checklist manual de 2 cuentas y 2 dispositivos (cierre simultáneo de compra, corte de red a mitad de limpieza multi-lote, mes cerrado y recarga PWA con formulario abierto).
+- **Archivo**: `MANUAL_ACCEPTANCE_CHECKLIST.md`
+- **Estado**: **Pendiente de ejecución manual por el usuario** con 2 cuentas y 2 dispositivos reales (8 pruebas: sincronización de gasto compartido y pagador por defecto en Cuenta común, privacidad de gasto personal, categoría personalizada y presupuesto, cierre simultáneo de compra, recuperación tras pérdida de conexión, mes cerrado, actualización PWA con formulario abierto, y cerrar sesión y volver a entrar).
+
+---
+
+## 6. Riesgos conocidos y limitaciones
+
+- **Tests de emulador (`firestore.rules.test.ts`) aún no ejecutados**: hasta que el workflow `.github/workflows/firestore-rules.yml` se ejecute en GitHub Actions (o `npm run test:rules` en local con Java 21+), la autorización en emulador sigue pendiente de verificación real (ESLint y el despliegue previo no sustituyen la ejecución de los 20 casos de `firestore.rules.test.ts`).
+- **Carrera simultánea pura en Fase 1 sobre lotes 1 disjuntos con solapamiento en lote 2**: si ambos miembros confirman exactamente a la vez dos compras `>10` artículos cuyos primeros 10 artículos son distintos y solo coinciden en los artículos `11+`, Firestore puede aceptar ambas transacciones Fase 1 (al no modificar los artículos `11+` en Fase 1); ahora la comprobación previa contra `pendingShoppingCheckouts` bloquea la ventana cuando un cierre ya está visible, Fase 1 bloquea cualquier solapamiento en lote 2+ una vez borrado, y Fase 2 acumula y muestra `alreadyGoneCount` avisando explícitamente al segundo miembro para revisar los gastos recientes sin duplicar su propio gasto.
+- **Límite de 100 artículos por cierre de compra**: `MAX_CHECKOUT_PENDING_ITEMS = 100` (procesado en transacciones de `≤ 10` artículos).
+
+---
+
+## 7. Siguiente paso exacto
+
+1. Subir los cambios a GitHub y ejecutar el workflow **Verificación de reglas de Firestore** (`.github/workflows/firestore-rules.yml`) o correr `npm run test:rules` en local con Java 21+ para verificar los 20 casos de `firestore.rules.test.ts`.
+2. Ejecutar las 8 pruebas manuales de `MANUAL_ACCEPTANCE_CHECKLIST.md` con 2 cuentas y 2 dispositivos reales.

@@ -129,6 +129,7 @@ import {
   type HouseholdSettings,
   type InitialCost,
   type NidoBackupV1,
+  type PendingShoppingCheckout,
   type RecurringExpense,
   type SavingsGoal,
   type ShoppingItem,
@@ -4018,6 +4019,388 @@ test('30. Fiabilidad — PWA update guard: bloqueos de edición/escritura, detec
   assert.equal(isLikelyStaleChunkError(new Error('Importing a module script failed.')), true);
   assert.equal(isLikelyStaleChunkError(new Error('Error genérico de validación')), false);
 });
+
+test('31. Fiabilidad — Recuperación ≤10 artículos: servidor confirma, respuesta perdida, cierre de sesión y reentrada sin duplicar gasto', async () => {
+  const mem = new Map<string, string>();
+  const prevStorage = globalThis.localStorage;
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      get length() {
+        return mem.size;
+      },
+      key(index: number) {
+        return Array.from(mem.keys())[index] ?? null;
+      },
+      getItem(k: string) {
+        return mem.get(k) ?? null;
+      },
+      setItem(k: string, v: string) {
+        mem.set(k, v);
+      },
+      removeItem(k: string) {
+        mem.delete(k);
+      },
+      clear() {
+        mem.clear();
+      },
+    },
+  });
+
+  try {
+    const repo = new DemoHouseholdRepository();
+    const hid = 'demo_hogar_santsadurni';
+    const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+    let liveShop: ShoppingItem[] = [];
+    let liveTxs: Transaction[] = [];
+    let livePending: PendingShoppingCheckout[] = [];
+    const uShop = repo.subscribeShopping(hid, (s) => {
+      liveShop = s;
+    });
+    const uTx = repo.subscribeTransactionsByMonth(hid, 'demo_alex', '2026-11', (txs) => {
+      liveTxs = txs;
+    });
+    const uPend = repo.subscribePendingShoppingCheckouts(hid, 'demo_alex', (p) => {
+      livePending = p;
+    });
+
+    // Crear 4 artículos marcados (≤ 10, se liquidan atómicamente en Fase 1 sin documento shoppingCheckouts)
+    const itemIds: string[] = [];
+    for (let i = 1; i <= 4; i++) {
+      const id = await repo.upsertShoppingItem(
+        hid,
+        { text: `Básico cierre ${i}`, qty: 1, unit: 'ud', done: true },
+        actorAlex
+      );
+      itemIds.push(id);
+    }
+    const snapshots = captureShoppingCheckoutSnapshots(
+      liveShop.filter((s) => itemIds.includes(s.id))
+    );
+    assert.equal(snapshots.length, 4);
+
+    const txCountBefore = liveTxs.length;
+    const checkoutId1 = generateShoppingCheckoutId();
+    const inFlight = { current: false };
+
+    // 1) El cliente guarda el estado local antes de enviar y el servidor CONFIRMA la transacción,
+    // pero la respuesta de red se pierde en el camino de vuelta al cliente.
+    const lostResponseRes = await executeDurableShoppingCheckout({
+      input: {
+        checkoutId: checkoutId1,
+        monthKey: '2026-11',
+        concept: 'Compra semanal ≤10',
+        amount: 34.8,
+        date: '2026-11-21',
+        paidBy: COMMON_ACCOUNT_ID,
+        splitPctA: 50,
+        isPrivate: true,
+        notes: 'Privado sensible',
+        snapshots,
+      },
+      inFlightRef: inFlight,
+      onPhase1Persisting: () => {
+        saveLocalPendingCheckout({
+          checkoutId: checkoutId1,
+          expenseId: buildCheckoutExpenseId(checkoutId1),
+          householdId: hid,
+          viewerUid: actorAlex.uid,
+          monthKey: '2026-11',
+          concept: 'Compra semanal ≤10',
+          amount: 34.8,
+          date: '2026-11-21',
+          paidBy: COMMON_ACCOUNT_ID,
+          splitPctA: 50,
+          isPrivate: true,
+          notes: 'Privado sensible',
+          snapshots,
+          state: 'committing',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      },
+      commitPhase1: async (inp) => {
+        const committed = await repo.commitShoppingCheckoutPhase1(hid, inp, actorAlex);
+        assert.equal(committed.status, 'committed');
+        // Simulamos pérdida de respuesta tras confirmar el servidor
+        throw new Error('network-lost-after-server-commit');
+      },
+      cleanupBatch: (id, snapsById) => repo.cleanupShoppingCheckoutBatch(hid, id, snapsById),
+    });
+
+    assert.equal(lostResponseRes.status, 'phase1_failed');
+    // En servidor el gasto YA existe una sola vez, los 4 productos ya están borrados y NO hay shoppingCheckouts pendientes
+    assert.equal(liveTxs.length, txCountBefore + 1);
+    assert.equal(livePending.length, 0);
+    assert.equal(liveShop.filter((s) => itemIds.includes(s.id)).length, 0);
+    // Mientras siga logueado, existe el registro local
+    assert.ok(loadLocalPendingCheckout(hid, actorAlex.uid));
+
+    // 2) El usuario cierra sesión (o cambia de hogar): se limpia todo rastro local de checkout (0 fuga de datos privados)
+    clearAllLocalPendingCheckouts();
+    const remainingPendingKeys = Array.from(mem.keys()).filter((k) =>
+      k.startsWith('nido_pending_checkout_v1:')
+    );
+    assert.equal(remainingPendingKeys.length, 0);
+    assert.equal(loadLocalPendingCheckout(hid, actorAlex.uid), null);
+
+    // 3) Al volver a entrar:
+    // a) La lista sincronizada ya no tiene esos 4 artículos marcados y el gasto aparece una única vez.
+    assert.equal(liveShop.filter((s) => itemIds.includes(s.id)).length, 0);
+    assert.equal(
+      liveTxs.filter((t) => t.id === buildCheckoutExpenseId(checkoutId1)).length,
+      1
+    );
+
+    // b) Incluso si un cliente desactualizado o pestaña en caché reintenta con un NUEVO checkoutId
+    //    sobre las mismas instantáneas, el servidor detecta que ya fueron retirados y aborta con overlap_conflict
+    //    SIN crear ningún gasto duplicado.
+    const retryAfterRelogin = await executeDurableShoppingCheckout({
+      input: {
+        checkoutId: generateShoppingCheckoutId(),
+        monthKey: '2026-11',
+        concept: 'Compra semanal ≤10',
+        amount: 34.8,
+        date: '2026-11-21',
+        paidBy: COMMON_ACCOUNT_ID,
+        splitPctA: 50,
+        isPrivate: true,
+        notes: 'Privado sensible',
+        snapshots,
+      },
+      inFlightRef: { current: false },
+      commitPhase1: (inp) => repo.commitShoppingCheckoutPhase1(hid, inp, actorAlex),
+      cleanupBatch: (id, snapsById) => repo.cleanupShoppingCheckoutBatch(hid, id, snapsById),
+    });
+
+    assert.equal(retryAfterRelogin.status, 'overlap_conflict');
+    if (retryAfterRelogin.status === 'overlap_conflict') {
+      assert.equal(retryAfterRelogin.alreadyGoneIds.length, 4);
+    }
+    // El número total de gastos permanece estrictamente en txCountBefore + 1 (0 duplicados)
+    assert.equal(liveTxs.length, txCountBefore + 1);
+
+    uShop();
+    uTx();
+    uPend();
+  } finally {
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: prevStorage,
+    });
+  }
+});
+
+test('32. Fiabilidad — Cierres >10 artículos con solapamiento exclusivo en lote 2+ (secuencial y carrera simultánea)', async () => {
+  const repo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const actorAlex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+  const actorMarta = { uid: 'demo_marta', displayName: 'Marta', photoURL: '' };
+
+  let liveShop: ShoppingItem[] = [];
+  let liveTxs: Transaction[] = [];
+  let livePending: PendingShoppingCheckout[] = [];
+  const uShop = repo.subscribeShopping(hid, (s) => {
+    liveShop = s;
+  });
+  const uTx = repo.subscribeTransactionsByMonth(hid, 'demo_alex', '2026-11', (txs) => {
+    liveTxs = txs;
+  });
+  const uPend = repo.subscribePendingShoppingCheckouts(hid, 'demo_alex', (p) => {
+    livePending = p;
+  });
+
+  // Helper para crear conjuntos de artículos con IDs deterministas que separen lote 1 (1..10) y lote 2 (z01, z02)
+  const seedDisjointWithBatch2Overlap = async (prefix: string) => {
+    const aIds: string[] = [];
+    const bIds: string[] = [];
+    const sharedIds: string[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const idA = await repo.upsertShoppingItem(
+        hid,
+        { id: `${prefix}_a_${String(i).padStart(2, '0')}`, text: `LoteA ${i}`, qty: 1, unit: 'ud', done: true },
+        actorAlex
+      );
+      aIds.push(idA);
+      const idB = await repo.upsertShoppingItem(
+        hid,
+        { id: `${prefix}_b_${String(i).padStart(2, '0')}`, text: `LoteB ${i}`, qty: 1, unit: 'ud', done: true },
+        actorMarta
+      );
+      bIds.push(idB);
+    }
+    for (let i = 1; i <= 2; i++) {
+      const idZ = await repo.upsertShoppingItem(
+        hid,
+        { id: `${prefix}_z_${String(i).padStart(2, '0')}`, text: `SolapadoLote2 ${i}`, qty: 1, unit: 'ud', done: true },
+        actorAlex
+      );
+      sharedIds.push(idZ);
+    }
+    const snapsA = captureShoppingCheckoutSnapshots(
+      liveShop.filter((s) => aIds.includes(s.id) || sharedIds.includes(s.id))
+    );
+    const snapsB = captureShoppingCheckoutSnapshots(
+      liveShop.filter((s) => bIds.includes(s.id) || sharedIds.includes(s.id))
+    );
+    assert.equal(snapsA.length, 12);
+    assert.equal(snapsB.length, 12);
+    // Comprobar que el lote 1 de A y el lote 1 de B son completamente disjuntos y que sharedIds caen en lote 2 (índices 10 y 11)
+    assert.deepEqual(
+      snapsA.slice(10).map((s) => s.id),
+      sharedIds
+    );
+    assert.deepEqual(
+      snapsB.slice(10).map((s) => s.id),
+      sharedIds
+    );
+    return { aIds, bIds, sharedIds, snapsA, snapsB };
+  };
+
+  // === SUBCASO B1: Alex completa su cierre de 12 artículos (borrando z_01 y z_02 en lote 2).
+  //     Marta inicia Fase 1 con sus 12 artículos (lote 1 100% intacto, solapamiento SOLO en lote 2).
+  //     Fase 1 debe leer también lotes posteriores y abortar con overlap_conflict sin crear gasto para Marta. ===
+  const case1 = await seedDisjointWithBatch2Overlap('seq');
+  const txBeforeB1 = liveTxs.length;
+
+  const alexRes1 = await executeDurableShoppingCheckout({
+    input: {
+      checkoutId: generateShoppingCheckoutId(),
+      monthKey: '2026-11',
+      concept: 'Compra Alex B1',
+      amount: 72,
+      date: '2026-11-21',
+      paidBy: COMMON_ACCOUNT_ID,
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '',
+      snapshots: case1.snapsA,
+    },
+    inFlightRef: { current: false },
+    commitPhase1: (inp) => repo.commitShoppingCheckoutPhase1(hid, inp, actorAlex),
+    cleanupBatch: (id, snapsById) => repo.cleanupShoppingCheckoutBatch(hid, id, snapsById),
+  });
+  assert.equal(alexRes1.status, 'completed');
+  if (alexRes1.status === 'completed') {
+    assert.equal(alexRes1.deletedCount, 12);
+    assert.equal(alexRes1.alreadyGoneCount, 0);
+  }
+  assert.equal(liveTxs.length, txBeforeB1 + 1);
+
+  const martaRes1 = await executeDurableShoppingCheckout({
+    input: {
+      checkoutId: generateShoppingCheckoutId(),
+      monthKey: '2026-11',
+      concept: 'Compra Marta B1',
+      amount: 68,
+      date: '2026-11-21',
+      paidBy: COMMON_ACCOUNT_ID,
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '',
+      snapshots: case1.snapsB,
+    },
+    inFlightRef: { current: false },
+    commitPhase1: (inp) => repo.commitShoppingCheckoutPhase1(hid, inp, actorMarta),
+    cleanupBatch: (id, snapsById) => repo.cleanupShoppingCheckoutBatch(hid, id, snapsById),
+  });
+  assert.equal(martaRes1.status, 'overlap_conflict');
+  if (martaRes1.status === 'overlap_conflict') {
+    assert.deepEqual(martaRes1.alreadyGoneIds, case1.sharedIds);
+  }
+  // Cero gasto duplicado para Marta y los 10 artículos propios de Marta siguen intactos en la lista
+  assert.equal(liveTxs.length, txBeforeB1 + 1);
+  assert.equal(liveShop.filter((s) => case1.bIds.includes(s.id)).length, 10);
+
+  // === SUBCASO B2: Carrera real simultánea en Fase 1 sobre lotes 1 disjuntos que colisionan SOLO en lote 2.
+  //     Tanto Alex como Marta comprometen Fase 1 antes de que ninguno ejecute Fase 2.
+  //     Alex limpia lote 2 primero; al limpiar Marta su lote 2, executeDurableShoppingCheckout
+  //     debe contabilizar alreadyGoneCount === 2, cerrar su shoppingCheckouts y avisar explícitamente. ===
+  const case2 = await seedDisjointWithBatch2Overlap('race');
+  const chkAlex = generateShoppingCheckoutId();
+  const chkMarta = generateShoppingCheckoutId();
+
+  const phase1Alex = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: chkAlex,
+      monthKey: '2026-11',
+      concept: 'Compra Alex B2',
+      amount: 55,
+      date: '2026-11-21',
+      paidBy: COMMON_ACCOUNT_ID,
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '',
+      snapshots: case2.snapsA,
+    },
+    actorAlex
+  );
+  const phase1Marta = await repo.commitShoppingCheckoutPhase1(
+    hid,
+    {
+      checkoutId: chkMarta,
+      monthKey: '2026-11',
+      concept: 'Compra Marta B2',
+      amount: 60,
+      date: '2026-11-21',
+      paidBy: COMMON_ACCOUNT_ID,
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '',
+      snapshots: case2.snapsB,
+    },
+    actorMarta
+  );
+  assert.equal(phase1Alex.status, 'committed');
+  assert.equal(phase1Marta.status, 'committed');
+
+  // Alex ejecuta su lote 2 primero -> retira los 2 artículos solapados limpiamente
+  const alexBatch2 = await repo.cleanupShoppingCheckoutBatch(
+    hid,
+    chkAlex,
+    Object.fromEntries(case2.snapsA.map((s) => [s.id, s]))
+  );
+  assert.equal(alexBatch2.completed, true);
+  assert.deepEqual(alexBatch2.deletedIds, case2.sharedIds);
+  assert.equal(alexBatch2.alreadyGoneIds.length, 0);
+
+  // Marta completa su operación vía executeDurableShoppingCheckout (reutilizando su Fase 1 ya comprometida):
+  // NO duplica su gasto, cierra shoppingCheckouts/chkMarta y reporta alreadyGoneCount === 2
+  const txCountBeforeMartaPhase2 = liveTxs.length;
+  const martaPhase2Res = await executeDurableShoppingCheckout({
+    input: {
+      checkoutId: chkMarta,
+      monthKey: '2026-11',
+      concept: 'Compra Marta B2',
+      amount: 60,
+      date: '2026-11-21',
+      paidBy: COMMON_ACCOUNT_ID,
+      splitPctA: 50,
+      isPrivate: false,
+      notes: '',
+      snapshots: case2.snapsB,
+    },
+    inFlightRef: { current: false },
+    commitPhase1: (inp) => repo.commitShoppingCheckoutPhase1(hid, inp, actorMarta),
+    cleanupBatch: (id, snapsById) => repo.cleanupShoppingCheckoutBatch(hid, id, snapsById),
+  });
+
+  assert.equal(martaPhase2Res.status, 'completed');
+  if (martaPhase2Res.status === 'completed') {
+    assert.equal(martaPhase2Res.reusedExistingExpense, true);
+    assert.equal(martaPhase2Res.deletedCount, 0);
+    assert.equal(martaPhase2Res.alreadyGoneCount, 2);
+  }
+  assert.equal(liveTxs.length, txCountBeforeMartaPhase2);
+  assert.equal(livePending.length, 0);
+
+  uShop();
+  uTx();
+  uPend();
+});
+
 
 
 

@@ -1022,12 +1022,16 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
             result.skippedConcurrentCount > 0
               ? ` · ${result.skippedConcurrentCount} conservados por cambios recientes`
               : '';
+          const alreadyGoneSuffix =
+            result.alreadyGoneCount > 0
+              ? ` · Aviso: ${result.alreadyGoneCount} ya habían sido retirados en otro cierre (revisa los gastos recientes)`
+              : '';
           showToast(
             result.reusedExistingExpense
               ? `Compra ya confirmada en el servidor (sin duplicar gasto)${
                   result.deletedCount > 0 ? ` · ${result.deletedCount} retirados` : ''
-                }${concurrentSuffix}`
-              : `Compra completada y ${result.deletedCount} productos retirados${concurrentSuffix}`
+                }${concurrentSuffix}${alreadyGoneSuffix}`
+              : `Compra completada y ${result.deletedCount} productos retirados${concurrentSuffix}${alreadyGoneSuffix}`
           );
           return;
         }
@@ -1039,21 +1043,27 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
             let remaining = [...targetServer.pendingItemIds];
             let deletedCount = 0;
             let skippedCount = 0;
+            let alreadyGoneCount = 0;
             let guard = 0;
             while (remaining.length > 0 && guard < 15) {
               guard += 1;
               const batch = await repo.cleanupShoppingCheckoutBatch(householdId, targetServer.id);
               deletedCount += batch.deletedIds.length;
               skippedCount += batch.skippedConcurrentIds.length;
+              alreadyGoneCount += batch.alreadyGoneIds.length;
               remaining = batch.remainingItemIds;
               if (batch.completed) break;
             }
             const skippedSuffix =
               skippedCount > 0 ? ` · ${skippedCount} conservados por cambios recientes` : '';
+            const alreadyGoneSuffix =
+              alreadyGoneCount > 0
+                ? ` · Aviso: ${alreadyGoneCount} ya habían sido retirados en otro cierre (revisa los gastos recientes)`
+                : '';
             showToast(
               `Limpieza completada (${deletedCount} ${
                 deletedCount === 1 ? 'producto retirado' : 'productos retirados'
-              })${skippedSuffix}`
+              })${skippedSuffix}${alreadyGoneSuffix}`
             );
           } finally {
             resumeCheckoutInFlightRef.current = false;
