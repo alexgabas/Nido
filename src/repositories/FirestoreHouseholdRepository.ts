@@ -28,12 +28,21 @@ import {
 } from '../domain/finance';
 import { isValidHexColor, sanitizeCategoryColors } from '../domain/categoryPalette';
 import {
+  isValidLocalDateISO,
+  sanitizeCommonAccountManualBalance,
+  sanitizePlannedCommonCategories,
+} from '../domain/monthlyPlanning';
+import {
   buildCategoryBudgetDocId,
   canSafelyDeleteCustomCategory,
+  CATEGORY_SELECTOR_PREFS_VERSION,
   generateCustomCategoryId,
   isCustomCategoryId,
   isSystemExpenseCategory,
   isValidCategoryIcon,
+  isValidSelectorCategoryId,
+  MAX_VISIBLE_SELECTOR_CATEGORIES,
+  resolveInitialVisibleCategoriesPlan,
 } from '../domain/categories';
 import {
   buildShoppingCatalogId,
@@ -42,10 +51,17 @@ import {
   normalizeShoppingUnit,
 } from '../domain/shoppingCatalog';
 import {
+  generateShoppingTemplateId,
+  sanitizeShoppingTemplateItems,
+  type ApplyShoppingTemplatePlan,
+} from '../domain/shoppingTemplates';
+import {
   buildDeterministicRecurringTxId,
   isRecurringDueInMonth,
   isValidMonthKey,
+  sanitizeSkippedMonths,
 } from '../domain/recurrence';
+import { sanitizeSavingsPlanAllocations } from '../domain/savingsPlan';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -89,16 +105,22 @@ import {
   type HouseholdMember,
   type HouseholdSettings,
   type InitialCost,
+  type MemberCategoryPreferences,
   type MonthClosure,
   type MonthlyBudget,
+  type MonthlySavingsPlan,
   type NidoBackupV1,
   type PendingShoppingCheckout,
   type RecurringExpense,
   type SavingsGoal,
+  type SavingsPlanAllocation,
   type ShoppingCatalogItem,
   type ShoppingItem,
+  type ShoppingListTemplate,
   type ShoppingSection,
+  type ShoppingSectionOverride,
   type ShoppingSourceType,
+  type ShoppingTemplateItem,
   type Transaction,
   type UiMode,
 } from '../types/nido';
@@ -188,6 +210,15 @@ function mapHousehold(id: string, d: DocumentData): Household {
   const { presetA, presetB } = normalizeSplitPair(d.settings?.presetA);
   const csvKeywords = sanitizeCsvKeywords(d.csvKeywords);
   const categoryColors = sanitizeCategoryColors(d.categoryColors);
+  const commonAccountPlannedCategories = Array.isArray(d.commonAccountPlannedCategories)
+    ? sanitizePlannedCommonCategories(d.commonAccountPlannedCategories)
+    : undefined;
+  const commonAccountManualBalance =
+    d.commonAccountManualBalance === null
+      ? null
+      : d.commonAccountManualBalance !== undefined
+        ? sanitizeCommonAccountManualBalance(d.commonAccountManualBalance)
+        : undefined;
   return {
     id,
     name: String(d.name ?? 'Mi hogar'),
@@ -203,6 +234,19 @@ function mapHousehold(id: string, d: DocumentData): Household {
     },
     ...(csvKeywords ? { csvKeywords } : {}),
     ...(categoryColors ? { categoryColors } : {}),
+    ...(commonAccountPlannedCategories !== undefined ? { commonAccountPlannedCategories } : {}),
+    ...(commonAccountManualBalance !== undefined ? { commonAccountManualBalance } : {}),
+    ...(typeof d.mudanzaCompleted === 'boolean' ? { mudanzaCompleted: d.mudanzaCompleted } : {}),
+    ...(typeof d.mudanzaCompletedAt === 'string'
+      ? { mudanzaCompletedAt: d.mudanzaCompletedAt }
+      : d.mudanzaCompletedAt === null
+        ? { mudanzaCompletedAt: null }
+        : {}),
+    ...(typeof d.mudanzaCompletedBy === 'string'
+      ? { mudanzaCompletedBy: d.mudanzaCompletedBy }
+      : d.mudanzaCompletedBy === null
+        ? { mudanzaCompletedBy: null }
+        : {}),
     ...(typeof d.seedPending === 'boolean' ? { seedPending: d.seedPending } : {}),
     ...(typeof d.recurringSeedVersion === 'number'
       ? { recurringSeedVersion: d.recurringSeedVersion }
@@ -273,6 +317,7 @@ function mapFurniture(id: string, d: DocumentData): FurnitureItem {
 
 function mapRecurring(id: string, d: DocumentData): RecurringExpense {
   const startMonth = isValidMonthKey(d.startMonth) ? d.startMonth : undefined;
+  const skippedMonths = sanitizeSkippedMonths(d.skippedMonths);
   return {
     id,
     concept: String(d.concept ?? ''),
@@ -281,6 +326,7 @@ function mapRecurring(id: string, d: DocumentData): RecurringExpense {
     frequency: d.frequency ?? 'mensual',
     dayOfMonth: Number(d.dayOfMonth ?? 1),
     ...(startMonth ? { startMonth } : {}),
+    ...(skippedMonths.length > 0 ? { skippedMonths } : {}),
     splitOverride:
       d.splitOverride === null || d.splitOverride === undefined
         ? null
@@ -337,6 +383,18 @@ function mapGoalMovement(id: string, d: DocumentData): GoalMovement {
     date: String(d.date ?? ''),
     note: String(d.note ?? ''),
     createdAt: tsToIso(d.createdAt),
+  };
+}
+
+function mapSavingsPlan(id: string, d: DocumentData): MonthlySavingsPlan {
+  const monthKey = isValidMonthKey(String(d.monthKey ?? id)) ? String(d.monthKey ?? id) : id;
+  const rawAllocs = Array.isArray(d.allocations) ? (d.allocations as SavingsPlanAllocation[]) : [];
+  return {
+    monthKey,
+    targetAmount: roundCents(Math.max(0, Number(d.targetAmount ?? 0))),
+    allocations: sanitizeSavingsPlanAllocations(rawAllocs),
+    updatedBy: String(d.updatedBy ?? ''),
+    updatedAt: tsToIso(d.updatedAt),
   };
 }
 
@@ -413,6 +471,42 @@ function mapCategoryBudget(id: string, d: DocumentData): CategoryBudgetLimit {
     monthKey: String(d.monthKey ?? ''),
     categoryId: String(d.categoryId ?? ''),
     limit: Math.max(0, Number(d.limit ?? 0) || 0),
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapMemberCategoryPreferences(uid: string, d: DocumentData): MemberCategoryPreferences {
+  const rawList = Array.isArray(d.visibleCategoryIds) ? d.visibleCategoryIds : [];
+  const visibleCategoryIds = rawList
+    .filter((id): id is string => typeof id === 'string' && isValidSelectorCategoryId(id))
+    .slice(0, MAX_VISIBLE_SELECTOR_CATEGORIES);
+  return {
+    uid,
+    selectorVersion: Math.max(0, Math.round(Number(d.selectorVersion ?? 0) || 0)),
+    visibleCategoryIds,
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapShoppingListTemplate(id: string, d: DocumentData): ShoppingListTemplate {
+  const rawItems = Array.isArray(d.items) ? (d.items as ShoppingTemplateItem[]) : [];
+  return {
+    id,
+    name: String(d.name ?? ''),
+    items: sanitizeShoppingTemplateItems(rawItems),
+    createdBy: String(d.createdBy ?? ''),
+    createdAt: tsToIso(d.createdAt),
+    updatedAt: tsToIso(d.updatedAt),
+  };
+}
+
+function mapShoppingSectionOverride(id: string, d: DocumentData): ShoppingSectionOverride {
+  const section = normalizeShoppingSection(typeof d.section === 'string' ? d.section : undefined) ?? 'Sin clasificar';
+  return {
+    id,
+    productKey: String(d.productKey ?? id),
+    section,
+    updatedBy: String(d.updatedBy ?? ''),
     updatedAt: tsToIso(d.updatedAt),
   };
 }
@@ -1389,6 +1483,30 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeSavingsPlans(
+    householdId: string,
+    onData: (plans: MonthlySavingsPlan[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/savingsPlans`;
+    return onSnapshot(
+      collection(db, 'households', householdId, 'savingsPlans'),
+      (snap) =>
+        onData(
+          snap.docs
+            .map((d) => mapSavingsPlan(d.id, d.data()))
+            .sort((a, b) => b.monthKey.localeCompare(a.monthKey))
+        ),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
   subscribeShopping(
     householdId: string,
     onData: (items: ShoppingItem[]) => void,
@@ -1468,6 +1586,71 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeMemberCategoryPreferences(
+    householdId: string,
+    uid: string,
+    onData: (prefs: MemberCategoryPreferences | null) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/memberPreferences/${uid}`;
+    return onSnapshot(
+      doc(db, 'households', householdId, 'memberPreferences', uid),
+      (snap) => {
+        onData(snap.exists() ? mapMemberCategoryPreferences(uid, snap.data()) : null);
+      },
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.GET, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
+  subscribeShoppingTemplates(
+    householdId: string,
+    onData: (items: ShoppingListTemplate[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/shoppingTemplates`;
+    return onSnapshot(
+      collection(db, 'households', householdId, 'shoppingTemplates'),
+      (snap) =>
+        onData(
+          snap.docs
+            .map((d) => mapShoppingListTemplate(d.id, d.data()))
+            .sort((a, b) => a.name.localeCompare(b.name, 'es'))
+        ),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
+  subscribeShoppingSectionOverrides(
+    householdId: string,
+    onData: (items: ShoppingSectionOverride[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe {
+    const path = `households/${householdId}/shoppingSectionOverrides`;
+    return onSnapshot(
+      collection(db, 'households', householdId, 'shoppingSectionOverrides'),
+      (snap) => onData(snap.docs.map((d) => mapShoppingSectionOverride(d.id, d.data()))),
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, path);
+        } catch (wrapped) {
+          onError(wrapped as Error);
+        }
+      }
+    );
+  }
+
   subscribeCategoryBudgets(
     householdId: string,
     monthKey: string,
@@ -1528,6 +1711,50 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       return { systemBudget, categoryBudgets };
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `${budgetPath} | ${customPath}`);
+    }
+  }
+
+  async fetchAnnualBalanceData(
+    householdId: string
+  ): Promise<{
+    sharedTransactions: Transaction[];
+    systemBudgets: MonthlyBudget[];
+    categoryBudgets: CategoryBudgetLimit[];
+  }> {
+    const txPath = `households/${householdId}/transactions`;
+    const budPath = `households/${householdId}/budgets`;
+    const catBudPath = `households/${householdId}/categoryBudgets`;
+    try {
+      const [sharedTxSnap, budSnap, catBudSnap] = await Promise.all([
+        getDocs(
+          query(
+            collection(db, 'households', householdId, 'transactions'),
+            where('isPrivate', '==', false)
+          )
+        ),
+        getDocs(collection(db, 'households', householdId, 'budgets')),
+        getDocs(collection(db, 'households', householdId, 'categoryBudgets')),
+      ]);
+
+      const sharedTransactions = sharedTxSnap.docs
+        .map((d) => mapTransaction(d.id, d.data()))
+        .filter((t) => !t.isPrivate)
+        .sort((a, b) => b.date.localeCompare(a.date));
+
+      const systemBudgets: MonthlyBudget[] = budSnap.docs.map((d) => {
+        const data = d.data();
+        return {
+          monthKey: String(data.monthKey ?? d.id),
+          limits: (data.limits ?? {}) as MonthlyBudget['limits'],
+          updatedAt: tsToIso(data.updatedAt),
+        };
+      });
+
+      const categoryBudgets = catBudSnap.docs.map((d) => mapCategoryBudget(d.id, d.data()));
+
+      return { sharedTransactions, systemBudgets, categoryBudgets };
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, `${txPath} | ${budPath} | ${catBudPath}`);
     }
   }
 
@@ -1607,6 +1834,79 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async updateCommonAccountPlannedCategories(
+    householdId: string,
+    categoryIds: string[]
+  ): Promise<void> {
+    const path = `households/${householdId}`;
+    const clean = sanitizePlannedCommonCategories(categoryIds);
+    try {
+      await updateDoc(doc(db, 'households', householdId), {
+        commonAccountPlannedCategories: clean,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
+  async updateCommonAccountManualBalance(
+    householdId: string,
+    balance: { amount: number; referenceDate: string } | null,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const path = `households/${householdId}`;
+    const payload =
+      balance === null
+        ? null
+        : {
+            amount: roundCents(Math.max(0, Number(balance.amount) || 0)),
+            referenceDate: isValidLocalDateISO(balance.referenceDate)
+              ? balance.referenceDate
+              : getTodayLocalISO(),
+            updatedBy: actor.uid,
+            updatedAt: new Date().toISOString(),
+          };
+    try {
+      await updateDoc(doc(db, 'households', householdId), {
+        commonAccountManualBalance: payload,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
+  async setMudanzaCompleted(
+    householdId: string,
+    completed: boolean,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const path = `households/${householdId}`;
+    const now = new Date().toISOString();
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, 'households', householdId), {
+        mudanzaCompleted: completed,
+        mudanzaCompletedAt: completed ? now : null,
+        mudanzaCompletedBy: completed ? actor.uid : null,
+        updatedAt: serverTimestamp(),
+      });
+      this.addActivityToBatch(
+        batch,
+        householdId,
+        actor,
+        'update',
+        'hogar',
+        householdId,
+        completed ? 'Dio por terminada la etapa de mudanza' : 'Reabrió la etapa de mudanza'
+      );
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
   async updateMemberUiMode(householdId: string, uid: string, uiMode: UiMode): Promise<void> {
     const path = `households/${householdId}/members/${uid}`;
     try {
@@ -1659,19 +1959,171 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     };
 
     try {
-      const batch = writeBatch(db);
       const ref = doc(db, 'households', householdId, 'categories', id);
-      if (cat.id) {
-        batch.update(ref, payload);
-        this.addActivityToBatch(batch, householdId, actor, 'update', 'categoria', id, `Editó categoría "${cleanName}"`);
-      } else {
-        batch.set(ref, { ...payload, createdAt: serverTimestamp() });
-        this.addActivityToBatch(batch, householdId, actor, 'create', 'categoria', id, `Creó categoría "${cleanName}"`);
-      }
-      await batch.commit();
+      await runTransaction(db, async (trx) => {
+        const existingSnap = await trx.get(ref);
+        const actRef = doc(collection(db, 'households', householdId, 'activity'));
+        if (existingSnap.exists()) {
+          trx.update(ref, payload);
+          trx.set(actRef, {
+            uid: actor.uid,
+            actorName: clampStr(actor.displayName || 'Usuario', MAX_LENGTHS.displayName) || 'Usuario',
+            action: 'update',
+            entity: 'categoria',
+            entityId: clampStr(id, 128),
+            summary: clampStr(`Editó categoría "${cleanName}"`, MAX_LENGTHS.activitySummary),
+            timestamp: serverTimestamp(),
+          });
+        } else {
+          trx.set(ref, { ...payload, createdAt: serverTimestamp() });
+          trx.set(actRef, {
+            uid: actor.uid,
+            actorName: clampStr(actor.displayName || 'Usuario', MAX_LENGTHS.displayName) || 'Usuario',
+            action: 'create',
+            entity: 'categoria',
+            entityId: clampStr(id, 128),
+            summary: clampStr(`Creó categoría "${cleanName}"`, MAX_LENGTHS.activitySummary),
+            timestamp: serverTimestamp(),
+          });
+        }
+      });
       return id;
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async saveMemberCategoryPreferences(
+    householdId: string,
+    uid: string,
+    prefs: { selectorVersion: number; visibleCategoryIds: string[] }
+  ): Promise<void> {
+    const path = `households/${householdId}/memberPreferences/${uid}`;
+    const deduped: string[] = [];
+    const seen = new Set<string>();
+    for (const rawId of prefs.visibleCategoryIds) {
+      if (deduped.length >= MAX_VISIBLE_SELECTOR_CATEGORIES) break;
+      if (typeof rawId === 'string' && isValidSelectorCategoryId(rawId) && !seen.has(rawId)) {
+        seen.add(rawId);
+        deduped.push(rawId);
+      }
+    }
+    const version = Math.max(1, Math.round(Number(prefs.selectorVersion) || CATEGORY_SELECTOR_PREFS_VERSION));
+    try {
+      await setDoc(doc(db, 'households', householdId, 'memberPreferences', uid), {
+        selectorVersion: version,
+        visibleCategoryIds: deduped,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async ensureInitialVisibleCategoriesSetup(
+    householdId: string,
+    uid: string,
+    actor: UserProfileInput
+  ): Promise<MemberCategoryPreferences> {
+    const prefRef = doc(db, 'households', householdId, 'memberPreferences', uid);
+    const prefPath = `households/${householdId}/memberPreferences/${uid}`;
+
+    try {
+      const existingPrefSnap = await getDoc(prefRef);
+      if (existingPrefSnap.exists()) {
+        const mapped = mapMemberCategoryPreferences(uid, existingPrefSnap.data());
+        if (mapped.selectorVersion >= CATEGORY_SELECTOR_PREFS_VERSION) {
+          return mapped;
+        }
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, prefPath);
+    }
+
+    let currentCustom: CustomCategory[] = [];
+    try {
+      const catSnap = await getDocs(collection(db, 'households', householdId, 'categories'));
+      currentCustom = catSnap.docs.map((d) => mapCustomCategory(d.id, d.data()));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, `households/${householdId}/categories`);
+    }
+
+    const plan = resolveInitialVisibleCategoriesPlan(currentCustom);
+
+    if (plan.missingSuggestionsToCreate.length > 0) {
+      const ops = plan.missingSuggestionsToCreate.map(({ id, suggestion, order }) => {
+        const ref = doc(db, 'households', householdId, 'categories', id);
+        return {
+          path: `households/${householdId}/categories/${id}`,
+          apply: (batch: ReturnType<typeof writeBatch>) =>
+            batch.set(ref, {
+              name: clampStr(suggestion.name, MAX_LENGTHS.categoryName),
+              color: isValidHexColor(suggestion.color) ? suggestion.color.toUpperCase() : '#0F766E',
+              icon: isValidCategoryIcon(suggestion.icon) ? suggestion.icon : 'tag',
+              order: Math.max(0, Math.min(999, Math.round(order))),
+              archived: false,
+              csvKeywords: clampStr(suggestion.csvKeywords || '', MAX_LENGTHS.csvKeywordString),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            }),
+        };
+      });
+
+      try {
+        await this.commitBatchOps(
+          ops,
+          OperationType.CREATE,
+          `households/${householdId}/categories`,
+          'No se pudieron inicializar las categorías iniciales.'
+        );
+      } catch {
+        // Si el otro miembro creó alguna simultáneamente, creamos solo las realmente faltantes de forma idempotente.
+        for (const { id, suggestion, order } of plan.missingSuggestionsToCreate) {
+          const ref = doc(db, 'households', householdId, 'categories', id);
+          const snap = await getDoc(ref);
+          if (!snap.exists()) {
+            await this.upsertCustomCategory(
+              householdId,
+              {
+                id,
+                name: suggestion.name,
+                color: suggestion.color,
+                icon: suggestion.icon,
+                order,
+                archived: false,
+                csvKeywords: suggestion.csvKeywords,
+              },
+              actor
+            );
+          }
+        }
+      }
+    }
+
+    try {
+      const finalPrefs = await runTransaction(db, async (trx) => {
+        const snap = await trx.get(prefRef);
+        if (snap.exists()) {
+          const mapped = mapMemberCategoryPreferences(uid, snap.data());
+          if (mapped.selectorVersion >= CATEGORY_SELECTOR_PREFS_VERSION) {
+            return mapped;
+          }
+        }
+        trx.set(prefRef, {
+          selectorVersion: CATEGORY_SELECTOR_PREFS_VERSION,
+          visibleCategoryIds: plan.orderedVisibleIds,
+          updatedAt: serverTimestamp(),
+        });
+        return {
+          uid,
+          selectorVersion: CATEGORY_SELECTOR_PREFS_VERSION,
+          visibleCategoryIds: plan.orderedVisibleIds,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      return finalPrefs;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, prefPath);
     }
   }
 
@@ -2078,7 +2530,12 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         batch.update(ref, payload);
         this.addActivityToBatch(batch, householdId, actor, 'update', 'recurrente', id, `Editó plantilla "${concept}"`);
       } else {
-        batch.set(ref, { ...payload, createdAt: serverTimestamp() });
+        const initialSkipped = sanitizeSkippedMonths(rec.skippedMonths);
+        batch.set(ref, {
+          ...payload,
+          ...(initialSkipped.length > 0 ? { skippedMonths: initialSkipped } : {}),
+          createdAt: serverTimestamp(),
+        });
         this.addActivityToBatch(batch, householdId, actor, 'create', 'recurrente', id, `Creó plantilla "${concept}"`);
       }
       await batch.commit();
@@ -2174,6 +2631,81 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       await batch.commit();
     } catch (error) {
       handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
+  async setRecurringMonthSkipped(
+    householdId: string,
+    recurringId: string,
+    monthKey: string,
+    skipped: boolean,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (!isValidMonthKey(monthKey)) {
+      throw new Error('Mes no válido para registrar la omisión.');
+    }
+    const path = `households/${householdId}/recurring/${recurringId}`;
+    const recRef = doc(db, 'households', householdId, 'recurring', recurringId);
+    const closureRef = doc(db, 'households', householdId, 'monthClosures', monthKey);
+
+    let conceptForLog = '';
+    let changed = false;
+    try {
+      await runTransaction(db, async (trx) => {
+        const [closureSnap, recSnap] = await Promise.all([trx.get(closureRef), trx.get(recRef)]);
+        if (closureSnap.exists()) {
+          throw new Error(
+            `El mes ${monthKey} está cerrado. Desbloquéalo antes de cambiar las omisiones.`
+          );
+        }
+        if (!recSnap.exists()) {
+          throw new Error('No se encontró la plantilla recurrente.');
+        }
+        const data = recSnap.data();
+        conceptForLog = clampStr(String(data.concept ?? ''), MAX_LENGTHS.concept);
+        const currentList = sanitizeSkippedMonths(data.skippedMonths);
+        const nextList = skipped
+          ? sanitizeSkippedMonths([...currentList, monthKey])
+          : currentList.filter((m) => m !== monthKey);
+
+        if (currentList.join(',') === nextList.join(',')) {
+          changed = false;
+          return;
+        }
+        changed = true;
+        trx.update(recRef, {
+          skippedMonths: nextList,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message.includes('está cerrado') || error.message.includes('No se encontró la plantilla'))
+      ) {
+        throw error;
+      }
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+
+    if (changed) {
+      try {
+        const actBatch = writeBatch(db);
+        this.addActivityToBatch(
+          actBatch,
+          householdId,
+          actor,
+          'update',
+          'recurrente',
+          recurringId,
+          skipped
+            ? `Marcó "${conceptForLog || recurringId}" como no producido en ${monthKey}`
+            : `Deshizo la omisión de "${conceptForLog || recurringId}" en ${monthKey}`
+        );
+        await actBatch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `households/${householdId}/activity`);
+      }
     }
   }
 
@@ -2826,6 +3358,71 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async saveSavingsPlan(
+    householdId: string,
+    plan: {
+      monthKey: string;
+      targetAmount: number;
+      allocations: SavingsPlanAllocation[];
+    },
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (!isValidMonthKey(plan.monthKey)) {
+      throw new Error('Mes inválido para el plan de ahorro.');
+    }
+    const path = `households/${householdId}/savingsPlans/${plan.monthKey}`;
+    const cleanTarget = roundCents(Math.max(0, Number(plan.targetAmount) || 0));
+    const cleanAllocations = sanitizeSavingsPlanAllocations(plan.allocations);
+    const ref = doc(db, 'households', householdId, 'savingsPlans', plan.monthKey);
+    try {
+      const batch = writeBatch(db);
+      batch.set(ref, {
+        monthKey: plan.monthKey,
+        targetAmount: cleanTarget,
+        allocations: cleanAllocations,
+        updatedBy: actor.uid,
+        updatedAt: serverTimestamp(),
+      });
+      this.addActivityToBatch(
+        batch,
+        householdId,
+        actor,
+        'update',
+        'plan_ahorro',
+        plan.monthKey,
+        `Guardó plan de ahorro de ${plan.monthKey} (${cleanTarget} €)`
+      );
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async deleteSavingsPlan(
+    householdId: string,
+    monthKey: string,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (!isValidMonthKey(monthKey)) return;
+    const path = `households/${householdId}/savingsPlans/${monthKey}`;
+    try {
+      const batch = writeBatch(db);
+      batch.delete(doc(db, 'households', householdId, 'savingsPlans', monthKey));
+      this.addActivityToBatch(
+        batch,
+        householdId,
+        actor,
+        'delete',
+        'plan_ahorro',
+        monthKey,
+        `Eliminó plan de ahorro de ${monthKey}`
+      );
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
   async upsertShoppingItem(
     householdId: string,
     item: {
@@ -3289,6 +3886,164 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
   }
 
+  async upsertShoppingTemplate(
+    householdId: string,
+    tpl: { id?: string; name: string; items: ShoppingTemplateItem[] },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const cleanName = clampStr(tpl.name, MAX_LENGTHS.shoppingTemplateName);
+    if (!cleanName) {
+      throw new Error('Escribe un nombre para la lista reutilizable.');
+    }
+    const cleanItems = sanitizeShoppingTemplateItems(tpl.items);
+    const id = tpl.id?.trim() || generateShoppingTemplateId();
+    const ref = doc(db, 'households', householdId, 'shoppingTemplates', id);
+    const path = `households/${householdId}/shoppingTemplates/${id}`;
+
+    try {
+      await runTransaction(db, async (trx) => {
+        const snap = await trx.get(ref);
+        if (snap.exists()) {
+          trx.update(ref, {
+            name: cleanName,
+            items: cleanItems,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          trx.set(ref, {
+            name: cleanName,
+            items: cleanItems,
+            createdBy: actor.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+      return id;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async deleteShoppingTemplate(householdId: string, id: string): Promise<void> {
+    const path = `households/${householdId}/shoppingTemplates/${id}`;
+    try {
+      await deleteDoc(doc(db, 'households', householdId, 'shoppingTemplates', id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
+  async applyShoppingTemplate(
+    householdId: string,
+    plan: ApplyShoppingTemplatePlan,
+    actor: UserProfileInput
+  ): Promise<{ createdCount: number; updatedCount: number }> {
+    const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
+
+    for (const upd of plan.toUpdate) {
+      const ref = doc(db, 'households', householdId, 'shopping', upd.id);
+      const cleanUnit = normalizeShoppingUnit(upd.unit);
+      const optMeta: Record<string, unknown> = {
+        ...(upd.catalogId ? { catalogId: clampStr(upd.catalogId, MAX_LENGTHS.shoppingCatalogId) } : {}),
+        ...(upd.brand ? { brand: clampStr(upd.brand, MAX_LENGTHS.shoppingBrand) } : {}),
+        ...(upd.format ? { format: clampStr(upd.format, MAX_LENGTHS.shoppingFormat) } : {}),
+        ...(upd.section ? { section: upd.section } : {}),
+        ...(upd.sourceType ? { sourceType: upd.sourceType } : {}),
+      };
+      ops.push({
+        path: `households/${householdId}/shopping/${upd.id}`,
+        apply: (batch) =>
+          batch.update(ref, {
+            text: clampStr(upd.text, MAX_LENGTHS.shoppingText) || 'Producto',
+            qty: roundCents(Math.max(0.01, Math.min(999, Number(upd.qty) || 1))),
+            unit: cleanUnit,
+            done: false,
+            ...optMeta,
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    }
+
+    for (const item of plan.toCreate) {
+      const ref = doc(collection(db, 'households', householdId, 'shopping'));
+      const cleanUnit = normalizeShoppingUnit(item.unit);
+      const optMeta: Record<string, unknown> = {
+        ...(item.catalogId ? { catalogId: clampStr(item.catalogId, MAX_LENGTHS.shoppingCatalogId) } : {}),
+        ...(item.brand ? { brand: clampStr(item.brand, MAX_LENGTHS.shoppingBrand) } : {}),
+        ...(item.format ? { format: clampStr(item.format, MAX_LENGTHS.shoppingFormat) } : {}),
+        ...(item.section ? { section: item.section } : {}),
+        ...(item.sourceType ? { sourceType: item.sourceType } : {}),
+      };
+      ops.push({
+        path: `households/${householdId}/shopping/${ref.id}`,
+        apply: (batch) =>
+          batch.set(ref, {
+            text: clampStr(item.text, MAX_LENGTHS.shoppingText) || 'Producto',
+            qty: roundCents(Math.max(0.01, Math.min(999, Number(item.qty) || 1))),
+            unit: cleanUnit,
+            done: false,
+            ...optMeta,
+            addedBy: actor.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+      });
+    }
+
+    if (ops.length > 0) {
+      await this.commitBatchOps(
+        ops,
+        OperationType.WRITE,
+        `households/${householdId}/shopping`,
+        'No se pudo aplicar la lista reutilizable a la lista de la compra.'
+      );
+    }
+
+    return {
+      createdCount: plan.toCreate.length,
+      updatedCount: plan.toUpdate.length,
+    };
+  }
+
+  async setShoppingSectionOverride(
+    householdId: string,
+    productKey: string,
+    section: ShoppingSection,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const cleanKey = productKey.trim().slice(0, MAX_LENGTHS.shoppingOverrideKey);
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(cleanKey)) {
+      throw new Error('Identificador de producto inválido para guardar la sección.');
+    }
+    const cleanSection = normalizeShoppingSection(section);
+    if (!cleanSection) {
+      throw new Error('Sección de supermercado no válida.');
+    }
+    const path = `households/${householdId}/shoppingSectionOverrides/${cleanKey}`;
+    try {
+      await setDoc(doc(db, 'households', householdId, 'shoppingSectionOverrides', cleanKey), {
+        productKey: cleanKey,
+        section: cleanSection,
+        updatedBy: actor.uid,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  async clearShoppingSectionOverride(householdId: string, productKey: string): Promise<void> {
+    const cleanKey = productKey.trim().slice(0, MAX_LENGTHS.shoppingOverrideKey);
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(cleanKey)) return;
+    const path = `households/${householdId}/shoppingSectionOverrides/${cleanKey}`;
+    try {
+      await deleteDoc(doc(db, 'households', householdId, 'shoppingSectionOverrides', cleanKey));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
   private async fetchVisibleTransactionsMap(
     householdId: string,
     viewerUid: string
@@ -3319,8 +4074,11 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         mcSnap,
         gSnap,
         gmSnap,
+        spSnap,
         shopSnap,
         catalogSnap,
+        tplSnap,
+        ovSnap,
       ] = await Promise.all([
         getDoc(doc(db, 'households', householdId)),
         getDocs(collection(db, 'households', householdId, 'categories')),
@@ -3334,8 +4092,11 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         getDocs(collection(db, 'households', householdId, 'monthClosures')),
         getDocs(collection(db, 'households', householdId, 'goals')),
         getDocs(collection(db, 'households', householdId, 'goalMovements')),
+        getDocs(collection(db, 'households', householdId, 'savingsPlans')),
         getDocs(collection(db, 'households', householdId, 'shopping')),
         getDocs(collection(db, 'households', householdId, 'shoppingCatalog')),
+        getDocs(collection(db, 'households', householdId, 'shoppingTemplates')),
+        getDocs(collection(db, 'households', householdId, 'shoppingSectionOverrides')),
       ]);
 
       const hData = hSnap.exists() ? mapHousehold(hSnap.id, hSnap.data()) : null;
@@ -3349,6 +4110,14 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       });
       const shoppingCatalog = catalogSnap.docs.map((d) => {
         const { createdAt: _c, updatedAt: _u, ...rest } = mapShoppingCatalogItem(d.id, d.data());
+        return rest;
+      });
+      const shoppingTemplates = tplSnap.docs.map((d) => {
+        const { createdAt: _c, updatedAt: _u, ...rest } = mapShoppingListTemplate(d.id, d.data());
+        return rest;
+      });
+      const shoppingSectionOverrides = ovSnap.docs.map((d) => {
+        const { updatedAt: _u, ...rest } = mapShoppingSectionOverride(d.id, d.data());
         return rest;
       });
 
@@ -3365,8 +4134,21 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           incomeB: 0,
           currency: 'EUR',
         },
+        ...(typeof hData?.mudanzaCompleted === 'boolean'
+          ? {
+              mudanzaCompleted: hData.mudanzaCompleted,
+              mudanzaCompletedAt: hData.mudanzaCompletedAt ?? null,
+              mudanzaCompletedBy: hData.mudanzaCompletedBy ?? null,
+            }
+          : {}),
         ...(hData?.csvKeywords ? { csvKeywords: hData.csvKeywords } : {}),
         ...(hData?.categoryColors ? { categoryColors: hData.categoryColors } : {}),
+        ...(hData?.commonAccountPlannedCategories && hData.commonAccountPlannedCategories.length > 0
+          ? { commonAccountPlannedCategories: hData.commonAccountPlannedCategories }
+          : {}),
+        ...(hData?.commonAccountManualBalance
+          ? { commonAccountManualBalance: hData.commonAccountManualBalance }
+          : {}),
         ...(customCategories.length > 0 ? { customCategories } : {}),
         ...(categoryBudgets.length > 0 ? { categoryBudgets } : {}),
         initialCosts: icSnap.docs.map((d) => {
@@ -3415,11 +4197,23 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           const { createdAt: _c, ...rest } = mapGoalMovement(d.id, d.data());
           return rest;
         }),
+        ...(spSnap.docs.length > 0
+          ? {
+              savingsPlans: spSnap.docs
+                .map((d) => {
+                  const { updatedAt: _u, ...rest } = mapSavingsPlan(d.id, d.data());
+                  return rest;
+                })
+                .sort((a, b) => a.monthKey.localeCompare(b.monthKey)),
+            }
+          : {}),
         shopping: shopSnap.docs.map((d) => {
           const { createdAt: _c, updatedAt: _u, ...rest } = mapShoppingItem(d.id, d.data());
           return rest;
         }),
         ...(shoppingCatalog.length > 0 ? { shoppingCatalog } : {}),
+        ...(shoppingTemplates.length > 0 ? { shoppingTemplates } : {}),
+        ...(shoppingSectionOverrides.length > 0 ? { shoppingSectionOverrides } : {}),
       };
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
@@ -3434,9 +4228,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const categoryOps: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
     const ops: Array<{ path: string; apply: (batch: ReturnType<typeof writeBatch>) => void }> = [];
 
-    let hSnap, catEx, cbEx, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx, catalogEx;
+    let hSnap, catEx, cbEx, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx, catalogEx, tplEx;
     try {
-      [hSnap, catEx, cbEx, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx, catalogEx] =
+      [hSnap, catEx, cbEx, icEx, clEx, itEx, recEx, txExistingMap, budEx, mcEx, gEx, gmEx, shopEx, catalogEx, tplEx] =
         await Promise.all([
           getDoc(doc(db, 'households', householdId)),
           getDocs(collection(db, 'households', householdId, 'categories')),
@@ -3452,6 +4246,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           getDocs(collection(db, 'households', householdId, 'goalMovements')),
           getDocs(collection(db, 'households', householdId, 'shopping')),
           getDocs(collection(db, 'households', householdId, 'shoppingCatalog')),
+          getDocs(collection(db, 'households', householdId, 'shoppingTemplates')),
         ]);
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, `households/${householdId}`);
@@ -3486,6 +4281,7 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const gmSet = existsSet(gmEx);
     const shopSet = existsSet(shopEx);
     const catalogSet = existsSet(catalogEx);
+    const tplSet = existsSet(tplEx);
 
     if (Array.isArray(backup.customCategories)) {
       for (const cat of backup.customCategories) {
@@ -3585,8 +4381,9 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
 
     for (const item of backup.recurring) {
-      const { id, ...fields } = item;
-      const safeFields = {
+      const { id, skippedMonths: rawSkipped, ...fields } = item;
+      const safeSkipped = sanitizeSkippedMonths(rawSkipped);
+      const baseSafeFields = {
         ...fields,
         startMonth: isValidMonthKey(fields.startMonth) ? fields.startMonth : '',
         paidByDefault: resolvePayer(fields.paidByDefault),
@@ -3596,8 +4393,13 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         path: `households/${householdId}/recurring/${id}`,
         apply: (b) =>
           recSet.has(id)
-            ? b.update(ref, { ...safeFields, updatedAt: serverTimestamp() })
-            : b.set(ref, { ...safeFields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }),
+            ? b.update(ref, { ...baseSafeFields, updatedAt: serverTimestamp() })
+            : b.set(ref, {
+                ...baseSafeFields,
+                ...(safeSkipped.length > 0 ? { skippedMonths: safeSkipped } : {}),
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              }),
       });
     }
 
@@ -3740,6 +4542,26 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       }
     }
 
+    if (Array.isArray(backup.savingsPlans)) {
+      for (const sp of backup.savingsPlans) {
+        if (!isValidMonthKey(sp.monthKey)) continue;
+        const cleanTarget = roundCents(Math.max(0, Number(sp.targetAmount) || 0));
+        const cleanAllocations = sanitizeSavingsPlanAllocations(sp.allocations);
+        const ref = doc(db, 'households', householdId, 'savingsPlans', sp.monthKey);
+        ops.push({
+          path: `households/${householdId}/savingsPlans/${sp.monthKey}`,
+          apply: (b) =>
+            b.set(ref, {
+              monthKey: sp.monthKey,
+              targetAmount: cleanTarget,
+              allocations: cleanAllocations,
+              updatedBy: actor.uid,
+              updatedAt: serverTimestamp(),
+            }),
+        });
+      }
+    }
+
     if (Array.isArray(backup.shopping)) {
       for (const item of backup.shopping) {
         const { id, text, qty, unit, done, addedBy } = item;
@@ -3832,6 +4654,51 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       }
     }
 
+    if (Array.isArray(backup.shoppingTemplates)) {
+      for (const tpl of backup.shoppingTemplates) {
+        const ref = doc(db, 'households', householdId, 'shoppingTemplates', tpl.id);
+        const cleanName = clampStr(tpl.name, MAX_LENGTHS.shoppingTemplateName) || 'Lista';
+        const cleanItems = sanitizeShoppingTemplateItems(tpl.items);
+        const safeCreator = resolveMemberUid(tpl.createdBy);
+        ops.push({
+          path: `households/${householdId}/shoppingTemplates/${tpl.id}`,
+          apply: (b) =>
+            tplSet.has(tpl.id)
+              ? b.update(ref, {
+                  name: cleanName,
+                  items: cleanItems,
+                  updatedAt: serverTimestamp(),
+                })
+              : b.set(ref, {
+                  name: cleanName,
+                  items: cleanItems,
+                  createdBy: safeCreator,
+                  createdAt: serverTimestamp(),
+                  updatedAt: serverTimestamp(),
+                }),
+        });
+      }
+    }
+
+    if (Array.isArray(backup.shoppingSectionOverrides)) {
+      for (const ov of backup.shoppingSectionOverrides) {
+        const cleanKey = (ov.productKey || ov.id || '').trim().slice(0, MAX_LENGTHS.shoppingOverrideKey);
+        const cleanSection = normalizeShoppingSection(ov.section);
+        if (!/^[a-zA-Z0-9_-]{2,64}$/.test(cleanKey) || !cleanSection) continue;
+        const ref = doc(db, 'households', householdId, 'shoppingSectionOverrides', cleanKey);
+        ops.push({
+          path: `households/${householdId}/shoppingSectionOverrides/${cleanKey}`,
+          apply: (b) =>
+            b.set(ref, {
+              productKey: cleanKey,
+              section: cleanSection,
+              updatedBy: actor.uid,
+              updatedAt: serverTimestamp(),
+            }),
+        });
+      }
+    }
+
     ops.push({
       path: `households/${householdId}/activity`,
       apply: (b) =>
@@ -3856,6 +4723,29 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
 
     await this.commitBatchOps(ops, OperationType.WRITE, `households/${householdId}`);
+
+    // Preferencias opcionales de planificación de Cuenta común (escrituras independientes para respetar cada acción de reglas)
+    if (backup.commonAccountPlannedCategories !== undefined) {
+      await this.updateCommonAccountPlannedCategories(
+        householdId,
+        backup.commonAccountPlannedCategories
+      );
+    }
+    if (backup.commonAccountManualBalance !== undefined) {
+      await this.updateCommonAccountManualBalance(
+        householdId,
+        backup.commonAccountManualBalance
+          ? {
+              amount: backup.commonAccountManualBalance.amount,
+              referenceDate: backup.commonAccountManualBalance.referenceDate,
+            }
+          : null,
+        actor
+      );
+    }
+    if (typeof backup.mudanzaCompleted === 'boolean') {
+      await this.setMudanzaCompleted(householdId, backup.mudanzaCompleted, actor);
+    }
   }
 }
 

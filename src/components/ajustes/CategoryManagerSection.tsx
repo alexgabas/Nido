@@ -16,7 +16,6 @@ import { useNido } from '../../context/NidoContext';
 import {
   canSafelyDeleteCustomCategory,
   CATEGORY_ICON_OPTIONS,
-  generateCustomCategoryId,
   getAvailableCategorySuggestions,
   isCategoryDuplicateName,
   type CategoryIconKey,
@@ -140,20 +139,13 @@ export const CategoryManagerSection: React.FC = () => {
       ? editingCat.order
       : sortedCustom.reduce((max, c) => Math.max(max, Number.isFinite(c.order) ? c.order : 0), 0) +
         1;
-    const id =
-      editingCat?.id ||
-      generateCustomCategoryId(
-        cleanName,
-        customCategories.map((c) => c.id)
-      );
-
     setSaving(true);
     setError(null);
     try {
       await repo.upsertCustomCategory(
         householdId,
         {
-          id,
+          ...(editingCat ? { id: editingCat.id } : {}),
           name: cleanName,
           color: cleanColor,
           icon,
@@ -179,10 +171,6 @@ export const CategoryManagerSection: React.FC = () => {
       showToast('Esa categoría ya existe en vuestro hogar');
       return;
     }
-    const id = generateCustomCategoryId(
-      suggestion.name,
-      customCategories.map((c) => c.id)
-    );
     const nextOrder =
       sortedCustom.reduce((max, c) => Math.max(max, Number.isFinite(c.order) ? c.order : 0), 0) +
       1;
@@ -191,7 +179,7 @@ export const CategoryManagerSection: React.FC = () => {
       await repo.upsertCustomCategory(
         householdId,
         {
-          id,
+          id: `cat_${suggestion.key}`,
           name: suggestion.name,
           color: suggestion.color,
           icon: suggestion.icon,

@@ -2,16 +2,19 @@ import {
   MAX_LENGTHS,
   SHOPPING_SECTIONS,
   type NidoBackupV1,
+  type SavingsPlanAllocation,
   type ShoppingSection,
   type ShoppingSourceType,
+  type ShoppingTemplateItem,
 } from '../types/nido';
+import { MAX_SAVINGS_PLAN_ALLOCATIONS } from './savingsPlan';
 import {
   buildCategoryBudgetDocId,
   isCustomCategoryId,
   isValidCategoryIcon,
 } from './categories';
 import { isValidHexColor } from './categoryPalette';
-import { localDaysBetween } from './finance';
+import { localDaysBetween, roundCents } from './finance';
 
 const VALID_SHOPPING_SECTIONS = new Set<string>(SHOPPING_SECTIONS);
 const VALID_SHOPPING_SOURCES = new Set<string>(['mercadona', 'custom', 'generic']);
@@ -164,6 +167,29 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
   const incomeA = assertNonNegNum(s.incomeA, 'settings.incomeA');
   const incomeB = assertNonNegNum(s.incomeB, 'settings.incomeB');
 
+  let mudanzaCompleted: boolean | undefined = undefined;
+  let mudanzaCompletedAt: string | null | undefined = undefined;
+  let mudanzaCompletedBy: string | null | undefined = undefined;
+  if (raw.mudanzaCompleted !== undefined) {
+    if (typeof raw.mudanzaCompleted !== 'boolean') {
+      throw new Error('Campo inválido (mudanzaCompleted): debe ser booleano.');
+    }
+    mudanzaCompleted = raw.mudanzaCompleted;
+    if (mudanzaCompleted) {
+      mudanzaCompletedAt =
+        raw.mudanzaCompletedAt !== undefined && raw.mudanzaCompletedAt !== null && raw.mudanzaCompletedAt !== ''
+          ? assertStr(raw.mudanzaCompletedAt, 'mudanzaCompletedAt', 64, 1)
+          : new Date().toISOString();
+      mudanzaCompletedBy =
+        raw.mudanzaCompletedBy !== undefined && raw.mudanzaCompletedBy !== null && raw.mudanzaCompletedBy !== ''
+          ? assertStr(raw.mudanzaCompletedBy, 'mudanzaCompletedBy', 128, 1)
+          : 'backup';
+    } else {
+      mudanzaCompletedAt = null;
+      mudanzaCompletedBy = null;
+    }
+  }
+
   const normalizePayer = (rawPayer: unknown, label: string): string => {
     const val = assertStr(rawPayer, label, 128, 1);
     return val === 'comun' ? 'cuenta_comun' : val;
@@ -250,6 +276,60 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     return customCategoryIdSet.has(cat);
   };
 
+  let commonAccountPlannedCategories: NidoBackupV1['commonAccountPlannedCategories'] = undefined;
+  if (raw.commonAccountPlannedCategories !== undefined) {
+    if (!Array.isArray(raw.commonAccountPlannedCategories)) {
+      throw new Error('commonAccountPlannedCategories inválido en la copia.');
+    }
+    if (raw.commonAccountPlannedCategories.length > 60) {
+      throw new Error('Demasiadas categorías en commonAccountPlannedCategories (máx. 60).');
+    }
+    const seen = new Set<string>();
+    const cleanPlanned: string[] = [];
+    for (let i = 0; i < raw.commonAccountPlannedCategories.length; i += 1) {
+      const cat = assertStr(
+        raw.commonAccountPlannedCategories[i],
+        `commonAccountPlannedCategories[${i}]`,
+        64,
+        1
+      );
+      if (!isAllowedExpenseCategory(cat) && !/^cat_[a-z0-9_]{2,48}$/.test(cat)) {
+        throw new Error(`Categoría inválida en commonAccountPlannedCategories[${i}]: ${cat}.`);
+      }
+      if (!seen.has(cat)) {
+        seen.add(cat);
+        cleanPlanned.push(cat);
+      }
+    }
+    commonAccountPlannedCategories = cleanPlanned;
+  }
+
+  let commonAccountManualBalance: NidoBackupV1['commonAccountManualBalance'] = undefined;
+  if (raw.commonAccountManualBalance !== undefined) {
+    if (raw.commonAccountManualBalance === null) {
+      commonAccountManualBalance = null;
+    } else if (!isObj(raw.commonAccountManualBalance)) {
+      throw new Error('commonAccountManualBalance inválido en la copia.');
+    } else {
+      const mb = raw.commonAccountManualBalance;
+      const refDate = assertStr(mb.referenceDate, 'commonAccountManualBalance.referenceDate', 10, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(refDate)) {
+        throw new Error('Fecha inválida en commonAccountManualBalance.referenceDate (esperado YYYY-MM-DD).');
+      }
+      commonAccountManualBalance = {
+        amount: roundCents(assertNonNegNum(mb.amount, 'commonAccountManualBalance.amount')),
+        referenceDate: refDate,
+        updatedBy: assertStr(mb.updatedBy ?? 'backup', 'commonAccountManualBalance.updatedBy', 128, 1),
+        updatedAt: assertStr(
+          mb.updatedAt ?? new Date().toISOString(),
+          'commonAccountManualBalance.updatedAt',
+          64,
+          1
+        ),
+      };
+    }
+  }
+
   const initialCosts = arr('initialCosts').map((item, idx) => {
     if (!isObj(item)) throw new Error(`initialCosts[${idx}] inválido.`);
     const cat = String(item.category);
@@ -332,6 +412,23 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     if (item.startMonth !== undefined && item.startMonth !== null && item.startMonth !== '') {
       startMonth = assertMonthKey(item.startMonth, `recurring[${idx}].startMonth`);
     }
+    let skippedMonths: string[] | undefined = undefined;
+    if (item.skippedMonths !== undefined && item.skippedMonths !== null) {
+      if (!Array.isArray(item.skippedMonths)) {
+        throw new Error(`skippedMonths inválido en recurring[${idx}].`);
+      }
+      if (item.skippedMonths.length > 120) {
+        throw new Error(`Demasiados meses omitidos en recurring[${idx}] (máximo 120).`);
+      }
+      const cleanSet = new Set<string>();
+      for (let mIdx = 0; mIdx < item.skippedMonths.length; mIdx++) {
+        cleanSet.add(
+          assertMonthKey(item.skippedMonths[mIdx], `recurring[${idx}].skippedMonths[${mIdx}]`)
+        );
+      }
+      const sorted = Array.from(cleanSet).sort();
+      if (sorted.length > 0) skippedMonths = sorted;
+    }
     return {
       id: assertStr(item.id, `recurring[${idx}].id`, 128, 1),
       concept: assertStr(item.concept, `recurring[${idx}].concept`, 120, 1),
@@ -340,6 +437,7 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       frequency: freq as NidoBackupV1['recurring'][number]['frequency'],
       dayOfMonth: day,
       ...(startMonth ? { startMonth } : {}),
+      ...(skippedMonths ? { skippedMonths } : {}),
       splitOverride,
       paidByDefault: normalizePayer(item.paidByDefault, `recurring[${idx}].paidByDefault`),
       active: item.active,
@@ -482,6 +580,82 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     };
   });
 
+  let savingsPlans: NidoBackupV1['savingsPlans'] = undefined;
+  if (raw.savingsPlans !== undefined) {
+    if (!Array.isArray(raw.savingsPlans)) {
+      throw new Error('savingsPlans inválido en la copia.');
+    }
+    savingsPlans = raw.savingsPlans.map((planItem, idx) => {
+      if (!isObj(planItem)) throw new Error(`savingsPlans[${idx}] inválido.`);
+      const monthKey = assertMonthKey(planItem.monthKey, `savingsPlans[${idx}].monthKey`);
+      const targetAmount = roundCents(
+        assertNonNegNum(planItem.targetAmount, `savingsPlans[${idx}].targetAmount`)
+      );
+      if (!Array.isArray(planItem.allocations)) {
+        throw new Error(`savingsPlans[${idx}].allocations inválido.`);
+      }
+      if (planItem.allocations.length > MAX_SAVINGS_PLAN_ALLOCATIONS) {
+        throw new Error(
+          `Demasiadas asignaciones en savingsPlans[${idx}] (máximo ${MAX_SAVINGS_PLAN_ALLOCATIONS}).`
+        );
+      }
+      const seenGoals = new Set<string>();
+      const allocations: SavingsPlanAllocation[] = [];
+      for (let aIdx = 0; aIdx < planItem.allocations.length; aIdx++) {
+        const alloc = planItem.allocations[aIdx];
+        if (!isObj(alloc)) {
+          throw new Error(`savingsPlans[${idx}].allocations[${aIdx}] inválido.`);
+        }
+        const goalId = assertStr(
+          alloc.goalId,
+          `savingsPlans[${idx}].allocations[${aIdx}].goalId`,
+          128,
+          1
+        );
+        if (!/^[a-zA-Z0-9_-]{1,128}$/.test(goalId)) {
+          throw new Error(`goalId inválido en savingsPlans[${idx}].allocations[${aIdx}].`);
+        }
+        if (seenGoals.has(goalId)) continue;
+        seenGoals.add(goalId);
+        const plannedAmount = roundCents(
+          assertNonNegNum(
+            alloc.plannedAmount,
+            `savingsPlans[${idx}].allocations[${aIdx}].plannedAmount`
+          )
+        );
+        const priorityRaw = assertFiniteNum(
+          alloc.priority ?? aIdx,
+          `savingsPlans[${idx}].allocations[${aIdx}].priority`
+        );
+        if (priorityRaw < 0 || priorityRaw > 99) {
+          throw new Error(`priority fuera de rango en savingsPlans[${idx}].allocations[${aIdx}].`);
+        }
+        const goalNameSnapshot =
+          alloc.goalNameSnapshot !== undefined && alloc.goalNameSnapshot !== null && alloc.goalNameSnapshot !== ''
+            ? assertStr(
+                alloc.goalNameSnapshot,
+                `savingsPlans[${idx}].allocations[${aIdx}].goalNameSnapshot`,
+                MAX_LENGTHS.goalName
+              )
+            : undefined;
+        allocations.push({
+          goalId,
+          plannedAmount,
+          priority: Math.round(priorityRaw),
+          ...(goalNameSnapshot ? { goalNameSnapshot } : {}),
+        });
+      }
+      allocations.sort((a, b) => a.priority - b.priority);
+      const normalizedAllocations = allocations.map((a, idxPos) => ({ ...a, priority: idxPos }));
+      return {
+        monthKey,
+        targetAmount,
+        allocations: normalizedAllocations,
+        updatedBy: assertStr(planItem.updatedBy ?? 'backup', `savingsPlans[${idx}].updatedBy`, 128, 1),
+      };
+    });
+  }
+
   const parseOptShoppingMeta = (item: Record<string, unknown>, prefix: string) => {
     const catalogId =
       typeof item.catalogId === 'string' && item.catalogId.trim()
@@ -560,6 +734,74 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       })
     : undefined;
 
+  const shoppingTemplates = Array.isArray(raw.shoppingTemplates)
+    ? raw.shoppingTemplates.map((tpl, idx) => {
+        if (!isObj(tpl)) throw new Error(`shoppingTemplates[${idx}] inválido.`);
+        const rawItems = Array.isArray(tpl.items) ? tpl.items : [];
+        if (rawItems.length > 100) {
+          throw new Error(`Demasiados productos en shoppingTemplates[${idx}] (máximo 100).`);
+        }
+        const items: ShoppingTemplateItem[] = rawItems.map((it, itemIdx) => {
+          if (!isObj(it)) throw new Error(`shoppingTemplates[${idx}].items[${itemIdx}] inválido.`);
+          const qty = assertFiniteNum(it.qty, `shoppingTemplates[${idx}].items[${itemIdx}].qty`);
+          if (qty <= 0 || qty > 999) {
+            throw new Error(`Cantidad fuera de rango en shoppingTemplates[${idx}].items[${itemIdx}].`);
+          }
+          const unit =
+            it.unit !== undefined && it.unit !== null
+              ? assertStr(it.unit, `shoppingTemplates[${idx}].items[${itemIdx}].unit`, MAX_LENGTHS.shoppingUnit)
+              : '';
+          return {
+            text: assertStr(
+              it.text,
+              `shoppingTemplates[${idx}].items[${itemIdx}].text`,
+              MAX_LENGTHS.shoppingText,
+              1
+            ),
+            qty,
+            ...(unit ? { unit } : {}),
+            ...parseOptShoppingMeta(it, `shoppingTemplates[${idx}].items[${itemIdx}]`),
+          };
+        });
+        return {
+          id: assertStr(tpl.id, `shoppingTemplates[${idx}].id`, 128, 1),
+          name: assertStr(tpl.name, `shoppingTemplates[${idx}].name`, MAX_LENGTHS.shoppingTemplateName, 1),
+          items,
+          createdBy: assertStr(tpl.createdBy ?? '', `shoppingTemplates[${idx}].createdBy`, 128),
+        };
+      })
+    : undefined;
+
+  const shoppingSectionOverrides = Array.isArray(raw.shoppingSectionOverrides)
+    ? raw.shoppingSectionOverrides.map((ov, idx) => {
+        if (!isObj(ov)) throw new Error(`shoppingSectionOverrides[${idx}] inválido.`);
+        const productKey = assertStr(
+          ov.productKey ?? ov.id,
+          `shoppingSectionOverrides[${idx}].productKey`,
+          MAX_LENGTHS.shoppingOverrideKey,
+          2
+        );
+        if (!/^[a-zA-Z0-9_-]{2,64}$/.test(productKey)) {
+          throw new Error(`productKey inválido en shoppingSectionOverrides[${idx}].`);
+        }
+        const rawSection = assertStr(
+          ov.section,
+          `shoppingSectionOverrides[${idx}].section`,
+          MAX_LENGTHS.shoppingSection,
+          1
+        );
+        if (!VALID_SHOPPING_SECTIONS.has(rawSection)) {
+          throw new Error(`Sección inválida en shoppingSectionOverrides[${idx}].`);
+        }
+        return {
+          id: productKey,
+          productKey,
+          section: rawSection as ShoppingSection,
+          updatedBy: assertStr(ov.updatedBy ?? '', `shoppingSectionOverrides[${idx}].updatedBy`, 128),
+        };
+      })
+    : undefined;
+
   return {
     schemaVersion: 1,
     app: 'nido',
@@ -573,8 +815,17 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       incomeB,
       currency: 'EUR',
     },
+    ...(mudanzaCompleted !== undefined
+      ? {
+          mudanzaCompleted,
+          mudanzaCompletedAt: mudanzaCompletedAt ?? null,
+          mudanzaCompletedBy: mudanzaCompletedBy ?? null,
+        }
+      : {}),
     ...(csvKeywords ? { csvKeywords } : {}),
     ...(categoryColors ? { categoryColors } : {}),
+    ...(commonAccountPlannedCategories !== undefined ? { commonAccountPlannedCategories } : {}),
+    ...(commonAccountManualBalance !== undefined ? { commonAccountManualBalance } : {}),
     ...(customCategories ? { customCategories } : {}),
     ...(categoryBudgets ? { categoryBudgets } : {}),
     initialCosts,
@@ -586,8 +837,11 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
     monthClosures,
     goals,
     goalMovements,
+    ...(savingsPlans ? { savingsPlans } : {}),
     ...(shopping ? { shopping } : {}),
     ...(shoppingCatalog ? { shoppingCatalog } : {}),
+    ...(shoppingTemplates ? { shoppingTemplates } : {}),
+    ...(shoppingSectionOverrides ? { shoppingSectionOverrides } : {}),
   };
 }
 

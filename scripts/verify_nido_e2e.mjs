@@ -88,10 +88,9 @@ async function run() {
     );
 
     // Verificar lista de la compra + catálogo Mercadona + exploración por secciones (Bloque 3) en Modo Sencillo
-    await page.getByRole('button', { name: /Lista de la compra/i }).first().click();
-    const shoppingDialog = page.getByRole('dialog');
-    await shoppingDialog.waitFor();
-    await shoppingDialog.locator('h2#shopping-list-title').waitFor();
+    await page.locator('main').getByRole('button', { name: /Compra/i }).first().click();
+    const shoppingDialog = page.locator('main');
+    await shoppingDialog.locator('#shopping-list-title').waitFor({ timeout: 10000 });
 
     // Esperar a que cargue el JSON diferido de Mercadona
     await shoppingDialog.getByText(/Catálogo de referencia no oficial/i).waitFor({ timeout: 15000 });
@@ -216,7 +215,7 @@ async function run() {
     await shoppingDialog.locator('#checkout-date').waitFor();
     await shoppingDialog.getByRole('button', { name: /Guardar gasto .* y limpiar carro/ }).click();
     await page.getByText(/Compra finalizada:/).waitFor({ timeout: 5000 });
-    await shoppingDialog.waitFor({ state: 'hidden', timeout: 5000 });
+    await amountInput.waitFor({ state: 'hidden', timeout: 5000 });
     await assertNoHorizontalOverflow(page, 'móvil tras finalizar compra');
 
     // Cambiar a Modo Avanzado y Tema Oscuro desde el avatar
@@ -229,10 +228,11 @@ async function run() {
     const isDark = await page.evaluate(() => document.documentElement.classList.contains('dark'));
     assert.ok(isDark, 'El modo oscuro no se activó');
 
-    await assertNoHorizontalOverflow(page, 'móvil Inicio (Avanzado, oscuro)');
+    await assertNoHorizontalOverflow(page, 'móvil Compra (Avanzado, oscuro)');
 
-    // Ir a Ajustes -> Categorías personalizadas
-    await page.getByRole('navigation', { name: 'Navegación inferior móvil' }).getByRole('button', { name: 'Ajustes' }).click();
+    // Ir a Ajustes -> Categorías personalizadas (desde menú avatar)
+    await page.getByRole('button', { name: /Menú de /i }).click();
+    await page.getByRole('button', { name: 'Ajustes del hogar' }).click();
     await page.getByRole('heading', { name: 'Categorías personalizadas' }).waitFor({ timeout: 10000 });
     await assertNoHorizontalOverflow(page, 'móvil Ajustes (Avanzado, oscuro)');
 
@@ -250,10 +250,16 @@ async function run() {
     );
 
     // Archivar y reactivar categoría
-    const catCard = page.locator('div', { hasText: 'Gimnasio E2E' }).filter({ has: page.getByRole('button', { name: 'Archivar' }) }).first();
+    const catCard = page
+      .locator('div')
+      .filter({ has: page.locator('button[aria-label="Editar categoría Gimnasio E2E"]') })
+      .last();
     await catCard.getByRole('button', { name: 'Archivar' }).click();
     await page.getByText('Categoría «Gimnasio E2E» archivada').waitFor();
-    const archivedCard = page.locator('div', { hasText: 'Gimnasio E2E' }).filter({ has: page.getByRole('button', { name: 'Reactivar' }) }).first();
+    const archivedCard = page
+      .locator('div')
+      .filter({ has: page.locator('button[aria-label="Editar categoría Gimnasio E2E"]') })
+      .last();
     await archivedCard.getByRole('button', { name: 'Reactivar' }).click();
     await page.getByText('Categoría «Gimnasio E2E» reactivada').waitFor();
 
@@ -342,10 +348,16 @@ async function run() {
     await dPage.keyboard.press('Escape');
     await dPage.waitForTimeout(150);
 
-    for (const tabLabel of ['Inicio', 'Mudanza', 'Mensual', 'Ahorros', 'Ajustes']) {
+    for (const tabLabel of ['Inicio', 'Mensual', 'Compra', 'Ahorros']) {
       await dPage.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: tabLabel }).click();
       await dPage.waitForTimeout(200);
       await assertNoHorizontalOverflow(dPage, `escritorio ${tabLabel} (oscuro)`);
+    }
+    for (const secondaryLabel of ['Mudanza', 'Ajustes del hogar']) {
+      await dPage.getByRole('button', { name: /Menú de /i }).click();
+      await dPage.getByRole('button', { name: secondaryLabel, exact: true }).click();
+      await dPage.waitForTimeout(200);
+      await assertNoHorizontalOverflow(dPage, `escritorio ${secondaryLabel} (oscuro)`);
     }
 
     await desktopContext.close();

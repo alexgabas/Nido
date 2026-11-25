@@ -1,13 +1,16 @@
 import React, { useMemo, useState } from 'react';
 import {
+  Archive,
   ArrowUpDown,
   Check,
+  CheckCircle2,
   CheckSquare,
   Download,
   ExternalLink,
   FileSpreadsheet,
   Pencil,
   Plus,
+  RotateCcw,
   Search,
   ShoppingCart,
   Square,
@@ -26,6 +29,11 @@ import {
   getTodayLocalISO,
 } from '../domain/finance';
 import { globalSearchSessionCache } from '../domain/globalSearch';
+import {
+  buildMudanzaCompletionDescription,
+  countPendingMudanzaItems,
+  isMudanzaCompleted,
+} from '../domain/mudanzaStage';
 import {
   FURNITURE_STATUS_LABELS,
   INITIAL_COST_CATEGORY_LABELS,
@@ -123,6 +131,51 @@ export const MudanzaView: React.FC = () => {
   >(null);
   const [exportingPdf, setExportingPdf] = useState(false);
   const [pdfExportError, setPdfExportError] = useState<string | null>(null);
+  const [completeStageConfirmOpen, setCompleteStageConfirmOpen] = useState(false);
+  const [togglingMudanzaStage, setTogglingMudanzaStage] = useState(false);
+
+  const mudanzaCompleted = isMudanzaCompleted(household);
+  const pendingMudanzaCounts = useMemo(
+    () => countPendingMudanzaItems(furnitureItems, checklist),
+    [furnitureItems, checklist]
+  );
+  const mudanzaCompletedDateLabel = household?.mudanzaCompletedAt
+    ? formatDateES(household.mudanzaCompletedAt.slice(0, 10))
+    : '';
+  const mudanzaCompletedByName = household?.mudanzaCompletedBy
+    ? members.find((m) => m.uid === household.mudanzaCompletedBy)?.displayName?.split(' ')[0] || ''
+    : '';
+
+  const handleCompleteMudanzaStage = async () => {
+    if (!householdId || !currentUserProfile || togglingMudanzaStage) return;
+    setTogglingMudanzaStage(true);
+    try {
+      await repo.setMudanzaCompleted(householdId, true, currentUserProfile);
+      setCompleteStageConfirmOpen(false);
+      showToast('Etapa de mudanza terminada · Histórico conservado');
+    } catch (err) {
+      showToast(
+        toUserFriendlyErrorMessage(err, 'No se pudo actualizar el estado de la mudanza.')
+      );
+    } finally {
+      setTogglingMudanzaStage(false);
+    }
+  };
+
+  const handleReopenMudanzaStage = async () => {
+    if (!householdId || !currentUserProfile || togglingMudanzaStage) return;
+    setTogglingMudanzaStage(true);
+    try {
+      await repo.setMudanzaCompleted(householdId, false, currentUserProfile);
+      showToast('Etapa de mudanza reabierta');
+    } catch (err) {
+      showToast(
+        toUserFriendlyErrorMessage(err, 'No se pudo reabrir la etapa de mudanza.')
+      );
+    } finally {
+      setTogglingMudanzaStage(false);
+    }
+  };
 
   const effectiveSubTab: MudanzaSubTab =
     uiMode === 'sencillo' && subTab === 'gastos' ? 'mobiliario' : subTab;
@@ -397,16 +450,68 @@ export const MudanzaView: React.FC = () => {
   const allVisibleSelected =
     filteredFurniture.length > 0 && filteredFurniture.every((it) => selectedFurnitureIds.has(it.id));
 
+  const mudanzaStageBanner = mudanzaCompleted && (
+    <section
+      aria-label="Estado histórico de mudanza"
+      className="rounded-2xl bg-[#0E5A64]/8 dark:bg-[#2AA1AE]/12 border border-[#0E5A64]/25 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+    >
+      <div className="flex items-start gap-3 min-w-0">
+        <span className="w-10 h-10 rounded-xl bg-[#0E5A64]/15 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+          <Archive className="w-5 h-5" />
+        </span>
+        <div className="min-w-0 space-y-0.5">
+          <p className="text-sm font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+            Etapa de mudanza terminada · Histórico compartido
+          </p>
+          <p className="text-xs text-slate-700 dark:text-slate-300">
+            {mudanzaCompletedDateLabel
+              ? `Marcada como terminada el ${mudanzaCompletedDateLabel}${mudanzaCompletedByName ? ` por ${mudanzaCompletedByName}` : ''}. `
+              : ''}
+            Todos los gastos iniciales, muebles y tareas siguen intactos y buscables.
+          </p>
+        </div>
+      </div>
+      <button
+        type="button"
+        disabled={togglingMudanzaStage}
+        onClick={() => void handleReopenMudanzaStage()}
+        className="min-h-[44px] px-4 rounded-xl bg-white dark:bg-[#132025] border border-[#0E5A64]/40 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-bold inline-flex items-center justify-center gap-1.5 hover:bg-[#0E5A64]/5 shrink-0 disabled:opacity-50"
+      >
+        <RotateCcw className="w-4 h-4" />
+        <span>{togglingMudanzaStage ? 'Reabriendo...' : 'Reabrir mudanza'}</span>
+      </button>
+    </section>
+  );
+
   // ─── MODO SENCILLO: SOLO MOBILIARIO (SIN FILTROS/URL/REF) + CHECKLIST ──────
   if (uiMode === 'sencillo') {
     return (
       <div className="space-y-5 max-w-2xl mx-auto">
-        <header className="space-y-1">
-          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">Mudanza</h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            Muebles del piso y lista de tareas.
-          </p>
+        <header className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+          <div className="space-y-1">
+            <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">
+              {mudanzaCompleted ? 'Histórico de mudanza' : 'Mudanza'}
+            </h1>
+            <p className="text-sm text-slate-600 dark:text-slate-400">
+              {mudanzaCompleted
+                ? 'Consulta los muebles y tareas que guardasteis en la mudanza.'
+                : 'Muebles del piso y lista de tareas.'}
+            </p>
+          </div>
+          {!mudanzaCompleted && (
+            <button
+              type="button"
+              disabled={togglingMudanzaStage}
+              onClick={() => setCompleteStageConfirmOpen(true)}
+              className="min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:border-[#0E5A64]/50 inline-flex items-center justify-center gap-1.5 shrink-0 self-start"
+            >
+              <CheckCircle2 className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+              <span>Dar por terminada la mudanza</span>
+            </button>
+          )}
         </header>
+
+        {mudanzaStageBanner}
 
         {/* Only 2 clean sub-tabs */}
         <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-200/70 dark:bg-slate-900 rounded-2xl">
@@ -705,6 +810,16 @@ export const MudanzaView: React.FC = () => {
           onConfirm={() => void handleConfirmDelete()}
           onCancel={() => setDeleteTarget(null)}
         />
+
+        <ConfirmDialog
+          open={completeStageConfirmOpen}
+          title="¿Dar por terminada la mudanza?"
+          description={buildMudanzaCompletionDescription(pendingMudanzaCounts)}
+          confirmLabel={togglingMudanzaStage ? 'Guardando...' : 'Sí, terminar mudanza'}
+          destructive={false}
+          onConfirm={() => void handleCompleteMudanzaStage()}
+          onCancel={() => setCompleteStageConfirmOpen(false)}
+        />
       </div>
     );
   }
@@ -715,12 +830,27 @@ export const MudanzaView: React.FC = () => {
       {/* Header + Export */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">Mudanza</h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            Gastos iniciales, checklist legal Catalunya y equipamiento del piso.
+          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight">
+            {mudanzaCompleted ? 'Histórico de mudanza' : 'Mudanza'}
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-400">
+            {mudanzaCompleted
+              ? 'Registro histórico de gastos iniciales, checklist y equipamiento del piso.'
+              : 'Gastos iniciales, checklist legal Catalunya y equipamiento del piso.'}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {!mudanzaCompleted && (
+            <button
+              type="button"
+              disabled={togglingMudanzaStage}
+              onClick={() => setCompleteStageConfirmOpen(true)}
+              className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/40 bg-[#0E5A64]/6 dark:bg-[#2AA1AE]/12 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-bold flex items-center gap-1.5 hover:bg-[#0E5A64]/12 whitespace-nowrap"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>Dar por terminada la mudanza</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={handleExportMudanzaCSV}
@@ -740,6 +870,8 @@ export const MudanzaView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {mudanzaStageBanner}
 
       {pdfExportError && (
         <div
@@ -1699,6 +1831,16 @@ export const MudanzaView: React.FC = () => {
         confirmLabel={`Eliminar ${selectedFurnitureIds.size}`}
         onConfirm={() => void handleConfirmBulkDeleteFurniture()}
         onCancel={() => setBulkDeleteConfirmOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={completeStageConfirmOpen}
+        title="¿Dar por terminada la mudanza?"
+        description={buildMudanzaCompletionDescription(pendingMudanzaCounts)}
+        confirmLabel={togglingMudanzaStage ? 'Guardando...' : 'Sí, terminar mudanza'}
+        destructive={false}
+        onConfirm={() => void handleCompleteMudanzaStage()}
+        onCancel={() => setCompleteStageConfirmOpen(false)}
       />
     </div>
   );

@@ -5,6 +5,7 @@ import type {
   ShoppingCheckoutPhase1Input,
   ShoppingCheckoutPhase1Result,
 } from '../domain/shoppingCheckout';
+import type { ApplyShoppingTemplatePlan } from '../domain/shoppingTemplates';
 import type {
   ActivityEntry,
   CategoryBudgetLimit,
@@ -20,16 +21,22 @@ import type {
   HouseholdMember,
   HouseholdSettings,
   InitialCost,
+  MemberCategoryPreferences,
   MonthClosure,
   MonthlyBudget,
+  MonthlySavingsPlan,
   NidoBackupV1,
   PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  SavingsPlanAllocation,
   ShoppingCatalogItem,
   ShoppingItem,
+  ShoppingListTemplate,
   ShoppingSection,
+  ShoppingSectionOverride,
   ShoppingSourceType,
+  ShoppingTemplateItem,
   Transaction,
   UiMode,
 } from '../types/nido';
@@ -56,6 +63,13 @@ export interface BankCsvImportItem {
   splitPctA: number;
   isPrivate: boolean;
   notes: string;
+}
+
+export interface AnnualBalanceRawData {
+  /** Exclusivamente movimientos compartidos (isPrivate === false). Nunca incluye gastos privados. */
+  sharedTransactions: Transaction[];
+  systemBudgets: MonthlyBudget[];
+  categoryBudgets: CategoryBudgetLimit[];
 }
 
 export class HouseholdSwitchConfirmationRequiredError extends Error {
@@ -161,6 +175,11 @@ export interface HouseholdRepository {
     onData: (m: GoalMovement[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
+  subscribeSavingsPlans(
+    householdId: string,
+    onData: (plans: MonthlySavingsPlan[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
   subscribeShopping(
     householdId: string,
     onData: (items: ShoppingItem[]) => void,
@@ -182,6 +201,22 @@ export interface HouseholdRepository {
     onData: (items: CustomCategory[]) => void,
     onError: (e: Error) => void
   ): Unsubscribe;
+  subscribeMemberCategoryPreferences(
+    householdId: string,
+    uid: string,
+    onData: (prefs: MemberCategoryPreferences | null) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  subscribeShoppingTemplates(
+    householdId: string,
+    onData: (items: ShoppingListTemplate[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
+  subscribeShoppingSectionOverrides(
+    householdId: string,
+    onData: (items: ShoppingSectionOverride[]) => void,
+    onError: (e: Error) => void
+  ): Unsubscribe;
   subscribeCategoryBudgets(
     householdId: string,
     monthKey: string,
@@ -193,6 +228,7 @@ export interface HouseholdRepository {
     householdId: string,
     monthKey: string
   ): Promise<{ systemBudget: MonthlyBudget | null; categoryBudgets: CategoryBudgetLimit[] }>;
+  fetchAnnualBalanceData(householdId: string): Promise<AnnualBalanceRawData>;
 
   // Settings & Member
   updateSettings(
@@ -208,13 +244,24 @@ export interface HouseholdRepository {
   ): Promise<void>;
   updateCsvKeywords(householdId: string, keywords: CsvCategoryKeywords): Promise<void>;
   updateCategoryColors(householdId: string, colors: CategoryColorMap): Promise<void>;
+  updateCommonAccountPlannedCategories(householdId: string, categoryIds: string[]): Promise<void>;
+  updateCommonAccountManualBalance(
+    householdId: string,
+    balance: { amount: number; referenceDate: string } | null,
+    actor: UserProfileInput
+  ): Promise<void>;
+  setMudanzaCompleted(
+    householdId: string,
+    completed: boolean,
+    actor: UserProfileInput
+  ): Promise<void>;
   updateMemberUiMode(
     householdId: string,
     uid: string,
     uiMode: UiMode
   ): Promise<void>;
 
-  // Custom Categories
+  // Custom Categories & Member Selector Preferences
   upsertCustomCategory(
     householdId: string,
     cat: Omit<CustomCategory, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
@@ -230,6 +277,16 @@ export interface HouseholdRepository {
     name: string,
     actor: UserProfileInput
   ): Promise<void>;
+  saveMemberCategoryPreferences(
+    householdId: string,
+    uid: string,
+    prefs: { selectorVersion: number; visibleCategoryIds: string[] }
+  ): Promise<void>;
+  ensureInitialVisibleCategoriesSetup(
+    householdId: string,
+    uid: string,
+    actor: UserProfileInput
+  ): Promise<MemberCategoryPreferences>;
 
   // Initial Costs
   upsertInitialCost(
@@ -314,6 +371,13 @@ export interface HouseholdRepository {
     householdId: string,
     id: string,
     concept: string,
+    actor: UserProfileInput
+  ): Promise<void>;
+  setRecurringMonthSkipped(
+    householdId: string,
+    recurringId: string,
+    monthKey: string,
+    skipped: boolean,
     actor: UserProfileInput
   ): Promise<void>;
   generateMonthTransactions(
@@ -406,6 +470,20 @@ export interface HouseholdRepository {
     goalName: string,
     actor: UserProfileInput
   ): Promise<void>;
+  saveSavingsPlan(
+    householdId: string,
+    plan: {
+      monthKey: string;
+      targetAmount: number;
+      allocations: SavingsPlanAllocation[];
+    },
+    actor: UserProfileInput
+  ): Promise<void>;
+  deleteSavingsPlan(
+    householdId: string,
+    monthKey: string,
+    actor: UserProfileInput
+  ): Promise<void>;
 
   // Shopping List (sin log de actividad por ítem)
   upsertShoppingItem(
@@ -456,6 +534,26 @@ export interface HouseholdRepository {
     id: string,
     favorite: boolean
   ): Promise<void>;
+
+  // Reusable Shopping Templates & Section Overrides
+  upsertShoppingTemplate(
+    householdId: string,
+    tpl: { id?: string; name: string; items: ShoppingTemplateItem[] },
+    actor: UserProfileInput
+  ): Promise<string>;
+  deleteShoppingTemplate(householdId: string, id: string): Promise<void>;
+  applyShoppingTemplate(
+    householdId: string,
+    plan: ApplyShoppingTemplatePlan,
+    actor: UserProfileInput
+  ): Promise<{ createdCount: number; updatedCount: number }>;
+  setShoppingSectionOverride(
+    householdId: string,
+    productKey: string,
+    section: ShoppingSection,
+    actor: UserProfileInput
+  ): Promise<void>;
+  clearShoppingSectionOverride(householdId: string, productKey: string): Promise<void>;
 
   // Export & Backup Restore
   exportBackup(householdId: string, viewerUid: string): Promise<NidoBackupV1>;

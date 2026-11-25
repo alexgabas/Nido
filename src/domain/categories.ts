@@ -3,6 +3,7 @@ import {
   type CategoryBudgetLimit,
   type CategoryColorMap,
   type CustomCategory,
+  type MemberCategoryPreferences,
   type MonthlyBudget,
   type SystemExpenseCategory,
   type Transaction,
@@ -68,6 +69,17 @@ export const CATEGORY_ICON_OPTIONS: ReadonlyArray<{ key: CategoryIconKey; label:
   { key: 'music', label: 'Música' },
   { key: 'wrench', label: 'Mantenimiento' },
   { key: 'book', label: 'Lectura' },
+  { key: 'shopping-cart', label: 'Supermercado' },
+  { key: 'ticket', label: 'Ocio' },
+  { key: 'zap', label: 'Electricidad' },
+  { key: 'droplets', label: 'Agua' },
+  { key: 'flame', label: 'Gas' },
+  { key: 'wifi', label: 'Internet' },
+  { key: 'smartphone', label: 'Móvil' },
+  { key: 'tv', label: 'Suscripciones' },
+  { key: 'shield', label: 'Seguros' },
+  { key: 'building-2', label: 'Comunidad' },
+  { key: 'layers', label: 'Otros' },
 ];
 
 export const SYSTEM_CATEGORY_ICONS: Record<SystemExpenseCategory, CategoryIconKey> = {
@@ -220,12 +232,15 @@ export function normalizeCategoryName(name: string): string {
 
 export function generateCustomCategoryId(name: string, existingIds: Iterable<string>): string {
   const taken = new Set(existingIds);
-  const baseSlug =
+  let baseSlug =
     normalizeCategoryName(name)
       .replace(/[^a-z0-9]+/g, '_')
       .replace(/^_+|_+$/g, '')
       .slice(0, 22) || 'custom';
-  let candidate = `cat_${baseSlug}`;
+  if (baseSlug.length < 2) {
+    baseSlug = `${baseSlug}_cat`;
+  }
+  const candidate = `cat_${baseSlug}`;
   if (!taken.has(candidate)) return candidate;
   let counter = 2;
   while (counter < 1000) {
@@ -234,6 +249,163 @@ export function generateCustomCategoryId(name: string, existingIds: Iterable<str
     counter += 1;
   }
   return `cat_${Date.now().toString(36)}`.slice(0, 40);
+}
+
+export function isValidSelectorCategoryId(id: string): boolean {
+  return isSystemExpenseCategory(id) || isCustomCategoryId(id);
+}
+
+export const CATEGORY_SELECTOR_PREFS_VERSION = 1;
+export const MAX_VISIBLE_SELECTOR_CATEGORIES = 60;
+
+export interface InitialVisibleCategoryEntry {
+  type: 'system' | 'suggestion';
+  id: string;
+}
+
+export const INITIAL_VISIBLE_CATEGORY_SPEC: readonly InitialVisibleCategoryEntry[] = [
+  { type: 'system', id: 'supermercado' },
+  { type: 'system', id: 'ocio' },
+  { type: 'suggestion', id: 'restaurantes_pedidos' },
+  { type: 'suggestion', id: 'hogar_decoracion' },
+  { type: 'suggestion', id: 'cuidado_personal' },
+  { type: 'suggestion', id: 'gimnasio_deporte' },
+  { type: 'suggestion', id: 'salud_farmacia' },
+  { type: 'suggestion', id: 'mascotas' },
+  { type: 'suggestion', id: 'ropa_calzado' },
+  { type: 'suggestion', id: 'regalos_celebraciones' },
+  { type: 'suggestion', id: 'viajes_escapadas' },
+  { type: 'suggestion', id: 'vehiculo' },
+  { type: 'suggestion', id: 'imprevistos' },
+  { type: 'system', id: 'otros' },
+] as const;
+
+const SUGGESTION_BY_KEY = new Map<string, CustomCategorySuggestion>(
+  CUSTOM_CATEGORY_SUGGESTIONS.map((s) => [s.key, s])
+);
+
+export function findExistingCustomCategoryForSuggestion(
+  suggestion: CustomCategorySuggestion,
+  customCategories: CustomCategory[]
+): CustomCategory | undefined {
+  const deterministicId = `cat_${suggestion.key}`;
+  const byId = customCategories.find((c) => c.id === deterministicId);
+  if (byId) return byId;
+  const targetNorm = normalizeCategoryName(suggestion.name);
+  return customCategories.find((c) => normalizeCategoryName(c.name) === targetNorm);
+}
+
+export interface InitialVisibleCategoriesPlan {
+  missingSuggestionsToCreate: Array<{
+    id: string;
+    suggestion: CustomCategorySuggestion;
+    order: number;
+  }>;
+  orderedVisibleIds: string[];
+}
+
+export function resolveInitialVisibleCategoriesPlan(
+  customCategories: CustomCategory[]
+): InitialVisibleCategoriesPlan {
+  const existingIds = new Set(customCategories.map((c) => c.id));
+  let nextOrder =
+    customCategories.reduce((max, c) => Math.max(max, Number.isFinite(c.order) ? c.order : 0), 0) +
+    1;
+
+  const missingSuggestionsToCreate: InitialVisibleCategoriesPlan['missingSuggestionsToCreate'] = [];
+  const orderedVisibleIds: string[] = [];
+
+  for (const entry of INITIAL_VISIBLE_CATEGORY_SPEC) {
+    if (entry.type === 'system') {
+      orderedVisibleIds.push(entry.id);
+      continue;
+    }
+    const suggestion = SUGGESTION_BY_KEY.get(entry.id);
+    if (!suggestion) continue;
+
+    const existing = findExistingCustomCategoryForSuggestion(suggestion, customCategories);
+    if (existing) {
+      orderedVisibleIds.push(existing.id);
+      continue;
+    }
+
+    const preferredId = `cat_${suggestion.key}`;
+    const id =
+      isCustomCategoryId(preferredId) && !existingIds.has(preferredId)
+        ? preferredId
+        : generateCustomCategoryId(suggestion.name, existingIds);
+    existingIds.add(id);
+
+    missingSuggestionsToCreate.push({
+      id,
+      suggestion,
+      order: nextOrder,
+    });
+    nextOrder += 1;
+    orderedVisibleIds.push(id);
+  }
+
+  return {
+    missingSuggestionsToCreate,
+    orderedVisibleIds,
+  };
+}
+
+export interface ResolvedSelectorCategories {
+  visibleCategories: ResolvedCategoryMeta[];
+  hiddenCategories: ResolvedCategoryMeta[];
+  selectedOutsideVisible: ResolvedCategoryMeta | null;
+}
+
+export function resolveSelectorCategories(
+  registry: CategoryRegistry,
+  prefs: MemberCategoryPreferences | null | undefined,
+  selectedCategoryId?: string
+): ResolvedSelectorCategories {
+  const activeById = new Map<string, ResolvedCategoryMeta>(
+    registry.activeCategories.map((c) => [c.id, c])
+  );
+
+  const rawPreferredIds =
+    prefs && Array.isArray(prefs.visibleCategoryIds) && prefs.visibleCategoryIds.length > 0
+      ? prefs.visibleCategoryIds
+      : resolveInitialVisibleCategoriesPlan(registry.customCategories).orderedVisibleIds;
+
+  const visibleCategories: ResolvedCategoryMeta[] = [];
+  const visibleIdSet = new Set<string>();
+
+  for (const id of rawPreferredIds) {
+    if (visibleIdSet.has(id)) continue;
+    const meta = activeById.get(id);
+    if (!meta) continue;
+    visibleIdSet.add(id);
+    visibleCategories.push(meta);
+  }
+
+  // Safe fallback if all preferred categories were deleted or archived
+  if (visibleCategories.length === 0) {
+    for (const cat of registry.activeCategories) {
+      visibleIdSet.add(cat.id);
+      visibleCategories.push(cat);
+    }
+  }
+
+  const hiddenCategories = registry.activeCategories.filter((c) => !visibleIdSet.has(c.id));
+
+  let selectedOutsideVisible: ResolvedCategoryMeta | null = null;
+  if (
+    selectedCategoryId &&
+    selectedCategoryId !== 'liquidacion' &&
+    !visibleIdSet.has(selectedCategoryId)
+  ) {
+    selectedOutsideVisible = registry.getMeta(selectedCategoryId);
+  }
+
+  return {
+    visibleCategories,
+    hiddenCategories,
+    selectedOutsideVisible,
+  };
 }
 
 export function isCategoryDuplicateName(

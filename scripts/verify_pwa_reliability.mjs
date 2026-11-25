@@ -131,9 +131,9 @@ async function run() {
     console.log('PWA_CHECK_2_OK: Apertura sin conexión tras uso previo funcionando desde Service Worker.');
 
     // Abrir Lista de la compra sin haber descargado Mercadona todavía -> debe avisar honestamente y seguir operable
-    await page1.getByRole('button', { name: /Lista de la compra/i }).first().click();
-    const shopDialog1 = page1.getByRole('dialog');
-    await shopDialog1.waitFor();
+    await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: /Compra/i }).click();
+    const shopDialog1 = page1.locator('main');
+    await shopDialog1.locator('#shopping-list-title').waitFor({ timeout: 10000 });
     await shopDialog1.getByText(/El catálogo de Mercadona aún no se ha descargado en este dispositivo/i).first().waitFor({ timeout: 10000 });
 
     // Confirmar que aún offline se puede añadir un artículo propio manualmente
@@ -152,16 +152,14 @@ async function run() {
     // Ir offline otra vez, recargar la app completa y abrir Lista de la compra -> debe cargar Mercadona desde caché
     await ctx1.setOffline(true);
     await page1.reload({ waitUntil: 'domcontentloaded' });
-    await page1.getByText('Este mes lleváis').waitFor({ timeout: 15000 });
-    await page1.getByRole('button', { name: /Lista de la compra/i }).first().click();
-    const shopDialog1Offline = page1.getByRole('dialog');
-    await shopDialog1Offline.waitFor();
+    await page1.locator('#shopping-list-title').waitFor({ timeout: 15000 });
+    const shopDialog1Offline = page1.locator('main');
     await shopDialog1Offline.getByText(/Catálogo de referencia no oficial/i).waitFor({ timeout: 15000 });
     const shopSearchOffline = shopDialog1Offline.getByRole('combobox', { name: 'Producto para comprar' });
     await shopSearchOffline.fill('leche');
     await shopDialog1Offline.locator('#shopping-suggestions-list').getByText('Mercadona').first().waitFor({ timeout: 10000 });
-    await shopDialog1Offline.getByRole('button', { name: 'Cerrar lista de la compra' }).click();
-    await shopDialog1Offline.waitFor({ state: 'hidden', timeout: 5000 });
+    await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: 'Inicio' }).click();
+    await page1.getByText('Este mes lleváis').waitFor({ timeout: 10000 });
     console.log('PWA_CHECK_3B_OK: Catálogo Mercadona descargado previamente funciona 100 % sin conexión.');
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -176,7 +174,7 @@ async function run() {
 
     // Volver a Inicio, ir offline y abrir Mensual -> debe abrir sin problema
     await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: 'Inicio' }).click();
-    await page1.getByRole('button', { name: /Lista de la compra/i }).first().waitFor({ timeout: 10000 });
+    await page1.getByRole('heading', { name: /Resumen de /i }).waitFor({ timeout: 10000 });
     await ctx1.setOffline(true);
     await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: 'Mensual' }).click();
     await page1.getByRole('heading', { name: 'Presupuesto vs real' }).waitFor({ timeout: 10000 });
@@ -234,7 +232,8 @@ async function run() {
     await ctx1.setOffline(false);
 
     // 1) Simular formulario abierto con cambios sin guardar mientras llega aviso de actualización
-    await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: 'Ajustes' }).click();
+    await page1.getByRole('button', { name: /Menú de /i }).click();
+    await page1.getByRole('button', { name: 'Ajustes del hogar', exact: true }).click();
     await page1.getByRole('heading', { name: 'Categorías personalizadas' }).waitFor({ timeout: 10000 });
     await page1.getByRole('button', { name: 'Nueva categoría' }).click();
     const catInput = page1.locator('#custom-cat-name');
@@ -271,7 +270,8 @@ async function run() {
     await ctx1.route(/\/assets\/MudanzaView-.*\.js(\?.*)?$/, (route) =>
       route.fulfill({ status: 404, contentType: 'text/plain', body: 'Not Found' })
     );
-    await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: 'Mudanza' }).click();
+    await page1.getByRole('button', { name: /Menú de /i }).click();
+    await page1.getByRole('button', { name: 'Mudanza', exact: true }).click();
     await page1.getByText('Hay una versión más reciente de Nido').waitFor({ timeout: 10000 });
     await page1.getByTestId('pwa-update-banner').waitFor({ timeout: 5000 });
 
@@ -292,11 +292,9 @@ async function run() {
     // ═══════════════════════════════════════════════════════════════════════
     // BLOQUE E: Finalizar compra en UI: cancelar no altera nada + flujo completo
     // ═══════════════════════════════════════════════════════════════════════
-    await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: 'Inicio' }).click();
-    await page1.getByRole('button', { name: /Lista de la compra/i }).first().waitFor({ timeout: 10000 });
-    await page1.getByRole('button', { name: /Lista de la compra/i }).first().click();
-    const shopDlg = page1.getByRole('dialog');
-    await shopDlg.waitFor();
+    await page1.getByRole('navigation', { name: 'Navegación principal' }).getByRole('button', { name: /Compra/i }).click();
+    const shopDlg = page1.locator('main');
+    await shopDlg.locator('#shopping-list-title').waitFor({ timeout: 10000 });
 
     // Añadir un artículo propio y marcarlo como comprado
     await shopDlg.getByRole('combobox', { name: 'Producto para comprar' }).fill('Prueba cancelación segura');
@@ -316,7 +314,7 @@ async function run() {
     await shopDlg.locator('#checkout-amount').fill('27.80');
     await shopDlg.getByRole('button', { name: /Guardar gasto .* y limpiar carro/ }).click();
     await page1.getByText(/Compra finalizada:/).waitFor({ timeout: 10000 });
-    await shopDlg.waitFor({ state: 'hidden', timeout: 5000 });
+    await shopDlg.locator('#checkout-amount').waitFor({ state: 'hidden', timeout: 5000 });
     console.log('PWA_CHECK_8_OK: Cancelar antes de confirmar deja la lista intacta y finalizar compra completa limpio.');
 
     await ctx1.close();

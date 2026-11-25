@@ -6,11 +6,12 @@ import {
   ChevronUp,
   Delete,
   Lock,
+  SlidersHorizontal,
   Wallet,
   X,
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
-import { pickSimpleWizardCategories } from '../domain/categories';
+import { resolveSelectorCategories } from '../domain/categories';
 import {
   clampSplitPct,
   computeRecurringHistoricalAverage,
@@ -20,6 +21,7 @@ import {
   inferSplitChoice,
   resolveSplitPctForChoice,
 } from '../domain/finance';
+import { annualBalanceSessionCache } from '../domain/annualBalance';
 import { globalSearchSessionCache } from '../domain/globalSearch';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
@@ -30,6 +32,7 @@ import {
   type Transaction,
 } from '../types/nido';
 import { CategoryIcon } from './CategoryIcon';
+import { CategoryVisibilityCustomizer } from './CategoryVisibilityCustomizer';
 
 interface QuickExpenseModalProps {
   open: boolean;
@@ -88,6 +91,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     recentTransactions,
     monthTransactions,
     categoryRegistry,
+    memberCategoryPreferences,
     uiMode,
     repo,
     showToast,
@@ -99,6 +103,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
 
   const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
   const [showAllSimpleCats, setShowAllSimpleCats] = useState(false);
+  const [showMoreAdvancedCats, setShowMoreAdvancedCats] = useState(false);
+  const [showCustomizeCategories, setShowCustomizeCategories] = useState(false);
   const [amount, setAmount] = useState('');
   const [concept, setConcept] = useState('');
   const [conceptTouched, setConceptTouched] = useState(false);
@@ -123,9 +129,9 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
       editingTx.createdBy !== currentUserProfile.uid
   );
 
-  const simpleWizardCats = useMemo(
-    () => pickSimpleWizardCategories(categoryRegistry.activeCategories, recentTransactions, 8),
-    [categoryRegistry.activeCategories, recentTransactions]
+  const selectorCats = useMemo(
+    () => resolveSelectorCategories(categoryRegistry, memberCategoryPreferences, category),
+    [categoryRegistry, memberCategoryPreferences, category]
   );
 
   const editableCategories = useMemo(() => {
@@ -139,6 +145,8 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
     setError(null);
     setWizardStep(1);
     setShowAllSimpleCats(false);
+    setShowMoreAdvancedCats(false);
+    setShowCustomizeCategories(false);
     if (editingTx) {
       setConceptTouched(false);
       const clampedSplit = clampSplitPct(editingTx.splitPctA, effectiveSplitPctA);
@@ -372,6 +380,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
         currentUserProfile
       );
       globalSearchSessionCache.invalidateHousehold(householdId);
+      annualBalanceSessionCache.invalidateHousehold(householdId);
       if (onSaved) {
         try {
           await onSaved();
@@ -542,26 +551,54 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           )}
 
-          {/* PASO 2: CATEGORÍA (MÁXIMO 8 PRINCIPALES + MÁS CATEGORÍAS) */}
+          {/* PASO 2: CATEGORÍAS VISIBLES CONFIGURABLES + MÁS CATEGORÍAS + PERSONALIZAR */}
           {wizardStep === 2 && (
-            <div className="flex-1 flex flex-col justify-between gap-4">
-              <div className="space-y-4">
-                <div className="text-center space-y-1">
+            <div className="flex-1 flex flex-col justify-between gap-3 min-h-0">
+              <div className="space-y-3 min-h-0 flex flex-col">
+                <div className="text-center space-y-1 shrink-0">
                   <p className="font-mono-num text-lg font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
                     {formatEUR(numericAmount)}
                   </p>
                   <h2 className="font-display text-2xl font-bold">¿En qué lo habéis gastado?</h2>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  {simpleWizardCats.primaryCategories.map((item) => {
+                {selectorCats.selectedOutsideVisible && (
+                  <div className="shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectSimpleCategory(selectorCats.selectedOutsideVisible!.id)}
+                      className="w-full min-h-[48px] px-3 py-2 rounded-xl border border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-between gap-2 text-left"
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <span
+                          aria-hidden="true"
+                          className="w-2.5 h-2.5 rounded-full shrink-0"
+                          style={{ backgroundColor: selectorCats.selectedOutsideVisible.color }}
+                        />
+                        <CategoryIcon
+                          icon={selectorCats.selectedOutsideVisible.icon}
+                          className="w-4 h-4 shrink-0"
+                        />
+                        <span className="text-xs font-bold truncate">
+                          {selectorCats.selectedOutsideVisible.label}
+                        </span>
+                      </span>
+                      <span className="text-[10px] font-semibold shrink-0">
+                        {selectorCats.selectedOutsideVisible.archived ? 'Archivada' : 'Seleccionada'}
+                      </span>
+                    </button>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-2 max-h-[46vh] overflow-y-auto pr-0.5">
+                  {selectorCats.visibleCategories.map((item) => {
                     const active = category === item.id;
                     return (
                       <button
                         key={item.id}
                         type="button"
                         onClick={() => handleSelectSimpleCategory(item.id)}
-                        className={`relative min-h-[82px] p-4 rounded-2xl border flex flex-col items-center justify-center gap-2 transition-all active:scale-[0.98] ${
+                        className={`relative min-h-[58px] px-3 py-2.5 rounded-xl border flex items-center gap-2.5 text-left transition-all active:scale-[0.98] ${
                           active
                             ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
                             : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-[#0F1F24] dark:text-[#F0F5F6] hover:border-[#0E5A64]/40'
@@ -569,11 +606,11 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                       >
                         <span
                           aria-hidden="true"
-                          className="absolute top-3 right-3 w-2.5 h-2.5 rounded-full"
+                          className="w-2.5 h-2.5 rounded-full shrink-0"
                           style={{ backgroundColor: item.color }}
                         />
-                        <CategoryIcon icon={item.icon} className="w-7 h-7" />
-                        <span className="text-sm font-bold text-center leading-tight line-clamp-2">
+                        <CategoryIcon icon={item.icon} className="w-4 h-4 shrink-0" />
+                        <span className="text-xs font-bold leading-tight line-clamp-2">
                           {item.label}
                         </span>
                       </button>
@@ -581,17 +618,17 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                   })}
                 </div>
 
-                {simpleWizardCats.overflowCategories.length > 0 && (
-                  <div className="space-y-2.5">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {selectorCats.hiddenCategories.length > 0 && (
                     <button
                       type="button"
                       onClick={() => setShowAllSimpleCats((v) => !v)}
-                      className="w-full min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4] inline-flex items-center justify-center gap-1.5"
+                      className="flex-1 min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4] inline-flex items-center justify-center gap-1.5"
                     >
                       <span>
                         {showAllSimpleCats
-                          ? 'Ocultar otras categorías'
-                          : `Más categorías (${simpleWizardCats.overflowCategories.length})`}
+                          ? 'Ocultar más categorías'
+                          : `Más categorías (${selectorCats.hiddenCategories.length})`}
                       </span>
                       {showAllSimpleCats ? (
                         <ChevronUp className="w-4 h-4" />
@@ -599,34 +636,48 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                         <ChevronDown className="w-4 h-4" />
                       )}
                     </button>
+                  )}
 
-                    {showAllSimpleCats && (
-                      <div className="grid grid-cols-2 gap-2.5">
-                        {simpleWizardCats.overflowCategories.map((item) => {
-                          const active = category === item.id;
-                          return (
-                            <button
-                              key={item.id}
-                              type="button"
-                              onClick={() => handleSelectSimpleCategory(item.id)}
-                              className={`min-h-[54px] px-3 py-2.5 rounded-xl border flex items-center gap-2.5 text-left transition-all ${
-                                active
-                                  ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                                  : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-[#0F1F24] dark:text-[#F0F5F6]'
-                              }`}
-                            >
-                              <span
-                                aria-hidden="true"
-                                className="w-2.5 h-2.5 rounded-full shrink-0"
-                                style={{ backgroundColor: item.color }}
-                              />
-                              <CategoryIcon icon={item.icon} className="w-4 h-4 shrink-0" />
-                              <span className="text-xs font-bold truncate">{item.label}</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
+                  <button
+                    type="button"
+                    onClick={() => setShowCustomizeCategories(true)}
+                    className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-bold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center justify-center gap-1.5"
+                  >
+                    <SlidersHorizontal className="w-3.5 h-3.5" />
+                    <span>Personalizar</span>
+                  </button>
+                </div>
+
+                {showAllSimpleCats && selectorCats.hiddenCategories.length > 0 && (
+                  <div className="space-y-1.5 shrink-0">
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Elige una categoría para este gasto puntual sin cambiar tu selección habitual:
+                    </p>
+                    <div className="grid grid-cols-2 gap-2 max-h-36 overflow-y-auto pr-0.5">
+                      {selectorCats.hiddenCategories.map((item) => {
+                        const active = category === item.id;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => handleSelectSimpleCategory(item.id)}
+                            className={`min-h-[48px] px-3 py-2 rounded-xl border flex items-center gap-2 text-left transition-all ${
+                              active
+                                ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                                : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-[#0F1F24] dark:text-[#F0F5F6]'
+                            }`}
+                          >
+                            <span
+                              aria-hidden="true"
+                              className="w-2.5 h-2.5 rounded-full shrink-0"
+                              style={{ backgroundColor: item.color }}
+                            />
+                            <CategoryIcon icon={item.icon} className="w-4 h-4 shrink-0" />
+                            <span className="text-xs font-bold truncate">{item.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
               </div>
@@ -634,7 +685,7 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
               <button
                 type="button"
                 onClick={() => handleSelectSimpleCategory(category)}
-                className="w-full min-h-[54px] rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-base font-bold transition-colors"
+                className="w-full min-h-[52px] rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-base font-bold transition-colors shrink-0"
               >
                 Siguiente
               </button>
@@ -827,6 +878,11 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           )}
         </div>
+
+        <CategoryVisibilityCustomizer
+          open={showCustomizeCategories}
+          onClose={() => setShowCustomizeCategories(false)}
+        />
       </div>
     );
   }
@@ -913,19 +969,31 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
               <label htmlFor="simple-edit-cat" className="block text-xs font-medium mb-1">
                 Categoría
               </label>
-              <select
-                id="simple-edit-cat"
-                value={category}
-                onChange={(e) => setCategory(e.target.value as ExpenseCategory)}
-                className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
-              >
-                {editableCategories.map((cat) => (
-                  <option key={cat.id} value={cat.id}>
-                    {cat.label}
-                    {cat.archived ? ' (Archivada)' : ''}
-                  </option>
-                ))}
-              </select>
+              <div className="flex items-center gap-2">
+                <span
+                  aria-hidden="true"
+                  className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex items-center justify-center gap-1.5 shrink-0 px-2"
+                >
+                  <span
+                    className="w-2.5 h-2.5 rounded-full shrink-0"
+                    style={{ backgroundColor: categoryRegistry.getColor(category) }}
+                  />
+                  <CategoryIcon icon={categoryRegistry.getIcon(category)} className="w-4 h-4" />
+                </span>
+                <select
+                  id="simple-edit-cat"
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value as ExpenseCategory)}
+                  className="flex-1 min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                >
+                  {editableCategories.map((cat) => (
+                    <option key={cat.id} value={cat.id}>
+                      {cat.label}
+                      {cat.archived ? ' (Archivada)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
 
             {!isPrivate && (
@@ -1124,12 +1192,45 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
             </div>
           )}
 
-          <div>
-            <span className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
-              Categoría
-            </span>
-            <div className="flex flex-wrap gap-1.5">
-              {editableCategories.map((cat) => (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                Categoría
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowCustomizeCategories(true)}
+                className="min-h-[36px] px-2.5 rounded-lg text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-[#0E5A64]/10 inline-flex items-center gap-1.5"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                <span>Personalizar</span>
+              </button>
+            </div>
+
+            {selectorCats.selectedOutsideVisible && (
+              <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl border border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]">
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold min-w-0">
+                  <span
+                    aria-hidden="true"
+                    className="w-2 h-2 rounded-full shrink-0"
+                    style={{ backgroundColor: selectorCats.selectedOutsideVisible.color }}
+                  />
+                  <CategoryIcon
+                    icon={selectorCats.selectedOutsideVisible.icon}
+                    className="w-3.5 h-3.5 shrink-0"
+                  />
+                  <span className="truncate">{selectorCats.selectedOutsideVisible.label}</span>
+                </span>
+                <span className="text-[11px] font-medium shrink-0">
+                  {selectorCats.selectedOutsideVisible.archived
+                    ? 'Archivada (conservada)'
+                    : 'Categoría oculta (conservada)'}
+                </span>
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-1.5 max-h-48 overflow-y-auto pr-1">
+              {selectorCats.visibleCategories.map((cat) => (
                 <button
                   key={cat.id}
                   type="button"
@@ -1145,13 +1246,57 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
                     className="w-2 h-2 rounded-full shrink-0"
                     style={{ backgroundColor: cat.color }}
                   />
-                  <span>
-                    {cat.label}
-                    {cat.archived ? ' (Archivada)' : ''}
-                  </span>
+                  <CategoryIcon icon={cat.icon} className="w-3.5 h-3.5 shrink-0" />
+                  <span>{cat.label}</span>
                 </button>
               ))}
             </div>
+
+            {selectorCats.hiddenCategories.length > 0 && (
+              <div className="space-y-1.5">
+                <button
+                  type="button"
+                  onClick={() => setShowMoreAdvancedCats((v) => !v)}
+                  className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
+                >
+                  <span>
+                    {showMoreAdvancedCats
+                      ? 'Ocultar más categorías'
+                      : `Más categorías (${selectorCats.hiddenCategories.length})`}
+                  </span>
+                  {showMoreAdvancedCats ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
+                </button>
+
+                {showMoreAdvancedCats && (
+                  <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto pr-1 pt-1">
+                    {selectorCats.hiddenCategories.map((cat) => (
+                      <button
+                        key={cat.id}
+                        type="button"
+                        onClick={() => setCategory(cat.id)}
+                        className={`min-h-[40px] px-2.5 rounded-xl text-xs font-medium transition-colors whitespace-nowrap inline-flex items-center gap-1.5 ${
+                          category === cat.id
+                            ? 'bg-[#0E5A64] text-white'
+                            : 'bg-slate-100/80 dark:bg-slate-800/80 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
+                        }`}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: cat.color }}
+                        />
+                        <CategoryIcon icon={cat.icon} className="w-3.5 h-3.5 shrink-0" />
+                        <span>{cat.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Privado (no lo ve mi pareja) */}
@@ -1321,6 +1466,11 @@ export const QuickExpenseModal: React.FC<QuickExpenseModalProps> = ({
           </button>
         </form>
       </div>
+
+      <CategoryVisibilityCustomizer
+        open={showCustomizeCategories}
+        onClose={() => setShowCustomizeCategories(false)}
+      />
     </div>
   );
 };

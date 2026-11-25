@@ -4,6 +4,7 @@ import {
   Archive,
   ArrowDownCircle,
   ArrowUpCircle,
+  Calendar,
   Download,
   FileSpreadsheet,
   Pencil,
@@ -15,6 +16,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { DonutChart } from '../components/Charts';
+import { MonthlySavingsPlanSection } from '../components/ahorros/MonthlySavingsPlanSection';
 import { useNido } from '../context/NidoContext';
 import { downloadTextFile, generateSpanishCSV } from '../domain/backup';
 import {
@@ -24,15 +26,20 @@ import {
   computeSavingsCapacity,
   formatDateES,
   formatEUR,
+  formatMonthLabelES,
   formatPctES,
   getCurrentMonthKeyLocal,
   getTodayLocalISO,
   roundCents,
 } from '../domain/finance';
 import { GOAL_TYPE_LABELS } from '../domain/presets';
+import {
+  evaluateMonthlySavingsPlan,
+  formatDecimalInputES,
+} from '../domain/savingsPlan';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
-import type { GoalType, SavingsGoal } from '../types/nido';
+import type { GoalType, SavingsGoal, SavingsPlanAllocation } from '../types/nido';
 
 export const AhorrosView: React.FC = () => {
   const {
@@ -46,6 +53,7 @@ export const AhorrosView: React.FC = () => {
     uiMode,
     goals,
     goalMovements,
+    savingsPlans,
     recurring,
     recentTransactions,
     monthClosures,
@@ -55,6 +63,12 @@ export const AhorrosView: React.FC = () => {
   } = useNido();
 
   const todayISO = getTodayLocalISO();
+  const currentMonthKey = getCurrentMonthKeyLocal();
+
+  // Monthly savings plan state
+  const [planMonthKey, setPlanMonthKey] = useState(currentMonthKey);
+  const [planEditorOpen, setPlanEditorOpen] = useState(false);
+  const [savingPlan, setSavingPlan] = useState(false);
 
   // Movement modal
   const [moveGoal, setMoveGoal] = useState<SavingsGoal | null>(null);
@@ -62,6 +76,7 @@ export const AhorrosView: React.FC = () => {
   const [moveAmount, setMoveAmount] = useState('');
   const [moveBy, setMoveBy] = useState(currentUserProfile?.uid || memberA?.uid || '');
   const [moveNote, setMoveNote] = useState('');
+  const [moveDate, setMoveDate] = useState(todayISO);
 
   // Goal create/edit modal (Avanzado)
   const [goalModalOpen, setGoalModalOpen] = useState(false);
@@ -96,7 +111,22 @@ export const AhorrosView: React.FC = () => {
     [activeGoals]
   );
 
-  const currentMonthKey = getCurrentMonthKeyLocal();
+  const selectedPlan = useMemo(
+    () => savingsPlans.find((p) => p.monthKey === planMonthKey) ?? null,
+    [savingsPlans, planMonthKey]
+  );
+
+  const planEvaluation = useMemo(
+    () =>
+      evaluateMonthlySavingsPlan({
+        monthKey: planMonthKey,
+        plan: selectedPlan,
+        goals,
+        movements: goalMovements,
+        refDateISO: todayISO,
+      }),
+    [planMonthKey, selectedPlan, goals, goalMovements, todayISO]
+  );
 
   const savingsCapacity = useMemo(
     () =>
@@ -151,13 +181,71 @@ export const AhorrosView: React.FC = () => {
     goal: SavingsGoal,
     direction: 'add' | 'withdraw',
     initialAmount = '',
-    initialNote = ''
+    initialNote = '',
+    initialDate = todayISO
   ) => {
     setMoveGoal(goal);
     setMoveDirection(direction);
     setMoveAmount(initialAmount);
     setMoveBy(currentUserProfile?.uid || memberA?.uid || '');
     setMoveNote(initialNote);
+    setMoveDate(initialDate);
+  };
+
+  const handleContributePending = (goal: SavingsGoal, pendingAmount: number) => {
+    const safeDay = String(Math.min(28, Number(todayISO.slice(8, 10)) || 1)).padStart(2, '0');
+    const targetDate = planMonthKey === currentMonthKey ? todayISO : `${planMonthKey}-${safeDay}`;
+    openMovementModal(
+      goal,
+      'add',
+      formatDecimalInputES(pendingAmount),
+      `Plan de ahorro ${formatMonthLabelES(planMonthKey)}`,
+      targetDate
+    );
+  };
+
+  const handleSaveSavingsPlan = async (payload: {
+    monthKey: string;
+    targetAmount: number;
+    allocations: SavingsPlanAllocation[];
+  }) => {
+    if (!householdId || !currentUserProfile) return;
+    setSavingPlan(true);
+    try {
+      await repo.saveSavingsPlan(householdId, payload, currentUserProfile);
+      setPlanEditorOpen(false);
+      showToast(
+        `Plan de ahorro de ${formatMonthLabelES(payload.monthKey)} guardado (no registra aportaciones)`
+      );
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el plan de ahorro mensual.'));
+    } finally {
+      setSavingPlan(false);
+    }
+  };
+
+  const handleDeleteSavingsPlan = async (monthKey: string) => {
+    if (!householdId || !currentUserProfile) return;
+    setSavingPlan(true);
+    try {
+      await repo.deleteSavingsPlan(householdId, monthKey, currentUserProfile);
+      setPlanEditorOpen(false);
+      showToast(`Plan de ahorro de ${formatMonthLabelES(monthKey)} eliminado`);
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo eliminar el plan de ahorro mensual.'));
+    } finally {
+      setSavingPlan(false);
+    }
+  };
+
+  const handleOpenPlanEditorFromHeader = () => {
+    setPlanEditorOpen(true);
+    window.requestAnimationFrame(() => {
+      document.getElementById('savings-plan-section')?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
+      });
+    });
   };
 
   const handleSaveMovement = async (e: React.FormEvent) => {
@@ -183,7 +271,7 @@ export const AhorrosView: React.FC = () => {
           goalId: moveGoal.id,
           amount: signed,
           by: moveBy || currentUserProfile.uid,
-          date: todayISO,
+          date: /^\d{4}-\d{2}-\d{2}$/.test(moveDate) ? moveDate : todayISO,
           note: moveNote.trim(),
         },
         moveGoal.name,
@@ -377,6 +465,22 @@ export const AhorrosView: React.FC = () => {
             />
           </div>
 
+          {moveDate !== todayISO && (
+            <div>
+              <label htmlFor="move-date" className="block text-xs font-medium mb-1">
+                Fecha de la aportación
+              </label>
+              <input
+                id="move-date"
+                type="date"
+                required
+                value={moveDate}
+                onChange={(e) => setMoveDate(e.target.value)}
+                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              />
+            </div>
+          )}
+
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
@@ -456,6 +560,25 @@ export const AhorrosView: React.FC = () => {
           )}
         </section>
 
+        {/* Plan de ahorro mensual (Modo Sencillo) */}
+        <MonthlySavingsPlanSection
+          uiMode="sencillo"
+          planMonthKey={planMonthKey}
+          onChangeMonthKey={setPlanMonthKey}
+          evaluation={planEvaluation}
+          existingPlan={selectedPlan}
+          allPlans={savingsPlans}
+          goals={goals}
+          goalMovements={goalMovements}
+          savingsCapacity={savingsCapacity}
+          editorOpen={planEditorOpen}
+          onSetEditorOpen={setPlanEditorOpen}
+          saving={savingPlan}
+          onSavePlan={handleSaveSavingsPlan}
+          onDeletePlan={handleDeleteSavingsPlan}
+          onContributePending={handleContributePending}
+        />
+
         {/* Suggestions capacity indicator (Modo Sencillo) */}
         {totalMonthlySuggested > 0 && (
           <section
@@ -489,88 +612,140 @@ export const AhorrosView: React.FC = () => {
           </div>
         ) : (
           <div className="space-y-4">
-            {goalsProgress.map(({ goal, savedAmount, pct, remaining, monthlyNeeded, isCompleted }) => (
-              <article
-                key={goal.id}
-                className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <h2 className="font-display text-lg font-bold">{goal.name}</h2>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {isCompleted
-                        ? 'Objetivo conseguido'
-                        : remaining > 0
-                          ? `Faltan ${formatEUR(remaining)}`
-                          : GOAL_TYPE_LABELS[goal.type]}
+            {goalsProgress.map(({ goal, savedAmount, pct, remaining, monthlyNeeded, isCompleted }) => {
+              const planRow = planEvaluation.rowsByGoalId.get(goal.id);
+              const showPlanStrip = Boolean(
+                planRow && (planRow.plannedAmount > 0 || planRow.withdrawnAmount > 0)
+              );
+              return (
+                <article
+                  key={goal.id}
+                  data-testid={`goal-card-${goal.id}`}
+                  className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h2 className="font-display text-lg font-bold">{goal.name}</h2>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        {isCompleted
+                          ? 'Objetivo conseguido'
+                          : remaining > 0
+                            ? `Faltan ${formatEUR(remaining)}`
+                            : GOAL_TYPE_LABELS[goal.type]}
+                      </p>
+                    </div>
+                    <p className="font-display text-xl font-bold tabular-nums text-[#0F1F24] dark:text-[#F0F5F6]">
+                      {formatEUR(savedAmount)}
                     </p>
                   </div>
-                  <p className="font-display text-xl font-bold tabular-nums text-[#0F1F24] dark:text-[#F0F5F6]">
-                    {formatEUR(savedAmount)}
-                  </p>
-                </div>
 
-                <div className="space-y-1.5">
-                  <div className="h-3.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
-                    <div
-                      className="h-full rounded-full transition-all duration-700 ease-out"
-                      style={{
-                        width: `${pct}%`,
-                        backgroundColor: isCompleted ? '#15803D' : goal.color || '#0E5A64',
-                      }}
-                    />
+                  <div className="space-y-1.5">
+                    <div className="h-3.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-700 ease-out"
+                        style={{
+                          width: `${pct}%`,
+                          backgroundColor: isCompleted ? '#15803D' : goal.color || '#0E5A64',
+                        }}
+                      />
+                    </div>
+                    {goal.targetAmount > 0 && (
+                      <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                        Objetivo: {formatEUR(goal.targetAmount)}
+                      </p>
+                    )}
+                    {!isCompleted && monthlyNeeded !== null && (
+                      <p className="text-xs font-medium text-[#0E5A64] dark:text-[#5EEAD4] tabular-nums">
+                        Sugerencia: {formatEUR(monthlyNeeded)}/mes
+                      </p>
+                    )}
                   </div>
-                  {goal.targetAmount > 0 && (
-                    <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                      Objetivo: {formatEUR(goal.targetAmount)}
-                    </p>
-                  )}
-                  {!isCompleted && monthlyNeeded !== null && (
-                    <p className="text-xs font-medium text-[#0E5A64] dark:text-[#5EEAD4] tabular-nums">
-                      Sugerencia: {formatEUR(monthlyNeeded)}/mes
-                    </p>
-                  )}
-                </div>
 
-                <div className="space-y-2 pt-1">
-                  {!isCompleted && monthlyNeeded !== null && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        openMovementModal(
-                          goal,
-                          'add',
-                          String(monthlyNeeded).replace('.', ','),
-                          'Aportación mensual sugerida'
-                        )
-                      }
-                      className="w-full min-h-[46px] px-4 rounded-2xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] border border-[#15803D]/25 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5"
-                    >
-                      <Sparkles className="w-4 h-4" />
-                      <span>Aportar lo sugerido ({formatEUR(monthlyNeeded)})</span>
-                    </button>
+                  {showPlanStrip && planRow && (
+                    <div className="rounded-2xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 px-3.5 py-2.5 space-y-1 text-xs">
+                      <p className="font-semibold text-slate-700 dark:text-slate-200">
+                        Plan de {formatMonthLabelES(planMonthKey)}
+                      </p>
+                      <div className="flex flex-wrap gap-x-3 gap-y-0.5 tabular-nums text-slate-600 dark:text-slate-300">
+                        <span>
+                          Planificado: <strong>{formatEUR(planRow.plannedAmount)}</strong>
+                        </span>
+                        <span>
+                          Aportado:{' '}
+                          <strong className="text-[#15803D] dark:text-[#4ADE80]">
+                            {formatEUR(planRow.contributedAmount)}
+                          </strong>
+                        </span>
+                        <span>
+                          Pendiente de aportar:{' '}
+                          <strong className="text-[#0E5A64] dark:text-[#5EEAD4]">
+                            {formatEUR(planRow.pendingAmount)}
+                          </strong>
+                        </span>
+                      </div>
+                      {planRow.excessAmount > 0 && (
+                        <p className="text-[11px] font-semibold text-[#15803D] dark:text-[#4ADE80] tabular-nums">
+                          Exceso sobre el plan: +{formatEUR(planRow.excessAmount)}
+                        </p>
+                      )}
+                      {planRow.withdrawnAmount > 0 && (
+                        <p className="text-[11px] font-semibold text-[#B42318] dark:text-[#FCA5A5] tabular-nums">
+                          Retirado en el mes (aparte): {formatEUR(planRow.withdrawnAmount)}
+                        </p>
+                      )}
+                    </div>
                   )}
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => openMovementModal(goal, 'add')}
-                      className="min-h-[48px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold flex items-center justify-center gap-2 transition-colors"
-                    >
-                      <ArrowUpCircle className="w-5 h-5" />
-                      <span>Aportar</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => openMovementModal(goal, 'withdraw')}
-                      className="min-h-[48px] px-4 rounded-2xl border border-slate-200 dark:border-slate-700 text-sm font-bold flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
-                    >
-                      <ArrowDownCircle className="w-5 h-5" />
-                      <span>Retirar</span>
-                    </button>
+
+                  <div className="space-y-2 pt-1">
+                    {planRow && planRow.pendingAmount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleContributePending(goal, planRow.pendingAmount)}
+                        className="w-full min-h-[46px] px-4 rounded-2xl bg-[#0E5A64]/12 text-[#0E5A64] dark:text-[#5EEAD4] border border-[#0E5A64]/25 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5"
+                      >
+                        <ArrowUpCircle className="w-4 h-4" />
+                        <span>Aportar pendiente ({formatEUR(planRow.pendingAmount)})</span>
+                      </button>
+                    )}
+                    {!isCompleted && monthlyNeeded !== null && (!planRow || planRow.pendingAmount <= 0) && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          openMovementModal(
+                            goal,
+                            'add',
+                            formatDecimalInputES(monthlyNeeded),
+                            'Aportación mensual sugerida'
+                          )
+                        }
+                        className="w-full min-h-[46px] px-4 rounded-2xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] border border-[#15803D]/25 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        <span>Aportar lo sugerido ({formatEUR(monthlyNeeded)})</span>
+                      </button>
+                    )}
+                    <div className="grid grid-cols-2 gap-3">
+                      <button
+                        type="button"
+                        onClick={() => openMovementModal(goal, 'add')}
+                        className="min-h-[48px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold flex items-center justify-center gap-2 transition-colors"
+                      >
+                        <ArrowUpCircle className="w-5 h-5" />
+                        <span>Aportar</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openMovementModal(goal, 'withdraw')}
+                        className="min-h-[48px] px-4 rounded-2xl border border-slate-200 dark:border-slate-700 text-sm font-bold flex items-center justify-center gap-2 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                      >
+                        <ArrowDownCircle className="w-5 h-5" />
+                        <span>Retirar</span>
+                      </button>
+                    </div>
                   </div>
-                </div>
-              </article>
-            ))}
+                </article>
+              );
+            })}
           </div>
         )}
 
@@ -592,6 +767,14 @@ export const AhorrosView: React.FC = () => {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleOpenPlanEditorFromHeader}
+            className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/35 bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-[#0E5A64]/15 text-xs sm:text-sm font-semibold flex items-center gap-1.5"
+          >
+            <Calendar className="w-4 h-4" />
+            <span>Planificar el ahorro del mes</span>
+          </button>
           <button
             type="button"
             onClick={handleExportCSV}
@@ -761,6 +944,25 @@ export const AhorrosView: React.FC = () => {
         </section>
       )}
 
+      {/* Plan de ahorro mensual (Modo Avanzado) */}
+      <MonthlySavingsPlanSection
+        uiMode="avanzado"
+        planMonthKey={planMonthKey}
+        onChangeMonthKey={setPlanMonthKey}
+        evaluation={planEvaluation}
+        existingPlan={selectedPlan}
+        allPlans={savingsPlans}
+        goals={goals}
+        goalMovements={goalMovements}
+        savingsCapacity={savingsCapacity}
+        editorOpen={planEditorOpen}
+        onSetEditorOpen={setPlanEditorOpen}
+        saving={savingPlan}
+        onSavePlan={handleSaveSavingsPlan}
+        onDeletePlan={handleDeleteSavingsPlan}
+        onContributePending={handleContributePending}
+      />
+
       {/* Goal Cards */}
       {goalsProgress.length === 0 ? (
         <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-8 text-center space-y-2">
@@ -771,115 +973,167 @@ export const AhorrosView: React.FC = () => {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {goalsProgress.map(({ goal, savedAmount, pct, remaining, monthlyNeeded, isCompleted }) => (
-            <article
-              key={goal.id}
-              className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <h3 className="font-display text-lg font-bold flex items-center gap-2">
-                    <span>{goal.name}</span>
-                    {isCompleted && (
-                      <span className="text-xs font-semibold text-[#15803D] dark:text-[#4ADE80]">
-                        · Completada
+          {goalsProgress.map(({ goal, savedAmount, pct, remaining, monthlyNeeded, isCompleted }) => {
+            const planRow = planEvaluation.rowsByGoalId.get(goal.id);
+            const showPlanStrip = Boolean(
+              planRow && (planRow.plannedAmount > 0 || planRow.withdrawnAmount > 0)
+            );
+            return (
+              <article
+                key={goal.id}
+                data-testid={`goal-card-${goal.id}`}
+                className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <h3 className="font-display text-lg font-bold flex items-center gap-2">
+                      <span>{goal.name}</span>
+                      {isCompleted && (
+                        <span className="text-xs font-semibold text-[#15803D] dark:text-[#4ADE80]">
+                          · Completada
+                        </span>
+                      )}
+                    </h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {GOAL_TYPE_LABELS[goal.type]}
+                      {goal.targetDate ? ` · Objetivo ${formatDateES(goal.targetDate)}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      aria-label={`Editar meta ${goal.name}`}
+                      onClick={() => openGoalEditor(goal)}
+                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <Pencil className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Archivar o eliminar meta ${goal.name}`}
+                      onClick={() => setDeleteGoalTarget(goal)}
+                      className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-baseline justify-between">
+                    <span className="font-display text-2xl font-bold tabular-nums">
+                      {formatEUR(savedAmount)}
+                    </span>
+                    <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                      de {formatEUR(goal.targetAmount)} ({formatPctES(pct)})
+                    </span>
+                  </div>
+                  <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-700 ease-out"
+                      style={{
+                        width: `${pct}%`,
+                        backgroundColor: isCompleted ? '#15803D' : goal.color || '#0E5A64',
+                      }}
+                    />
+                  </div>
+                  {remaining > 0 ? (
+                    <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
+                      Faltan {formatEUR(remaining)}
+                      {monthlyNeeded !== null ? ` → Sugerido: ${formatEUR(monthlyNeeded)}/mes` : ''}
+                    </p>
+                  ) : (
+                    <p className="text-xs font-semibold text-[#15803D] dark:text-[#4ADE80]">
+                      Objetivo alcanzado
+                    </p>
+                  )}
+                </div>
+
+                {showPlanStrip && planRow && (
+                  <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 px-3 py-2 space-y-1 text-xs">
+                    <p className="font-semibold text-slate-700 dark:text-slate-200">
+                      Plan de {formatMonthLabelES(planMonthKey)}
+                    </p>
+                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 tabular-nums text-slate-600 dark:text-slate-300">
+                      <span>
+                        Planificado: <strong>{formatEUR(planRow.plannedAmount)}</strong>
                       </span>
+                      <span>
+                        Aportado:{' '}
+                        <strong className="text-[#15803D] dark:text-[#4ADE80]">
+                          {formatEUR(planRow.contributedAmount)}
+                        </strong>
+                      </span>
+                      <span>
+                        Pendiente de aportar:{' '}
+                        <strong className="text-[#0E5A64] dark:text-[#5EEAD4]">
+                          {formatEUR(planRow.pendingAmount)}
+                        </strong>
+                      </span>
+                    </div>
+                    {planRow.excessAmount > 0 && (
+                      <p className="text-[11px] font-semibold text-[#15803D] dark:text-[#4ADE80] tabular-nums">
+                        Exceso sobre el plan: +{formatEUR(planRow.excessAmount)}
+                      </p>
                     )}
-                  </h3>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    {GOAL_TYPE_LABELS[goal.type]}
-                    {goal.targetDate ? ` · Objetivo ${formatDateES(goal.targetDate)}` : ''}
-                  </p>
-                </div>
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    aria-label={`Editar meta ${goal.name}`}
-                    onClick={() => openGoalEditor(goal)}
-                    className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
-                  >
-                    <Pencil className="w-4 h-4" />
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Archivar o eliminar meta ${goal.name}`}
-                    onClick={() => setDeleteGoalTarget(goal)}
-                    className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-400 hover:text-[#B42318] dark:hover:text-[#FCA5A5]"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex items-baseline justify-between">
-                  <span className="font-display text-2xl font-bold tabular-nums">
-                    {formatEUR(savedAmount)}
-                  </span>
-                  <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                    de {formatEUR(goal.targetAmount)} ({formatPctES(pct)})
-                  </span>
-                </div>
-                <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
-                  <div
-                    className="h-full rounded-full transition-all duration-700 ease-out"
-                    style={{
-                      width: `${pct}%`,
-                      backgroundColor: isCompleted ? '#15803D' : goal.color || '#0E5A64',
-                    }}
-                  />
-                </div>
-                {remaining > 0 ? (
-                  <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
-                    Faltan {formatEUR(remaining)}
-                    {monthlyNeeded !== null ? ` → Sugerido: ${formatEUR(monthlyNeeded)}/mes` : ''}
-                  </p>
-                ) : (
-                  <p className="text-xs font-semibold text-[#15803D] dark:text-[#4ADE80]">
-                    Objetivo alcanzado
-                  </p>
+                    {planRow.withdrawnAmount > 0 && (
+                      <p className="text-[11px] font-semibold text-[#B42318] dark:text-[#FCA5A5] tabular-nums">
+                        Retirado en el mes (aparte): {formatEUR(planRow.withdrawnAmount)}
+                      </p>
+                    )}
+                  </div>
                 )}
-              </div>
 
-              <div className="space-y-2 pt-1">
-                {!isCompleted && monthlyNeeded !== null && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      openMovementModal(
-                        goal,
-                        'add',
-                        String(monthlyNeeded).replace('.', ','),
-                        'Aportación mensual sugerida'
-                      )
-                    }
-                    className="w-full min-h-[44px] px-3 rounded-xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] border border-[#15803D]/25 text-xs font-bold flex items-center justify-center gap-1.5 hover:bg-[#15803D]/18"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Aportar lo sugerido ({formatEUR(monthlyNeeded)})</span>
-                  </button>
-                )}
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => openMovementModal(goal, 'add')}
-                    className="min-h-[44px] px-3 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5"
-                  >
-                    <ArrowUpCircle className="w-4 h-4" />
-                    <span>Aportar</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => openMovementModal(goal, 'withdraw')}
-                    className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
-                  >
-                    <ArrowDownCircle className="w-4 h-4" />
-                    <span>Retirar</span>
-                  </button>
+                <div className="space-y-2 pt-1">
+                  {planRow && planRow.pendingAmount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => handleContributePending(goal, planRow.pendingAmount)}
+                      className="w-full min-h-[44px] px-3 rounded-xl bg-[#0E5A64]/12 text-[#0E5A64] dark:text-[#5EEAD4] border border-[#0E5A64]/25 text-xs font-bold flex items-center justify-center gap-1.5 hover:bg-[#0E5A64]/18"
+                    >
+                      <ArrowUpCircle className="w-3.5 h-3.5" />
+                      <span>Aportar pendiente ({formatEUR(planRow.pendingAmount)})</span>
+                    </button>
+                  )}
+                  {!isCompleted && monthlyNeeded !== null && (!planRow || planRow.pendingAmount <= 0) && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openMovementModal(
+                          goal,
+                          'add',
+                          formatDecimalInputES(monthlyNeeded),
+                          'Aportación mensual sugerida'
+                        )
+                      }
+                      className="w-full min-h-[44px] px-3 rounded-xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] border border-[#15803D]/25 text-xs font-bold flex items-center justify-center gap-1.5 hover:bg-[#15803D]/18"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Aportar lo sugerido ({formatEUR(monthlyNeeded)})</span>
+                    </button>
+                  )}
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => openMovementModal(goal, 'add')}
+                      className="min-h-[44px] px-3 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5"
+                    >
+                      <ArrowUpCircle className="w-4 h-4" />
+                      <span>Aportar</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openMovementModal(goal, 'withdraw')}
+                      className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+                    >
+                      <ArrowDownCircle className="w-4 h-4" />
+                      <span>Retirar</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </article>
-          ))}
+              </article>
+            );
+          })}
         </div>
       )}
 

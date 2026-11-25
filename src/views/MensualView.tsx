@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  BarChart3,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -19,6 +20,7 @@ import { BankCsvImportModal } from '../components/BankCsvImportModal';
 import { CategoryTag } from '../components/CategoryTag';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { QuickExpenseModal } from '../components/QuickExpenseModal';
+import { AnnualBalanceSection } from '../components/mensual/AnnualBalanceSection';
 import {
   BudgetProgressCard,
   CategoryComparisonSection,
@@ -27,8 +29,10 @@ import { BudgetEditorModal } from '../components/mensual/BudgetEditorModal';
 import { CategoryColorModal } from '../components/mensual/CategoryColorModal';
 import { CommonAccountRadarCard } from '../components/mensual/CommonAccountRadarCard';
 import { GlobalSearchSection } from '../components/mensual/GlobalSearchSection';
+import { GuidedMonthCloseModal } from '../components/mensual/GuidedMonthCloseModal';
 import { HabitualCatalogModal } from '../components/mensual/HabitualCatalogModal';
 import { MonthlyCalendarSection } from '../components/mensual/MonthlyCalendarSection';
+import { MonthlySummaryCard } from '../components/mensual/MonthlySummaryCard';
 import { RecurringIcsModal } from '../components/mensual/RecurringIcsModal';
 import { RecurringTemplateModal } from '../components/mensual/RecurringTemplateModal';
 import { RecurringTemplatesSection } from '../components/mensual/RecurringTemplatesSection';
@@ -54,10 +58,18 @@ import {
   shiftMonthKey,
 } from '../domain/finance';
 import {
+  annualBalanceSessionCache,
+  computeAnnualBalance,
+  extractAvailableYears,
+  type ScopedAnnualBalanceEntry,
+} from '../domain/annualBalance';
+import {
   filterGlobalExpenses,
   globalSearchSessionCache,
   type GlobalSearchOrigin,
 } from '../domain/globalSearch';
+import { computeCommonAccountRadar } from '../domain/commonAccountRadar';
+import { computeMonthlyPlanSummary } from '../domain/monthlyPlanning';
 import type { RecurringCatalogPreset } from '../domain/presets';
 import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
@@ -128,6 +140,14 @@ export const MensualView: React.FC = () => {
   const [globalLimit, setGlobalLimit] = useState(40);
   const historyLoadSeqRef = useRef(0);
 
+  // Balance anual bajo demanda (sin listener desde Inicio; caché aislada por householdId + viewerUid)
+  const [annualBalanceOpen, setAnnualBalanceOpen] = useState(false);
+  const [annualYear, setAnnualYear] = useState<number>(() => Number(getTodayLocalISO().slice(0, 4)));
+  const [annualData, setAnnualData] = useState<ScopedAnnualBalanceEntry | null>(null);
+  const [annualLoading, setAnnualLoading] = useState(false);
+  const [annualError, setAnnualError] = useState<string | null>(null);
+  const annualLoadSeqRef = useRef(0);
+
   const [selectedTxIds, setSelectedTxIds] = useState<Set<string>>(new Set());
   const [confirmBulkDeleteTx, setConfirmBulkDeleteTx] = useState(false);
 
@@ -144,6 +164,7 @@ export const MensualView: React.FC = () => {
   const [pdfExportError, setPdfExportError] = useState<string | null>(null);
 
   const plantillasSectionRef = useRef<HTMLElement | null>(null);
+  const transactionsSectionRef = useRef<HTMLDivElement | null>(null);
 
   // Confirm dialogs
   const [deleteTarget, setDeleteTarget] = useState<
@@ -151,7 +172,7 @@ export const MensualView: React.FC = () => {
     | { kind: 'rec'; item: RecurringExpense }
     | null
   >(null);
-  const [confirmCloseMonth, setConfirmCloseMonth] = useState(false);
+  const [guidedCloseOpen, setGuidedCloseOpen] = useState(false);
 
   const closure = monthClosures.find((c) => c.monthKey === selectedMonthKey) ?? null;
   const isClosed = Boolean(closure);
@@ -170,8 +191,13 @@ export const MensualView: React.FC = () => {
     setSelectedTxIds(new Set());
   }, [selectedMonthKey, isClosed]);
 
-  // Focus plantillas section when navigated from Modo Sencillo CTA
+  // Focus plantillas section or guided close modal when navigated from Inicio CTA
   useEffect(() => {
+    if (focusMensualSection === 'cierre_guiado') {
+      setGuidedCloseOpen(true);
+      clearFocusMensualSection();
+      return;
+    }
     if (uiMode !== 'avanzado' || focusMensualSection !== 'plantillas') return;
     const prefersReduced =
       typeof window !== 'undefined' &&
@@ -208,6 +234,105 @@ export const MensualView: React.FC = () => {
     [monthTransactions, budget]
   );
 
+  const plannedCommonCategories = useMemo(
+    () => household?.commonAccountPlannedCategories ?? [],
+    [household?.commonAccountPlannedCategories]
+  );
+
+  const manualCommonBalance = household?.commonAccountManualBalance ?? null;
+
+  const monthlyPlanSummary = useMemo(
+    () =>
+      computeMonthlyPlanSummary({
+        monthKey: selectedMonthKey,
+        transactions: monthTransactions,
+        recurring,
+        budget,
+        categoryRegistry,
+      }),
+    [selectedMonthKey, monthTransactions, recurring, budget, categoryRegistry]
+  );
+
+  const commonMonthlySummary = useMemo(
+    () =>
+      computeCommonAccountRadar(
+        selectedMonthKey,
+        monthTransactions,
+        recurring,
+        effectiveSplitPctA,
+        {
+          manualBalance: manualCommonBalance,
+          budget,
+          plannedCommonCategoryIds: plannedCommonCategories,
+          categoryRegistry,
+        }
+      ),
+    [
+      selectedMonthKey,
+      monthTransactions,
+      recurring,
+      effectiveSplitPctA,
+      manualCommonBalance,
+      budget,
+      plannedCommonCategories,
+      categoryRegistry,
+    ]
+  );
+
+  const scrollToTemplatesSection = () => {
+    const prefersReduced =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    plantillasSectionRef.current?.scrollIntoView({
+      behavior: prefersReduced ? 'auto' : 'smooth',
+      block: 'start',
+    });
+  };
+
+  const handleSavePlannedCommonCategories = async (categoryIds: string[]) => {
+    if (!householdId) return;
+    if (isClosed) {
+      showToast('Este mes está cerrado y no se puede cambiar la planificación.');
+      return;
+    }
+    try {
+      await repo.updateCommonAccountPlannedCategories(householdId, categoryIds);
+      showToast('Planificación de Cuenta común guardada');
+    } catch (err) {
+      const msg = toUserFriendlyErrorMessage(
+        err,
+        'No se pudieron guardar las categorías de Cuenta común.'
+      );
+      showToast(msg);
+      throw new Error(msg);
+    }
+  };
+
+  const handleSaveManualCommonBalance = async (
+    nextBalance: { amount: number; referenceDate: string } | null
+  ) => {
+    if (!householdId || !currentUserProfile) return;
+    if (isClosed) {
+      showToast('Este mes está cerrado y no se puede cambiar la planificación.');
+      return;
+    }
+    try {
+      await repo.updateCommonAccountManualBalance(householdId, nextBalance, currentUserProfile);
+      showToast(
+        nextBalance === null
+          ? 'Saldo disponible de Cuenta común eliminado'
+          : 'Saldo disponible de Cuenta común actualizado'
+      );
+    } catch (err) {
+      const msg = toUserFriendlyErrorMessage(
+        err,
+        'No se pudo actualizar el saldo de Cuenta común.'
+      );
+      showToast(msg);
+      throw new Error(msg);
+    }
+  };
+
   const activeFixedByCategory = useMemo(() => {
     const map: Partial<Record<ExpenseCategory, number>> = {};
     for (const rec of recurring) {
@@ -226,6 +351,7 @@ export const MensualView: React.FC = () => {
   // Reset local view state when household or viewer user changes (strict scope isolation)
   useEffect(() => {
     historyLoadSeqRef.current += 1;
+    annualLoadSeqRef.current += 1;
     const scoped =
       householdId && currentUserProfile?.uid
         ? globalSearchSessionCache.get(householdId, currentUserProfile.uid)
@@ -234,17 +360,127 @@ export const MensualView: React.FC = () => {
     setCachedInitialCosts(scoped ? scoped.initialCosts : null);
     setHistoryError(null);
     setHistoryLoading(false);
+
+    const scopedAnnual =
+      householdId && currentUserProfile?.uid
+        ? annualBalanceSessionCache.get(householdId, currentUserProfile.uid)
+        : null;
+    setAnnualData(scopedAnnual);
+    setAnnualError(null);
+    setAnnualLoading(false);
+    setAnnualBalanceOpen(false);
   }, [householdId, currentUserProfile?.uid]);
 
   const invalidateScopedHistoryCache = () => {
     if (householdId && currentUserProfile?.uid) {
       globalSearchSessionCache.invalidateScope(householdId, currentUserProfile.uid);
+      annualBalanceSessionCache.invalidateScope(householdId, currentUserProfile.uid);
     } else if (householdId) {
       globalSearchSessionCache.invalidateHousehold(householdId);
+      annualBalanceSessionCache.invalidateHousehold(householdId);
     }
     setCachedHistory(null);
     setCachedInitialCosts(null);
+    setAnnualData(null);
   };
+
+  const loadAnnualBalanceOnDemand = async (force = false) => {
+    if (!householdId || !currentUserProfile) return;
+    const scopeHouseholdId = householdId;
+    const scopeUid = currentUserProfile.uid;
+
+    if (!force) {
+      const existing = annualBalanceSessionCache.get(scopeHouseholdId, scopeUid);
+      if (existing) {
+        setAnnualData(existing);
+        setAnnualError(null);
+        return;
+      }
+    }
+
+    const requestSeq = ++annualLoadSeqRef.current;
+    setAnnualLoading(true);
+    setAnnualError(null);
+    try {
+      const raw = await repo.fetchAnnualBalanceData(scopeHouseholdId);
+      if (requestSeq !== annualLoadSeqRef.current) return;
+      const entry: ScopedAnnualBalanceEntry = {
+        sharedTransactions: raw.sharedTransactions,
+        systemBudgets: raw.systemBudgets,
+        categoryBudgets: raw.categoryBudgets,
+        loadedAt: Date.now(),
+      };
+      annualBalanceSessionCache.set(scopeHouseholdId, scopeUid, entry);
+      setAnnualData(entry);
+    } catch (err) {
+      if (requestSeq !== annualLoadSeqRef.current) return;
+      setAnnualError(
+        toUserFriendlyErrorMessage(
+          err,
+          'No se pudieron cargar los datos para el balance anual.'
+        )
+      );
+    } finally {
+      if (requestSeq === annualLoadSeqRef.current) {
+        setAnnualLoading(false);
+      }
+    }
+  };
+
+  const openAnnualBalanceView = () => {
+    setAnnualYear(Number(getTodayLocalISO().slice(0, 4)));
+    setAnnualBalanceOpen(true);
+    void loadAnnualBalanceOnDemand(false);
+  };
+
+  const handleJumpToMonthFromAnnual = (monthKey: string) => {
+    setSelectedMonthKey(monthKey);
+    setCategoryFilter('todas');
+    setAnnualBalanceOpen(false);
+  };
+
+  const handleJumpToCategoryFromAnnual = (monthKey: string, categoryId: string) => {
+    setSelectedMonthKey(monthKey);
+    setCategoryFilter(categoryId);
+    setAnnualBalanceOpen(false);
+    if (uiMode === 'avanzado') {
+      const prefersReduced =
+        typeof window !== 'undefined' &&
+        window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      window.setTimeout(() => {
+        transactionsSectionRef.current?.scrollIntoView({
+          behavior: prefersReduced ? 'auto' : 'smooth',
+          block: 'start',
+        });
+      }, 60);
+    }
+  };
+
+  const annualAvailableYears = useMemo(() => {
+    if (!annualData) return [annualYear];
+    return extractAvailableYears({
+      sharedTransactions: annualData.sharedTransactions,
+      monthClosures,
+      systemBudgets: annualData.systemBudgets,
+      categoryBudgets: annualData.categoryBudgets,
+      todayISO: getTodayLocalISO(),
+      selectedYear: annualYear,
+    });
+  }, [annualData, monthClosures, annualYear]);
+
+  const annualBalanceResult = useMemo(() => {
+    if (!annualBalanceOpen || !annualData) return null;
+    return computeAnnualBalance({
+      year: annualYear,
+      sharedTransactions: annualData.sharedTransactions,
+      systemBudgets: annualData.systemBudgets,
+      categoryBudgets: annualData.categoryBudgets,
+      monthClosures,
+      recurring,
+      categoryRegistry,
+      todayISO: getTodayLocalISO(),
+    });
+  }, [annualBalanceOpen, annualData, annualYear, monthClosures, recurring, categoryRegistry]);
 
   const loadHistoryOnDemand = async (force = false) => {
     if (!householdId || !currentUserProfile) return;
@@ -482,6 +718,10 @@ export const MensualView: React.FC = () => {
         effectiveSplitPctA,
         currentUserProfile
       );
+      if (count > 0) {
+        invalidateScopedHistoryCache();
+        if (globalSearchOpen) void loadHistoryOnDemand(true);
+      }
       showToast(
         count > 0
           ? `Generados ${count} gastos desde plantillas`
@@ -525,6 +765,8 @@ export const MensualView: React.FC = () => {
         },
         currentUserProfile
       );
+      invalidateScopedHistoryCache();
+      if (globalSearchOpen) void loadHistoryOnDemand(true);
       showToast('Liquidación registrada');
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo registrar la liquidación.'));
@@ -533,7 +775,6 @@ export const MensualView: React.FC = () => {
 
   const handleCloseMonth = async () => {
     if (!householdId || !currentUserProfile) return;
-    setConfirmCloseMonth(false);
     try {
       await repo.closeMonth(
         householdId,
@@ -592,6 +833,7 @@ export const MensualView: React.FC = () => {
     }
     if (!isClosed && budgetChanged) {
       await repo.saveBudget(householdId, selectedMonthKey, nextLimits, currentUserProfile);
+      invalidateScopedHistoryCache();
     }
     setHabitualModalOpen(false);
     if (addedCount > 0 && budgetChanged) {
@@ -620,6 +862,7 @@ export const MensualView: React.FC = () => {
       customCategories.map((c) => c.id),
       currentUserProfile
     );
+    invalidateScopedHistoryCache();
     setBudgetModalOpen(false);
     showToast('Presupuesto mensual actualizado');
   };
@@ -712,6 +955,49 @@ export const MensualView: React.FC = () => {
     }
   };
 
+  // ─── VISTA DE BALANCE ANUAL (SENCILLO REDUCIDO Y AVANZADO COMPLETO) ─────────
+  if (annualBalanceOpen) {
+    return (
+      <>
+        <AnnualBalanceSection
+          uiMode={uiMode}
+          selectedYear={annualYear}
+          availableYears={annualAvailableYears}
+          balance={annualBalanceResult}
+          loading={annualLoading}
+          error={annualError}
+          lastLoadedAt={annualData?.loadedAt ?? null}
+          memberLabel={memberLabel}
+          onSelectYear={setAnnualYear}
+          onRefresh={() => void loadAnnualBalanceOnDemand(true)}
+          onBackToMonth={() => setAnnualBalanceOpen(false)}
+          onJumpToMonth={handleJumpToMonthFromAnnual}
+          onJumpToCategory={handleJumpToCategoryFromAnnual}
+          onConfigureRecurring={
+            uiMode === 'avanzado' ? (rec) => openRecModal(rec, false) : undefined
+          }
+        />
+
+        {uiMode === 'avanzado' && (
+          <RecurringTemplateModal
+            open={recModalOpen}
+            editingRec={editingRec}
+            activateOnOpen={recActivateOnOpen}
+            selectedMonthKey={selectedMonthKey}
+            transactions={comparisonSourceTransactions}
+            memberA={memberA}
+            memberB={memberB}
+            viewerIsMemberA={viewerIsMemberA}
+            effectiveSplitPctA={effectiveSplitPctA}
+            onSave={handleSaveRecurringPayload}
+            onDeleteRequest={(rec) => setDeleteTarget({ kind: 'rec', item: rec })}
+            onClose={() => setRecModalOpen(false)}
+          />
+        )}
+      </>
+    );
+  }
+
   // ─── MODO SENCILLO ──────────────────────────────────────────────────────────
   if (uiMode === 'sencillo') {
     const simpleList = monthTransactions.filter((t) => !t.isSettlement);
@@ -740,45 +1026,77 @@ export const MensualView: React.FC = () => {
           </button>
         </div>
 
-        {isClosed && (
-          <div className="rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex items-center gap-2.5 text-sm">
-            <Lock className="w-4 h-4 text-slate-500 shrink-0" />
-            <span>Este mes ya está cerrado y no se puede cambiar.</span>
+        {isClosed ? (
+          <div className="rounded-2xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex flex-wrap items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <Lock className="w-4 h-4 text-slate-500 shrink-0" />
+              <span>Este mes ya está cerrado y no se puede cambiar.</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={openAnnualBalanceView}
+                className="min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                <BarChart3 className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                <span>Balance anual</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setGuidedCloseOpen(true)}
+                className="min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                Ver resumen de cierre
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={openAnnualBalanceView}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              <BarChart3 className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+              <span>Balance anual</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setGuidedCloseOpen(true)}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              <Lock className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+              <span>Cerrar mes</span>
+            </button>
           </div>
         )}
 
-        <section className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-2">
-          <p className="text-sm text-slate-600 dark:text-slate-300">
-            Total gastado:{' '}
-            <strong className="font-display text-lg text-[#0F1F24] dark:text-[#F0F5F6] tabular-nums">
-              {formatEUR(balance.totalSpent)}
-            </strong>
-          </p>
-          <p
-            className={`font-display text-xl font-bold ${
-              balance.owesDirection === 'peace'
-                ? 'text-[#15803D] dark:text-[#4ADE80]'
-                : 'text-[#0E5A64] dark:text-[#5EEAD4]'
-            }`}
-          >
-            {secondPersonBalanceText}
-          </p>
-          {personalMonthTotal > 0 && (
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Además llevas {formatEUR(personalMonthTotal)} en gastos personales (solo visibles para ti).
-            </p>
-          )}
-        </section>
+        <MonthlySummaryCard
+          summary={monthlyPlanSummary}
+          uiMode="sencillo"
+          isClosed={isClosed}
+          secondPersonBalanceText={secondPersonBalanceText}
+          isPeaceBalance={balance.owesDirection === 'peace'}
+          personalMonthTotal={personalMonthTotal}
+          commonAccountMonthlyNeed={commonMonthlySummary.totalMonthlyNeed}
+        />
 
         <CommonAccountRadarCard
           monthKey={selectedMonthKey}
           transactions={monthTransactions}
           recurring={recurring}
+          budget={budget}
           uiMode="sencillo"
+          isClosed={isClosed}
           effectiveSplitPctA={effectiveSplitPctA}
           shortNameA={shortNameA}
           shortNameB={shortNameB}
           hasPartner={Boolean(memberB)}
+          plannedCategoryIds={plannedCommonCategories}
+          manualBalance={manualCommonBalance}
+          memberLabel={memberLabel}
+          onSavePlannedCategories={handleSavePlannedCommonCategories}
+          onSaveManualBalance={handleSaveManualCommonBalance}
         />
 
         <MonthlyCalendarSection
@@ -880,6 +1198,30 @@ export const MensualView: React.FC = () => {
           prefill={txPrefill}
         />
 
+        <GuidedMonthCloseModal
+          open={guidedCloseOpen}
+          onClose={() => setGuidedCloseOpen(false)}
+          uiMode="sencillo"
+          selectedMonthKey={selectedMonthKey}
+          isClosed={isClosed}
+          closure={closure ?? undefined}
+          monthlyPlanSummary={monthlyPlanSummary}
+          monthTransactions={monthTransactions}
+          recentTransactions={recentTransactions}
+          recurring={recurring}
+          budget={budget}
+          customCategories={customCategories}
+          balance={balance}
+          secondPersonBalanceText={secondPersonBalanceText}
+          memberA={memberA}
+          memberB={memberB}
+          effectiveSplitPctA={effectiveSplitPctA}
+          closedMonthKeys={closedMonthKeys}
+          onRegisterSettlement={handleRegisterSettlement}
+          onCloseMonth={handleCloseMonth}
+          onAfterTransactionCreated={invalidateScopedHistoryCache}
+        />
+
         <ConfirmDialog
           open={Boolean(deleteTarget)}
           title="Eliminar gasto"
@@ -927,6 +1269,14 @@ export const MensualView: React.FC = () => {
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            onClick={openAnnualBalanceView}
+            className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/40 dark:border-[#5EEAD4]/40 bg-[#0E5A64]/5 dark:bg-[#5EEAD4]/10 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-semibold flex items-center gap-1.5 hover:bg-[#0E5A64]/10 dark:hover:bg-[#5EEAD4]/15 transition-colors"
+          >
+            <BarChart3 className="w-4 h-4" />
+            <span>Balance anual</span>
+          </button>
+          <button
+            type="button"
             onClick={() => {
               const next = !globalSearchOpen;
               setGlobalSearchOpen(next);
@@ -969,29 +1319,39 @@ export const MensualView: React.FC = () => {
           {!isClosed ? (
             <button
               type="button"
-              onClick={() => setConfirmCloseMonth(true)}
+              onClick={() => setGuidedCloseOpen(true)}
               className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
             >
               <Lock className="w-4 h-4" />
               <span>Cerrar mes</span>
             </button>
           ) : (
-            <button
-              type="button"
-              onClick={async () => {
-                if (!householdId || !currentUserProfile) return;
-                try {
-                  await repo.reopenMonth(householdId, selectedMonthKey, currentUserProfile);
-                  showToast(`Mes ${selectedMonthKey} desbloqueado`);
-                } catch (err) {
-                  showToast(toUserFriendlyErrorMessage(err, 'No se pudo desbloquear el mes.'));
-                }
-              }}
-              className="min-h-[44px] px-3.5 rounded-xl bg-amber-500/15 text-amber-800 dark:text-amber-300 text-xs font-semibold flex items-center gap-1.5"
-            >
-              <Unlock className="w-4 h-4" />
-              <span>Desbloquear mes</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => setGuidedCloseOpen(true)}
+                className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                <Lock className="w-4 h-4 text-slate-500" />
+                <span>Ver resumen de cierre</span>
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!householdId || !currentUserProfile) return;
+                  try {
+                    await repo.reopenMonth(householdId, selectedMonthKey, currentUserProfile);
+                    showToast(`Mes ${selectedMonthKey} desbloqueado`);
+                  } catch (err) {
+                    showToast(toUserFriendlyErrorMessage(err, 'No se pudo desbloquear el mes.'));
+                  }
+                }}
+                className="min-h-[44px] px-3.5 rounded-xl bg-amber-500/15 text-amber-800 dark:text-amber-300 text-xs font-semibold flex items-center gap-1.5"
+              >
+                <Unlock className="w-4 h-4" />
+                <span>Desbloquear mes</span>
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -1171,15 +1531,32 @@ export const MensualView: React.FC = () => {
         )}
       </section>
 
+      <MonthlySummaryCard
+        summary={monthlyPlanSummary}
+        uiMode="avanzado"
+        isClosed={isClosed}
+        onOpenBudgetEditor={() => setBudgetModalOpen(true)}
+        onScrollToTemplates={scrollToTemplatesSection}
+      />
+
       <CommonAccountRadarCard
         monthKey={selectedMonthKey}
         transactions={monthTransactions}
         recurring={recurring}
+        budget={budget}
         uiMode="avanzado"
+        isClosed={isClosed}
         effectiveSplitPctA={effectiveSplitPctA}
         shortNameA={shortNameA}
         shortNameB={shortNameB}
         hasPartner={Boolean(memberB)}
+        plannedCategoryIds={plannedCommonCategories}
+        manualBalance={manualCommonBalance}
+        memberLabel={memberLabel}
+        onSavePlannedCategories={handleSavePlannedCommonCategories}
+        onSaveManualBalance={handleSaveManualCommonBalance}
+        onOpenBudgetEditor={() => setBudgetModalOpen(true)}
+        onScrollToTemplates={scrollToTemplatesSection}
       />
 
       <MonthlyCalendarSection
@@ -1203,47 +1580,49 @@ export const MensualView: React.FC = () => {
         onOpenColorModal={() => setColorModalOpen(true)}
       />
 
-      <TransactionsTableSection
-        selectedMonthKey={selectedMonthKey}
-        monthTransactionsCount={monthTransactions.length}
-        filteredTransactions={filteredAndSortedTransactions}
-        isClosed={isClosed}
-        txSearch={txSearch}
-        categoryFilter={categoryFilter}
-        payerFilter={payerFilter}
-        selectedTxIds={selectedTxIds}
-        memberA={memberA}
-        memberB={memberB}
-        effectiveSplitPctA={effectiveSplitPctA}
-        memberLabel={memberLabel}
-        onTxSearchChange={setTxSearch}
-        onCategoryFilterChange={setCategoryFilter}
-        onPayerFilterChange={setPayerFilter}
-        onSortClick={handleSortClick}
-        onToggleSelectAll={(checked) => {
-          if (checked) {
-            setSelectedTxIds(new Set(filteredAndSortedTransactions.map((t) => t.id)));
-          } else {
-            setSelectedTxIds(new Set());
-          }
-        }}
-        onToggleSelectOne={(id, checked) => {
-          setSelectedTxIds((prev) => {
-            const next = new Set(prev);
-            if (checked) next.add(id);
-            else next.delete(id);
-            return next;
-          });
-        }}
-        onBulkDeleteRequest={() => setConfirmBulkDeleteTx(true)}
-        onSaveInlineEdit={handleSaveInlineEdit}
-        onOpenEditModal={(tx) => {
-          setTxPrefill(null);
-          setEditingTx(tx);
-          setTxModalOpen(true);
-        }}
-        onDeleteRequest={(tx) => setDeleteTarget({ kind: 'tx', item: tx })}
-      />
+      <div ref={transactionsSectionRef}>
+        <TransactionsTableSection
+          selectedMonthKey={selectedMonthKey}
+          monthTransactionsCount={monthTransactions.length}
+          filteredTransactions={filteredAndSortedTransactions}
+          isClosed={isClosed}
+          txSearch={txSearch}
+          categoryFilter={categoryFilter}
+          payerFilter={payerFilter}
+          selectedTxIds={selectedTxIds}
+          memberA={memberA}
+          memberB={memberB}
+          effectiveSplitPctA={effectiveSplitPctA}
+          memberLabel={memberLabel}
+          onTxSearchChange={setTxSearch}
+          onCategoryFilterChange={setCategoryFilter}
+          onPayerFilterChange={setPayerFilter}
+          onSortClick={handleSortClick}
+          onToggleSelectAll={(checked) => {
+            if (checked) {
+              setSelectedTxIds(new Set(filteredAndSortedTransactions.map((t) => t.id)));
+            } else {
+              setSelectedTxIds(new Set());
+            }
+          }}
+          onToggleSelectOne={(id, checked) => {
+            setSelectedTxIds((prev) => {
+              const next = new Set(prev);
+              if (checked) next.add(id);
+              else next.delete(id);
+              return next;
+            });
+          }}
+          onBulkDeleteRequest={() => setConfirmBulkDeleteTx(true)}
+          onSaveInlineEdit={handleSaveInlineEdit}
+          onOpenEditModal={(tx) => {
+            setTxPrefill(null);
+            setEditingTx(tx);
+            setTxModalOpen(true);
+          }}
+          onDeleteRequest={(tx) => setDeleteTarget({ kind: 'tx', item: tx })}
+        />
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <BudgetProgressCard
@@ -1362,14 +1741,28 @@ export const MensualView: React.FC = () => {
         onCancel={() => setConfirmBulkDeleteTx(false)}
       />
 
-      <ConfirmDialog
-        open={confirmCloseMonth}
-        title={`Cerrar ${formatMonthLabelES(selectedMonthKey)}`}
-        description={`Se guardará una foto del saldo (${balance.summaryText}) y se bloqueará la edición de gastos de este mes hasta que lo desbloquees en Modo Avanzado.`}
-        confirmLabel="Cerrar mes"
-        destructive={false}
-        onConfirm={() => void handleCloseMonth()}
-        onCancel={() => setConfirmCloseMonth(false)}
+      <GuidedMonthCloseModal
+        open={guidedCloseOpen}
+        onClose={() => setGuidedCloseOpen(false)}
+        uiMode="avanzado"
+        selectedMonthKey={selectedMonthKey}
+        isClosed={isClosed}
+        closure={closure ?? undefined}
+        monthlyPlanSummary={monthlyPlanSummary}
+        monthTransactions={monthTransactions}
+        recentTransactions={recentTransactions}
+        recurring={recurring}
+        budget={budget}
+        customCategories={customCategories}
+        balance={balance}
+        secondPersonBalanceText={secondPersonBalanceText}
+        memberA={memberA}
+        memberB={memberB}
+        effectiveSplitPctA={effectiveSplitPctA}
+        closedMonthKeys={closedMonthKeys}
+        onRegisterSettlement={handleRegisterSettlement}
+        onCloseMonth={handleCloseMonth}
+        onAfterTransactionCreated={invalidateScopedHistoryCache}
       />
     </div>
   );

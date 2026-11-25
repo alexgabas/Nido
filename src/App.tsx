@@ -11,12 +11,14 @@ import {
   isLikelyStaleChunkError,
   recordSafeChunkReloadAttempt,
 } from './services/pwaUpdateGuard';
+import { resolveTabForUiMode } from './domain/mudanzaStage';
 import type { NavTab } from './types/nido';
 import { InicioView } from './views/InicioView';
 
 type LazyViewTab = Exclude<NavTab, 'inicio'>;
 
 const VIEW_EXPORT_NAMES: Record<LazyViewTab, string> = {
+  compra: 'CompraView',
   mudanza: 'MudanzaView',
   mensual: 'MensualView',
   ahorros: 'AhorrosView',
@@ -25,6 +27,7 @@ const VIEW_EXPORT_NAMES: Record<LazyViewTab, string> = {
 };
 
 const VIEW_IMPORTERS: Record<LazyViewTab, () => Promise<{ default: React.ComponentType }>> = {
+  compra: () => import('./views/CompraView').then((m) => ({ default: m.CompraView })),
   mudanza: () => import('./views/MudanzaView').then((m) => ({ default: m.MudanzaView })),
   mensual: () => import('./views/MensualView').then((m) => ({ default: m.MensualView })),
   ahorros: () => import('./views/AhorrosView').then((m) => ({ default: m.AhorrosView })),
@@ -211,7 +214,7 @@ const NidoRouter: React.FC = () => {
   const { authReady, authUser, isDemoMode, householdId, household, activeTab, uiMode } = useNido();
   const [viewRetryCount, setViewRetryCount] = useState(0);
 
-  const effectiveTab = uiMode === 'sencillo' && activeTab === 'ajustes' ? 'inicio' : activeTab;
+  const effectiveTab = resolveTabForUiMode(activeTab, uiMode);
 
   const ActiveLazyView = useMemo(() => {
     if (effectiveTab === 'inicio') return null;

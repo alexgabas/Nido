@@ -16,9 +16,12 @@
  *   de base de datos, por lo que NO se extrae ni se consulta automáticamente.
  *
  * Modos:
- *   - Por defecto (--mode=dumps): descarga con reanudación HTTP Range a .cache/off-dumps/ y filtra
+ *   - --mode=dumps (por defecto): descarga con reanudación HTTP Range a .cache/off-dumps/ y filtra
  *     en streaming sin límites de peticiones ni costes.
- *   - Alternativa (--mode=api): consulta paginada y educada (1 req / 6.5 s) con checkpoint reanudable.
+ *   - --mode=api: consulta paginada y educada (1 req / 6.5 s) con checkpoint reanudable.
+ *   - --mode=refine: depura el catálogo JSON ya descargado (sin tráfico de red), corrige secciones
+ *     mal clasificadas con reglas por límites de palabra, marca ruido en `excludedFromSuggestions`
+ *     conservando IDs, variantes, formatos y atribución ODbL.
  */
 
 import fs from 'node:fs';
@@ -40,7 +43,7 @@ const DUMP_SOURCES = [
     label: 'Open Food Facts',
     url: 'https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz',
     file: path.join(CACHE_DIR, 'en.openfoodfacts.org.products.csv.gz'),
-    defaultSection: 'Despensa, arroz, pasta y conservas',
+    defaultSection: 'Sin clasificar',
   },
   {
     key: 'obf',
@@ -118,6 +121,76 @@ const VARIANT_PATTERNS = [
   ['para gato', 'Gato'],
 ];
 
+const VALID_SHORT_WORDS = new Set([
+  'te',
+  'pan',
+  'pao',
+  'ajo',
+  'sal',
+  'col',
+  'ron',
+  'gin',
+  'uva',
+  'bbq',
+  'wok',
+  'aji',
+  'oca',
+  'pez',
+  'soy',
+  'oat',
+  'rum',
+  'ice',
+  'oil',
+  'pie',
+  'ham',
+  'egg',
+  'jam',
+  'pea',
+  'nut',
+  'fig',
+  'tea',
+]);
+
+const NOISE_EXACT_NAMES = new Set([
+  'no',
+  'se',
+  'si',
+  'ya',
+  'ok',
+  'na',
+  'ni',
+  'lo',
+  'la',
+  'el',
+  'en',
+  'de',
+  'un',
+  'una',
+  'ghn',
+  'hace',
+  'merc',
+  'test',
+  'prueba',
+  'asdf',
+  'qwer',
+  'xxxx',
+  'xxx',
+  'producto',
+  'sin nombre',
+  'desconocido',
+  'unknown',
+  'n/a',
+  'none',
+  'null',
+  'delete',
+  'borrar',
+  'nordos',
+  'mierda',
+  'caca',
+  'polla',
+  'cono',
+]);
+
 function normalizeText(value) {
   return String(value ?? '')
     .normalize('NFD')
@@ -137,21 +210,32 @@ function cleanWhitespace(value) {
 function isLikelyJunkProductName(rawName) {
   const name = cleanWhitespace(rawName);
   if (!name || name.length < 2 || name.length > 110) return true;
-  if (/^\d{5,}$/.test(name)) return true; // solo código de barras o números
-  if (/^[^a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]+$/.test(name)) return true;
+  if (/^\d{5,}$/.test(name)) return true;
+  if (/^[^a-zA-ZáéíóúÁÉÍÓÚñÑüÜãõÃÕ]+$/.test(name)) return true;
   if (/https?:\/\/|www\.|<[^>]+>|\{|\}/i.test(name)) return true;
   const norm = normalizeText(name);
-  if (
-    /^(test|prueba|asdf|qwer|xxxx|producto|sin nombre|desconocido|unknown|n\/a|none|null|delete|borrar|ñordos|mierda|caca|polla|coño)$/i.test(
-      norm
-    )
-  ) {
-    return true;
-  }
-  if (/\b(nordos|ñordos|gilipollas|puta|fuck|shit)\b/i.test(norm)) return true;
-  // Descartar nombres puramente en otro alfabeto no latino
-  const latinLetters = (name.match(/[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]/g) || []).length;
+  if (NOISE_EXACT_NAMES.has(norm)) return true;
+  if (/\b(nordos|gilipollas|puta|fuck|shit)\b/i.test(norm)) return true;
+  const latinLetters = (name.match(/[a-zA-ZáéíóúÁÉÍÓÚñÑüÜãõÃÕ]/g) || []).length;
   if (latinLetters < 2) return true;
+  return false;
+}
+
+/**
+ * Determina si una entrada existente debe excluirse de las sugerencias por ser ruido
+ * (`No`, `Se`, `ghn`, `Hace`, etc.) sin eliminar palabras cortas válidas (`Té`, `Pan`, `Ajo`, `Sal`, `BBQ`, `WOK`).
+ */
+function isExcludedFromSuggestions(rawName) {
+  const name = cleanWhitespace(rawName);
+  if (isLikelyJunkProductName(name)) return true;
+  const norm = normalizeText(name);
+  if (!norm) return true;
+  if (NOISE_EXACT_NAMES.has(norm)) return true;
+  if (norm.length <= 3 && !VALID_SHORT_WORDS.has(norm)) return true;
+  if (!/[aeiou]/.test(norm) && !VALID_SHORT_WORDS.has(norm)) return true;
+  if (/(.)\1{3,}/.test(norm)) return true;
+  if (/^\d+\s*[.,/-]*$/.test(norm)) return true;
+  if (/^\d+\s*(kcal|kj|g|gr|kg|ml|cl|l|%)$/i.test(norm)) return true;
   return false;
 }
 
@@ -187,7 +271,7 @@ function inferDefaultUnit(format, name, section) {
   }
   if (/\b(docena|12 ud|12 huevos|6 huevos)\b/.test(normFmt)) return 'docena';
   const normName = normalizeText(name);
-  if (/(huevo)/.test(normName)) return 'docena';
+  if (/\b(huevo|huevos|ovos)\b/.test(normName)) return 'docena';
   if (/(agua|vino|aceite|vinagre|colutorio|suavizante|detergente liquido|lejia|fregasuelos|gel de ducha|champu)/.test(normName)) {
     return 'botella';
   }
@@ -236,68 +320,131 @@ function extractVariant(name, genericName) {
   return found.join(' · ');
 }
 
-function mapToSection(sourceKey, name, categoriesText, defaultSection) {
-  const norm = normalizeText(`${name} ${categoriesText}`);
+/**
+ * Clasificación estricta por límites de palabra (\b) y orden de especificidad:
+ * producto específico > sabor o ingrediente secundario.
+ * Si no hay señales suficientes, devuelve 'Sin clasificar' en lugar de inventar una sección.
+ */
+function classifySection(sourceKey, name, brand = '', variant = '', extraContext = '') {
+  const nameNorm = normalizeText(`${name} ${variant}`);
+  const brandNorm = normalizeText(brand);
+  const fullNorm = normalizeText(`${name} ${variant} ${brand} ${extraContext}`);
 
-  if (sourceKey === 'obf') {
-    if (/(bebe|panal|infantil|baby|diaper)/.test(norm)) return 'Bebé y mascotas';
-    if (/(limpieza|detergente|hogar|papel)/.test(norm)) return 'Limpieza y hogar';
+  // 1) Fuentes y marcas no alimentarias exclusivas
+  if (
+    sourceKey === 'obf' ||
+    brandNorm === 'deliplus' ||
+    brandNorm === 'solcare' ||
+    brandNorm === 'stylius'
+  ) {
+    if (/\b(bebe|panal|panales|infantil|baby|diaper|potito)\b/.test(fullNorm)) {
+      return 'Bebé y mascotas';
+    }
+    if (/\b(limpieza|detergente|lejia|fregasuelos|ambientador|papel higienico)\b/.test(nameNorm)) {
+      return 'Limpieza y hogar';
+    }
     return 'Cuidado personal e higiene';
   }
-  if (sourceKey === 'opf') {
-    if (/(perro|gato|mascota|pet|dog|cat|arena para gatos)/.test(norm)) return 'Bebé y mascotas';
-    if (/(champu|gel|jabon manos|pasta de dientes|desodorante|cosmet)/.test(norm)) {
+  if (sourceKey === 'opf' || brandNorm === 'bosque verde') {
+    if (/\b(perro|gato|mascota|arena para gatos?)\b/.test(fullNorm)) {
+      return 'Bebé y mascotas';
+    }
+    if (/\b(champu|gel de ducha|jabon de manos|pasta de dientes|desodorante|cosmet)\b/.test(nameNorm)) {
       return 'Cuidado personal e higiene';
     }
     return 'Limpieza y hogar';
   }
-
-  if (/(pienso|mascota|perro|gato|dog|cat food|arena gato|panal|potito|leche infantil|papilla|bebe)/.test(norm)) {
+  if (brandNorm === 'compy') {
     return 'Bebé y mascotas';
   }
-  if (/(papel higienico|rollo cocina|servilleta|bolsa basura|detergente|suavizante|lavavajillas|lejia|fregasuelos|limpiacristales|estropajo|bayeta|insecticida|ambientador|aluminio|film)/.test(norm)) {
-    return 'Limpieza y hogar';
-  }
-  if (/(gel de ducha|champu|acondicionador|desodorante|dentifrico|pasta de dientes|cepillo dientes|colutorio|compresa|tampon|crema corporal|protector solar|maquinilla|toallita|algodon)/.test(norm)) {
-    return 'Cuidado personal e higiene';
-  }
-  if (/(congelad|ultracongelad|helado|ice cream|frozen|edamame|gyoza|patatas para freir)/.test(norm)) {
-    return 'Congelados';
-  }
-  if (/(fruta|verdura|hortaliza|ensalada|brocoli|espinaca|tomate|patata|cebolla|platano|manzana|naranja|aguacate|champinon|fresa|fruit|vegetable)/.test(norm) &&
-      !/(zumo|mermelada|frito|triturado|en conserva|galleta|yogur|helado)/.test(norm)) {
-    return 'Fruta y verdura';
-  }
-  if (/(pescado|marisco|salmon|merluza|bacalao|atun fresco|langostino|gamba|mejillon fresco|calamar|fish|seafood)/.test(norm) &&
-      !/(conserva|lata|en aceite|al natural|en escabeche)/.test(norm)) {
-    return 'Pescado y marisco';
-  }
-  if (/(carne|pollo|pavo|cerdo|ternera|vacuno|jamon|lomo|chorizo|salchichon|fuet|beicon|bacon|hamburguesa|huevo|meat|poultry|charcut|egg)/.test(norm) &&
-      !/(caldo|patata|snack|pizza|sabor jamon)/.test(norm)) {
-    return 'Carne, charcutería y huevos';
-  }
-  if (/(plato preparado|gazpacho|salmorejo|hummus|guacamole|ensaladilla|lasaña|lasagna|tortilla de patata|pizza fresca|refrigerad)/.test(norm)) {
-    return 'Platos preparados y refrigerados';
-  }
-  if (/(leche|yogur|kefir|queso|mozzarella|mantequilla|nata|requeson|cuajada|bebida de avena|bebida de soja|bebida de almendra|lacteo|dairy|cheese|milk|yogurt)/.test(norm) &&
-      !/(chocolate con leche|galleta|helado)/.test(norm)) {
+
+  // Marca especializada de quesos
+  if (brandNorm === 'entrepinares') {
     return 'Lácteos, quesos y bebidas vegetales';
   }
-  if (/(pan |panaderia|barra de pan|pan de molde|pan tostado|pico|tortita|brioche|croissant|magdalena|hojaldre|masa de pizza|bread|bakery)/.test(norm)) {
+
+  // 2) Bebé y mascotas
+  if (/\b(pienso|mascota|mascotas|perro|perros|gato|gatos|arena para gatos?|panal|panales|potito|potitos|leche infantil|papilla|papillas|chupete|biberon|empapador|colonia bebe)\b/.test(fullNorm)) {
+    return 'Bebé y mascotas';
+  }
+
+  // 3) Limpieza y hogar
+  if (/\b(papel higienico|papel cocina|papel de cocina|servilleta|servilletas|bolsa basura|bolsa de basura|bolsas de basura|detergente|suavizante|lavavajillas|lejia|fregasuelos|limpiacristales|estropajo|bayeta|papel aluminio|papel de aluminio|film transparente|ambientador|quitagrasas|antical|desatascador|insecticida|limpiador|limpiahogar|fregona|escoba|cerillas|pila alcalina|pilas)\b/.test(fullNorm)) {
+    return 'Limpieza y hogar';
+  }
+
+  // 4) Cuidado personal e higiene
+  if (/\b(gel de ducha|gel bano|gel higienizante|champu|acondicionador|mascarilla capilar|desodorante|dentifrico|pasta de dientes|cepillo dental|cepillo de dientes|colutorio|compresa|compresas|tampon|tampones|salvaslip|protector solar|crema corporal|crema facial|crema hidratante|crema manos|maquinilla|afeitar|espuma de afeitar|after shave|toallita|toallitas|algodon|bastoncillos|hilo dental|colonia|perfume|agua micelar|desmaquillante|esmalte|pintalabios|laca|gomina|tinte|urea|arbol del te|aceite corporal|vaselina|tirita|tiritas|preservativo|lubricante)\b/.test(fullNorm)) {
+    return 'Cuidado personal e higiene';
+  }
+
+  // 5) Congelados (antes de carnes, pescados, panes y postres)
+  if (/\b(congelad[oa]s?|ultracongelad[oa]s?|helado|helados|polo|polos|sorbete|bombon helado|tarrina helado|edamame|gyoza|gyozas|hielo|cubitos de hielo|wok|patatas para freir|varitas de merluza|nuggets|churros)\b/.test(fullNorm)) {
+    return 'Congelados';
+  }
+
+  // 6) Platos preparados y refrigerados
+  if (/\b(plato preparado|gazpacho|salmorejo|hummus|guacamole|ensaladilla|tortilla de patata|tortilla espanola|tortilla con|pizza|pizzas|lasana|canelones|empanada|empanadilla|empanadillas|croqueta|croquetas|sushi|poke|wrap|wraps|sandwich|sandwiches|bocadillo|bocadillos|tabule|crema refrigerada|callos|fabada|paella|risotto|yakisoba|ramen|falafel)\b/.test(nameNorm) &&
+      !/\b(masa de pizza|sopa instantanea|caldo)\b/.test(nameNorm)) {
+    return 'Platos preparados y refrigerados';
+  }
+
+  // 7) Lácteos, quesos y bebidas vegetales (antes de fruta/pan/dulces)
+  if (/\b(leche|milk|yogur|yogurt|kefir|queso|quesos|mozzarella|burrata|ricotta|mascarpone|parmesano|cheddar|gouda|emmental|brie|camembert|manchego|roquefort|feta|mato|cuajada|requeson|entrepinares|mantequilla|margarina|nata|flan|natillas|arroz con leche|petit|danonino|actimel|skyr|griego|4 quesos|bebida de avena|bebida de soja|bebida de almendra|bebida de arroz|bebida de coco|bebida vegetal|leche de avena|leche de soja|leche de almendras?)\b/.test(nameNorm) &&
+      !/\b(chocolate con leche|galleta|galletas|helado|salsa de queso|patatas? fritas?|chips|snack|sabor queso)\b/.test(nameNorm)) {
+    return 'Lácteos, quesos y bebidas vegetales';
+  }
+
+  // 8) Huevos, carne y charcutería (antes de pescado y conservas)
+  if (/\b(huevo|huevos|ovos|eggs|clara de huevo|claras de huevo|yema)\b/.test(nameNorm) || /huevosuelo/.test(nameNorm)) {
+    if (!/\b(chocolate|sorpresa|pascua|huevo kinder|galleta)\b/.test(nameNorm)) {
+      return 'Carne, charcutería y huevos';
+    }
+  }
+  if (/\b(pollo|pavo|cerdo|ternera|vacuno|cordero|conejo|jamon|lomo|lacon|beicon|bacon|panceta|hamburguesa|salchicha|salchichas|carne|chorizo|fuet|salchichon|mortadela|salami|chistorra|longaniza|morcilla|sobrasada|butifarra|pate|foie|albondigas|alitas|alas de pollo|pechuga|muslo|contramuslo|solomillo|chuleta|costilla|entrecot|secreto|abanico iberico|presa|alheira|anojo|cachopo|york)\b/.test(nameNorm) &&
+      !/\b(caldo|patatas? fritas?|chips|sabor jamon|aroma|vegano|vegetal|arroz con|bocata queso)\b/.test(nameNorm)) {
+    return 'Carne, charcutería y huevos';
+  }
+
+  // 9) Conservas de pescado -> Despensa (antes de Pescado fresco)
+  const isCannedOrPreserve = /\b(lata|latas|conserva|conservas|en aceite|aceite de oliva|aceite de girasol|al natural|escabeche|en tomate|en salsa)\b/.test(nameNorm);
+
+  // 10) Pescado y marisco fresco / refrigerado
+  if (!isCannedOrPreserve &&
+      /\b(salmon|merluza|bacalao|lubina|dorada|emperador|pez espada|rape|lenguado|rodaballo|trucha|boqueron|boquerones|sardina|sardinas|caballa|jurel|bonito|atun|anchoa|anchoas|anchois|langostino|langostinos|gamba|gambas|gambon|cigala|bogavante|mejillon|mejillones|almeja|almejas|berberecho|berberechos|pulpo|sepia|calamar|calamares|pota|chipiron|chipirones|navaja|navajas|ostra|vieira|pescado|marisco|surimi|gulas|cangrejo|panga|tilapia)\b/.test(nameNorm)) {
+    return 'Pescado y marisco';
+  }
+
+  // 11) Panadería y bollería (antes de fruta/despensa para panes con aceite de oliva)
+  if (/\b(pan|panes|panecillo|panecillos|panets|barra de pan|pan de molde|pan integral|pan rustico|baguette|baguettes|chapata|chapatas|mollete|molletes|piadina|piadinas|croissant|magdalena|magdalenas|brioche|hojaldre|masa de pizza|masa quebrada|picos|reganas|biscote|biscotes|tostada|tostadas|rosquilla|rosquillas|ensaimada|napolitana|napolitanas|sobao|sobaos|bizcocho|palmera|palmeritas|donut|berlina|muffin|tortita|tortitas|tortillas? de trigo|tortillas? integrales|tortillas? de avena|fajita|fajitas|xuxo|pao)\b/.test(nameNorm) &&
+      !/\b(panal|panales|panceta|pantalon|pan rallado)\b/.test(nameNorm)) {
     return 'Panadería y bollería';
   }
-  if (/(agua |mineral|refresco|cola|tonica|cerveza|vino|kombucha|horchata|zumo|nectar|bebida|tea|isotonica|soda|juice|beer|wine)/.test(norm) &&
-      !/(bebida de avena|bebida de soja|bebida de almendra|aceite)/.test(norm)) {
+
+  // 12) Bebidas (antes de fruta para zumos/néctares de fruta)
+  if (/\b(agua|agua mineral|refresco|cola|coca cola|pepsi|fanta|sprite|tonica|gaseosa|casera|cerveza|clara|vino|cava|champan|champagne|vermut|sidra|sangria|tinto de verano|ginebra|gin|ron|vodka|whisky|licor|crema de orujo|kombucha|horchata|zumo|zumos|nectar|jus|batido|bebida energetica|isotonica|aquarius|nestea|fuze tea|te frio|mosto|fino|moscatel|anis|pacharan)\b/.test(nameNorm) &&
+      !/\b(vinagre|zumo de limon.*cocina)\b/.test(nameNorm)) {
     return 'Bebidas';
   }
-  if (/(cafe|cacao|te |infusion|manzanilla|tilo|cereales|avena|muesli|galleta|mermelada|miel|chocolate|turron|dulce|crema de cacahuete|crema de cacao|azucar|breakfast|coffee|biscuit)/.test(norm)) {
+
+  // 13) Desayuno, café y dulces (antes de fruta/despensa para galletas/mermeladas con fruta)
+  if (/\b(cafe|descafeinado|capsulas|espresso|ristretto|cappuccino|cacao|colacao|nesquik|infusion|infusiones|manzanilla|tila|poleo|te|te verde|te negro|te rojo|chai|matcha|cereales|copos de avena|muesli|granola|porridge|galleta|galletas|barquillo|mermelada|confitura|miel|crema de cacahuete|crema de cacao|nocilla|nutella|azucar|edulcorante|sacarina|stevia|chocolate|bombones|turron|polvoron|mantecado|mazapan|caramelo|caramelos|chicle|chicles|gominola|golosina|regaliz|barrita|barritas|cacao puro)\b/.test(nameNorm) &&
+      !/\b(aceite|salsa)\b/.test(nameNorm)) {
     return 'Desayuno, café y dulces';
   }
-  if (/(arroz|pasta|espagueti|macarron|fideo|garbanzo|lenteja|alubia|atun|sardinilla|mejillon|conserva|tomate frito|tomate triturado|aceituna|aceite|vinagre|sal |harina|caldo|mayonesa|salsa|especia|fruto seco|nuez|almendra|patatas fritas|snack)/.test(norm)) {
+
+  // 14) Despensa, arroz, pasta y conservas (antes de fruta para aceites, tomate frito, conservas, snacks)
+  if (/\b(arroz|pasta|espagueti|espaguetis|macarron|macarrones|tallarin|tallarines|fideo|fideos|fusilli|penne|farfalle|tagliatelle|gnocchi|cuscus|quinoa|chia|lino|semilla|semillas|garbanzo|garbanzos|lenteja|lentejas|alubia|alubias|judias|lata|conserva|conservas|tomate frito|tomate triturado|tomate natural triturado|concentrado de tomate|maiz dulce|aceituna|aceitunas|pepinillo|pepinillos|encurtido|alcaparra|aceite|aceite de oliva|aceite de girasol|aceite de coco|vinagre|sal|pimienta|especia|especias|oregano|comino|pimenton|curry|curcuma|canela|harina|levadura|bicarbonato|pan rallado|pure|caldo|sopa|mayonesa|alioli|ketchup|mostaza|salsa|soja|bbq|aderezo|vinagreta|tahini|pesto|carbonara|bolonesa|nuez|nueces|almendra|almendras|avellana|avellanas|pistacho|pistachos|anacardo|anacardos|cacahuete|cacahuetes|pipas|frutos secos|patatas fritas|chips|nachos|palomitas|snack|maiz frito|almibar|compota|coco rallado)\b/.test(nameNorm) ||
+      isCannedOrPreserve) {
     return 'Despensa, arroz, pasta y conservas';
   }
 
-  return defaultSection;
+  // 15) Fruta y verdura fresca
+  if (/\b(platano|platanos|banana|manzana|manzanas|maca|naranja|naranjas|mandarina|mandarinas|clementina|clementinas|limon|limones|lima|pera|peras|fresa|fresas|freson|frambuesa|frambuesas|arandano|arandanos|mora|moras|cereza|cerezas|uva|uvas|melon|sandia|pina|mango|papaya|kiwi|kiwis|aguacate|aguacates|melocoton|nectarina|paraguayo|albaricoque|ciruela|higo|higos|granada|caqui|persimon|chirimoya|maracuya|coco|tomate|tomates|patata|patatas|papa|boniato|batata|cebolla|cebollas|cebolleta|puerro|puerros|ajo|ajos|zanahoria|zanahorias|calabacin|calabaza|berenjena|pimiento|pimientos|pepino|lechuga|escarola|canonigos|rucula|espinaca|espinacas|acelga|acelgas|champinon|champinones|seta|setas|brocoli|coliflor|repollo|col|lombarda|judia verde|judias verdes|guisante|guisantes|haba|habas|esparrago|esparragos|alcachofa|alcachofas|apio|rabano|rabanito|remolacha|jengibre|fruta|frutas|verdura|verduras|ensalada|mezclum)\b/.test(nameNorm)) {
+    return 'Fruta y verdura';
+  }
+
+  return 'Sin clasificar';
 }
 
 function stableCatalogId(normName, normBrand, normVariant, normFormat, code) {
@@ -323,7 +470,6 @@ function isSpanishOrCompatible(countriesText, storesText, brandNorm) {
 
   if (!c) return true;
   if (/(spain|espana|en:spain|portugal|en:portugal)/.test(c)) return true;
-  // Si el producto es marca exclusiva de Mercadona y tiene países mezclados, aceptar si está etiquetado con Mercadona
   if (isPrivateLabel && hasMercadonaStore) return true;
   return false;
 }
@@ -403,7 +549,6 @@ function processProductRecord(raw, source, seenKeys, seenCodes, results, addedAt
   const countriesText = cleanWhitespace(raw.countries_tags || raw.countries_en || '');
   if (!isSpanishOrCompatible(countriesText, storesText, brandNorm)) return 0;
 
-  // Evitar falsos positivos: si la marca no es propia de Mercadona, exigir que stores contenga "mercadona"
   if (!MERCADONA_PRIVATE_BRANDS.has(brandNorm) && !/\bmercadona\b/.test(normalizeText(storesText))) {
     return 0;
   }
@@ -415,8 +560,9 @@ function processProductRecord(raw, source, seenKeys, seenCodes, results, addedAt
       .filter(Boolean)
       .join(' ')
   );
-  const section = mapToSection(source.key, rawName, categoriesText, source.defaultSection);
+  const section = classifySection(source.key, rawName, brand, variant, categoriesText);
   const defaultUnit = inferDefaultUnit(format, rawName, section);
+  const excluded = isExcludedFromSuggestions(rawName);
 
   const normName = normalizeText(rawName);
   const normVariant = normalizeText(variant);
@@ -436,6 +582,7 @@ function processProductRecord(raw, source, seenKeys, seenCodes, results, addedAt
     ...(format ? { format } : {}),
     section,
     ...(defaultUnit && defaultUnit !== 'ud' ? { defaultUnit } : {}),
+    ...(excluded ? { excludedFromSuggestions: true } : {}),
     sourceRef: `${source.key}:${code || id}`,
     source: 'openfoodfacts_odbl',
     addedAt,
@@ -483,7 +630,6 @@ async function parseCsvDump(source, seenKeys, seenCodes, results, addedAt) {
     }
 
     scanned++;
-    // Fast pre-filter before splitting all columns for speed
     const lower = line.toLowerCase();
     if (
       !lower.includes('mercadona') &&
@@ -554,8 +700,8 @@ async function runApiMode(addedAt) {
   }
 
   const apiPlans = [
-    { key: 'off_store', base: 'https://world.openfoodfacts.org/api/v2/search', params: 'stores_tags=mercadona&countries_tags=spain', sourceKey: 'off', defaultSection: 'Despensa, arroz, pasta y conservas' },
-    { key: 'off_hacendado', base: 'https://world.openfoodfacts.org/api/v2/search', params: 'brands_tags=hacendado&countries_tags=spain', sourceKey: 'off', defaultSection: 'Despensa, arroz, pasta y conservas' },
+    { key: 'off_store', base: 'https://world.openfoodfacts.org/api/v2/search', params: 'stores_tags=mercadona&countries_tags=spain', sourceKey: 'off', defaultSection: 'Sin clasificar' },
+    { key: 'off_hacendado', base: 'https://world.openfoodfacts.org/api/v2/search', params: 'brands_tags=hacendado&countries_tags=spain', sourceKey: 'off', defaultSection: 'Sin clasificar' },
     { key: 'obf_deliplus', base: 'https://world.openbeautyfacts.org/api/v2/search', params: 'brands_tags=deliplus', sourceKey: 'obf', defaultSection: 'Cuidado personal e higiene' },
     { key: 'opf_bosque', base: 'https://world.openproductsfacts.org/api/v2/search', params: 'brands_tags=bosque-verde', sourceKey: 'opf', defaultSection: 'Limpieza y hogar' },
   ];
@@ -612,12 +758,84 @@ async function runDumpsMode(addedAt) {
   return results;
 }
 
+function runRefineMode() {
+  if (!fs.existsSync(OUTPUT_FILE)) {
+    throw new Error(`No existe ${OUTPUT_FILE} para depurar.`);
+  }
+  const existing = JSON.parse(fs.readFileSync(OUTPUT_FILE, 'utf8'));
+  const prevItems = Array.isArray(existing.items) ? existing.items : [];
+
+  let correctedSections = 0;
+  let excludedFromSuggestionsCount = 0;
+  let sinClasificarCount = 0;
+
+  const refinedItems = prevItems.map((item) => {
+    const sourceKey = String(item.sourceRef || '').split(':')[0] || 'off';
+    const nextSection = classifySection(
+      sourceKey,
+      item.name || '',
+      item.brand || '',
+      item.variant || '',
+      ''
+    );
+    if (nextSection !== item.section) {
+      correctedSections += 1;
+    }
+    if (nextSection === 'Sin clasificar') {
+      sinClasificarCount += 1;
+    }
+    const excluded = isExcludedFromSuggestions(item.name || '');
+    if (excluded) {
+      excludedFromSuggestionsCount += 1;
+    }
+
+    const updated = {
+      id: item.id,
+      name: item.name,
+      ...(item.brand ? { brand: item.brand } : {}),
+      ...(item.variant ? { variant: item.variant } : {}),
+      ...(item.format ? { format: item.format } : {}),
+      section: nextSection,
+      ...(item.defaultUnit ? { defaultUnit: item.defaultUnit } : {}),
+      ...(excluded ? { excludedFromSuggestions: true } : {}),
+      sourceRef: item.sourceRef,
+      source: item.source,
+      addedAt: item.addedAt,
+    };
+    return updated;
+  });
+
+  return {
+    items: refinedItems,
+    stats: {
+      total: refinedItems.length,
+      correctedSections,
+      excludedFromSuggestions: excludedFromSuggestionsCount,
+      sinClasificar: sinClasificarCount,
+    },
+    existingMeta: existing,
+  };
+}
+
 async function main() {
   const modeArg = process.argv.find((a) => a.startsWith('--mode=')) || '--mode=dumps';
   const mode = modeArg.split('=')[1];
   const addedAt = new Date().toISOString().slice(0, 10);
 
-  let items = mode === 'api' ? await runApiMode(addedAt) : await runDumpsMode(addedAt);
+  let items = [];
+  let refineStats = null;
+  let existingMeta = null;
+
+  if (mode === 'refine') {
+    const refined = runRefineMode();
+    items = refined.items;
+    refineStats = refined.stats;
+    existingMeta = refined.existingMeta;
+  } else if (mode === 'api') {
+    items = await runApiMode(addedAt);
+  } else {
+    items = await runDumpsMode(addedAt);
+  }
 
   items.sort((a, b) => a.name.localeCompare(b.name, 'es'));
 
@@ -628,9 +846,12 @@ async function main() {
 
   const payload = {
     version: 1,
-    source: 'Open Food Facts, Open Beauty Facts & Open Products Facts',
-    license: 'ODbL 1.0 / DbCL 1.0 (https://world.openfoodfacts.org/terms-of-use)',
-    disclaimer: 'Catálogo de referencia no oficial. El surtido puede variar según tienda y fecha.',
+    source: existingMeta?.source || 'Open Food Facts, Open Beauty Facts & Open Products Facts',
+    license:
+      existingMeta?.license || 'ODbL 1.0 / DbCL 1.0 (https://world.openfoodfacts.org/terms-of-use)',
+    disclaimer:
+      existingMeta?.disclaimer ||
+      'Catálogo de referencia no oficial. El surtido puede variar según tienda y fecha.',
     generatedAt: new Date().toISOString(),
     count: items.length,
     sectionCounts,
@@ -643,9 +864,17 @@ async function main() {
   const gzBytes = zlib.gzipSync(fs.readFileSync(OUTPUT_FILE)).length;
 
   console.log(`\nCatálogo guardado en ${path.relative(ROOT_DIR, OUTPUT_FILE)}`);
-  console.log(`Productos únicos reales: ${items.length.toLocaleString('es-ES')}`);
+  console.log(`Productos totales (IDs estables conservados): ${items.length.toLocaleString('es-ES')}`);
+  if (refineStats) {
+    console.log('Resumen depuración (--mode=refine):', {
+      total: refineStats.total,
+      correctedSections: refineStats.correctedSections,
+      excludedFromSuggestions: refineStats.excludedFromSuggestions,
+      sinClasificar: refineStats.sinClasificar,
+    });
+  }
   console.log(`Tamaño JSON: ${(rawBytes / (1024 * 1024)).toFixed(2)} MB | Gzip: ${(gzBytes / 1024).toFixed(1)} KB`);
-  console.log('Distribución por sección:', sectionCounts);
+  console.log('Distribución por sección (bySection):', sectionCounts);
 }
 
 main().catch((err) => {

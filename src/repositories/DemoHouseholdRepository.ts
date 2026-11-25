@@ -9,12 +9,21 @@ import {
 } from '../domain/finance';
 import { isValidHexColor, sanitizeCategoryColors } from '../domain/categoryPalette';
 import {
+  isValidLocalDateISO,
+  sanitizeCommonAccountManualBalance,
+  sanitizePlannedCommonCategories,
+} from '../domain/monthlyPlanning';
+import {
   buildCategoryBudgetDocId,
   canSafelyDeleteCustomCategory,
+  CATEGORY_SELECTOR_PREFS_VERSION,
   generateCustomCategoryId,
   isCustomCategoryId,
   isSystemExpenseCategory,
   isValidCategoryIcon,
+  isValidSelectorCategoryId,
+  MAX_VISIBLE_SELECTOR_CATEGORIES,
+  resolveInitialVisibleCategoriesPlan,
 } from '../domain/categories';
 import {
   buildShoppingCatalogId,
@@ -23,10 +32,17 @@ import {
   normalizeShoppingUnit,
 } from '../domain/shoppingCatalog';
 import {
+  generateShoppingTemplateId,
+  sanitizeShoppingTemplateItems,
+  type ApplyShoppingTemplatePlan,
+} from '../domain/shoppingTemplates';
+import {
   buildDeterministicRecurringTxId,
   isRecurringDueInMonth,
   isValidMonthKey,
+  sanitizeSkippedMonths,
 } from '../domain/recurrence';
+import { sanitizeSavingsPlanAllocations } from '../domain/savingsPlan';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -66,16 +82,22 @@ import type {
   HouseholdMember,
   HouseholdSettings,
   InitialCost,
+  MemberCategoryPreferences,
   MonthClosure,
   MonthlyBudget,
+  MonthlySavingsPlan,
   NidoBackupV1,
   PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  SavingsPlanAllocation,
   ShoppingCatalogItem,
   ShoppingItem,
+  ShoppingListTemplate,
   ShoppingSection,
+  ShoppingSectionOverride,
   ShoppingSourceType,
+  ShoppingTemplateItem,
   Transaction,
   UiMode,
 } from '../types/nido';
@@ -101,9 +123,13 @@ interface DemoState {
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
+  savingsPlans: Record<string, MonthlySavingsPlan>;
   shopping: ShoppingItem[];
   shoppingCatalog: ShoppingCatalogItem[];
   pendingShoppingCheckouts: PendingShoppingCheckout[];
+  memberPreferences: Record<string, MemberCategoryPreferences>;
+  shoppingTemplates: ShoppingListTemplate[];
+  shoppingSectionOverrides: ShoppingSectionOverride[];
 }
 
 const STORAGE_KEY = 'nido_demo_state_v1';
@@ -272,6 +298,7 @@ function buildInitialDemoState(): DemoState {
     monthClosures: [],
     goals,
     goalMovements,
+    savingsPlans: {},
     shopping: [
       { id: 'shop_1', text: 'Leche semidesnatada', qty: 6, unit: 'L', done: false, addedBy: uidA, createdAt: ts, updatedAt: ts },
       { id: 'shop_2', text: 'Aceite de oliva virgen extra', qty: 1, unit: 'botella', done: true, addedBy: uidB, createdAt: ts, updatedAt: ts },
@@ -279,6 +306,9 @@ function buildInitialDemoState(): DemoState {
     ],
     shoppingCatalog: [],
     pendingShoppingCheckouts: [],
+    memberPreferences: {},
+    shoppingTemplates: [],
+    shoppingSectionOverrides: [],
   };
 }
 
@@ -325,6 +355,18 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         }
         if (loaded && !Array.isArray(loaded.pendingShoppingCheckouts)) {
           loaded.pendingShoppingCheckouts = [];
+        }
+        if (loaded && (!loaded.memberPreferences || typeof loaded.memberPreferences !== 'object')) {
+          loaded.memberPreferences = {};
+        }
+        if (loaded && !Array.isArray(loaded.shoppingTemplates)) {
+          loaded.shoppingTemplates = [];
+        }
+        if (loaded && !Array.isArray(loaded.shoppingSectionOverrides)) {
+          loaded.shoppingSectionOverrides = [];
+        }
+        if (loaded && (!loaded.savingsPlans || typeof loaded.savingsPlans !== 'object')) {
+          loaded.savingsPlans = {};
         }
       }
     } catch {
@@ -443,9 +485,13 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       monthClosures: [],
       goals: [],
       goalMovements: [],
+      savingsPlans: {},
       shopping: [],
       shoppingCatalog: [],
       pendingShoppingCheckouts: [],
+      memberPreferences: {},
+      shoppingTemplates: [],
+      shoppingSectionOverrides: [],
     };
     this.emit();
 
@@ -709,6 +755,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeSavingsPlans(_hid: string, onData: (plans: MonthlySavingsPlan[]) => void): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        Object.values(this.state.savingsPlans).sort((a, b) => b.monthKey.localeCompare(a.monthKey))
+      )
+    );
+  }
+
   subscribeShopping(_hid: string, onData: (items: ShoppingItem[]) => void): Unsubscribe {
     return this.subscribe(() =>
       onData(
@@ -748,6 +802,39 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     );
   }
 
+  subscribeMemberCategoryPreferences(
+    _hid: string,
+    uid: string,
+    onData: (prefs: MemberCategoryPreferences | null) => void
+  ): Unsubscribe {
+    return this.subscribe(() => {
+      const found = this.state.memberPreferences[uid];
+      onData(found ? { ...found, visibleCategoryIds: [...found.visibleCategoryIds] } : null);
+    });
+  }
+
+  subscribeShoppingTemplates(
+    _hid: string,
+    onData: (items: ShoppingListTemplate[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(
+        [...this.state.shoppingTemplates]
+          .map((t) => ({ ...t, items: t.items.map((it) => ({ ...it })) }))
+          .sort((a, b) => a.name.localeCompare(b.name, 'es'))
+      )
+    );
+  }
+
+  subscribeShoppingSectionOverrides(
+    _hid: string,
+    onData: (items: ShoppingSectionOverride[]) => void
+  ): Unsubscribe {
+    return this.subscribe(() =>
+      onData(this.state.shoppingSectionOverrides.map((ov) => ({ ...ov })))
+    );
+  }
+
   subscribeCategoryBudgets(
     _hid: string,
     monthKey: string,
@@ -780,6 +867,25 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     };
   }
 
+  async fetchAnnualBalanceData(
+    _hid: string
+  ): Promise<{
+    sharedTransactions: Transaction[];
+    systemBudgets: MonthlyBudget[];
+    categoryBudgets: CategoryBudgetLimit[];
+  }> {
+    return {
+      sharedTransactions: this.state.transactions
+        .filter((t) => !t.isPrivate)
+        .map((t) => ({ ...t })),
+      systemBudgets: Object.values(this.state.budgets).map((b) => ({
+        ...b,
+        limits: { ...b.limits },
+      })),
+      categoryBudgets: this.state.categoryBudgets.map((cb) => ({ ...cb })),
+    };
+  }
+
   async updateSettings(
     hid: string,
     settings: HouseholdSettings,
@@ -809,6 +915,57 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     const clean = sanitizeCategoryColors(colors);
     this.state.household.categoryColors = clean ?? {};
     this.state.household.updatedAt = new Date().toISOString();
+    this.emit();
+  }
+
+  async updateCommonAccountPlannedCategories(_hid: string, categoryIds: string[]): Promise<void> {
+    this.state.household.commonAccountPlannedCategories =
+      sanitizePlannedCommonCategories(categoryIds);
+    this.state.household.updatedAt = new Date().toISOString();
+    this.emit();
+  }
+
+  async updateCommonAccountManualBalance(
+    _hid: string,
+    balance: { amount: number; referenceDate: string } | null,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    if (balance === null) {
+      this.state.household.commonAccountManualBalance = null;
+    } else {
+      const amount = roundCents(Math.max(0, Number(balance.amount) || 0));
+      const referenceDate = isValidLocalDateISO(balance.referenceDate)
+        ? balance.referenceDate
+        : getTodayLocalISO();
+      this.state.household.commonAccountManualBalance = {
+        amount,
+        referenceDate,
+        updatedBy: actor.uid,
+        updatedAt: now,
+      };
+    }
+    this.state.household.updatedAt = now;
+    this.emit();
+  }
+
+  async setMudanzaCompleted(
+    _hid: string,
+    completed: boolean,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    this.state.household.mudanzaCompleted = completed;
+    this.state.household.mudanzaCompletedAt = completed ? now : null;
+    this.state.household.mudanzaCompletedBy = completed ? actor.uid : null;
+    this.state.household.updatedAt = now;
+    this.logActivity(
+      actor,
+      'update',
+      'hogar',
+      this.state.household.id,
+      completed ? 'Dio por terminada la etapa de mudanza' : 'Reabrió la etapa de mudanza'
+    );
     this.emit();
   }
 
@@ -905,6 +1062,68 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.state.customCategories = this.state.customCategories.filter((c) => c.id !== id);
     this.logActivity(actor, 'delete', 'categoria', id, `Eliminó categoría "${name}"`);
     this.emit();
+  }
+
+  async saveMemberCategoryPreferences(
+    _hid: string,
+    uid: string,
+    prefs: { selectorVersion: number; visibleCategoryIds: string[] }
+  ): Promise<void> {
+    const deduped: string[] = [];
+    const seen = new Set<string>();
+    for (const rawId of prefs.visibleCategoryIds) {
+      if (deduped.length >= MAX_VISIBLE_SELECTOR_CATEGORIES) break;
+      if (typeof rawId === 'string' && isValidSelectorCategoryId(rawId) && !seen.has(rawId)) {
+        seen.add(rawId);
+        deduped.push(rawId);
+      }
+    }
+    this.state.memberPreferences[uid] = {
+      uid,
+      selectorVersion: Math.max(1, Math.round(Number(prefs.selectorVersion) || CATEGORY_SELECTOR_PREFS_VERSION)),
+      visibleCategoryIds: deduped,
+      updatedAt: new Date().toISOString(),
+    };
+    this.emit();
+  }
+
+  async ensureInitialVisibleCategoriesSetup(
+    _hid: string,
+    uid: string,
+    _actor: UserProfileInput
+  ): Promise<MemberCategoryPreferences> {
+    const existing = this.state.memberPreferences[uid];
+    if (existing && existing.selectorVersion >= CATEGORY_SELECTOR_PREFS_VERSION) {
+      return { ...existing, visibleCategoryIds: [...existing.visibleCategoryIds] };
+    }
+
+    const now = new Date().toISOString();
+    const plan = resolveInitialVisibleCategoriesPlan(this.state.customCategories);
+    for (const { id, suggestion, order } of plan.missingSuggestionsToCreate) {
+      if (!this.state.customCategories.some((c) => c.id === id)) {
+        this.state.customCategories.push({
+          id,
+          name: suggestion.name,
+          color: suggestion.color.toUpperCase(),
+          icon: suggestion.icon,
+          order,
+          archived: false,
+          csvKeywords: suggestion.csvKeywords,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+
+    const saved: MemberCategoryPreferences = {
+      uid,
+      selectorVersion: CATEGORY_SELECTOR_PREFS_VERSION,
+      visibleCategoryIds: [...plan.orderedVisibleIds],
+      updatedAt: now,
+    };
+    this.state.memberPreferences[uid] = saved;
+    this.emit();
+    return { ...saved, visibleCategoryIds: [...saved.visibleCategoryIds] };
   }
 
   async upsertInitialCost(
@@ -1068,19 +1287,39 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     actor: UserProfileInput
   ): Promise<string> {
     const now = new Date().toISOString();
-    const id = rec.id || `rec_${Date.now()}`;
+    const id = rec.id || `rec_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const startMonth = isValidMonthKey(rec.startMonth) ? rec.startMonth : '';
     const cleanRec = {
       ...rec,
       ...(startMonth ? { startMonth } : { startMonth: '' }),
     };
     if (rec.id) {
-      this.state.recurring = this.state.recurring.map((r) =>
-        r.id === id ? { ...r, ...cleanRec, id, updatedAt: now } : r
-      );
+      this.state.recurring = this.state.recurring.map((r) => {
+        if (r.id !== id) return r;
+        const preservedSkipped =
+          rec.skippedMonths !== undefined
+            ? sanitizeSkippedMonths(rec.skippedMonths)
+            : r.skippedMonths;
+        return {
+          ...r,
+          ...cleanRec,
+          ...(preservedSkipped && preservedSkipped.length > 0
+            ? { skippedMonths: preservedSkipped }
+            : { skippedMonths: undefined }),
+          id,
+          updatedAt: now,
+        };
+      });
       this.logActivity(actor, 'update', 'recurrente', id, `Editó plantilla "${rec.concept}"`);
     } else {
-      this.state.recurring.push({ ...cleanRec, id, createdAt: now, updatedAt: now });
+      const initialSkipped = sanitizeSkippedMonths(rec.skippedMonths);
+      this.state.recurring.push({
+        ...cleanRec,
+        ...(initialSkipped.length > 0 ? { skippedMonths: initialSkipped } : {}),
+        id,
+        createdAt: now,
+        updatedAt: now,
+      });
       this.logActivity(actor, 'create', 'recurrente', id, `Creó plantilla "${rec.concept}"`);
     }
     this.emit();
@@ -1136,6 +1375,51 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async setRecurringMonthSkipped(
+    _hid: string,
+    recurringId: string,
+    monthKey: string,
+    skipped: boolean,
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (!isValidMonthKey(monthKey)) {
+      throw new Error('Mes no válido para registrar la omisión.');
+    }
+    this.assertMonthNotClosed(monthKey);
+    const existing = this.state.recurring.find((r) => r.id === recurringId);
+    if (!existing) {
+      throw new Error('No se encontró la plantilla recurrente.');
+    }
+    const currentList = sanitizeSkippedMonths(existing.skippedMonths);
+    const nextList = skipped
+      ? sanitizeSkippedMonths([...currentList, monthKey])
+      : currentList.filter((m) => m !== monthKey);
+
+    if (currentList.join(',') === nextList.join(',')) return;
+
+    const now = new Date().toISOString();
+    this.state.recurring = this.state.recurring.map((r) => {
+      if (r.id !== recurringId) return r;
+      const updated: RecurringExpense = { ...r, updatedAt: now };
+      if (nextList.length > 0) {
+        updated.skippedMonths = nextList;
+      } else {
+        delete updated.skippedMonths;
+      }
+      return updated;
+    });
+    this.logActivity(
+      actor,
+      'update',
+      'recurrente',
+      recurringId,
+      skipped
+        ? `Marcó "${existing.concept}" como no producido en ${monthKey}`
+        : `Deshizo la omisión de "${existing.concept}" en ${monthKey}`
+    );
+    this.emit();
+  }
+
   async generateMonthTransactions(
     _hid: string,
     monthKey: string,
@@ -1144,6 +1428,7 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     actor: UserProfileInput
   ): Promise<number> {
     if (missing.length === 0 || !isValidMonthKey(monthKey)) return 0;
+    this.assertMonthNotClosed(monthKey);
     const now = new Date().toISOString();
     let createdCount = 0;
 
@@ -1514,6 +1799,52 @@ export class DemoHouseholdRepository implements HouseholdRepository {
   async deleteGoalMovement(_hid: string, id: string, goalName: string, actor: UserProfileInput): Promise<void> {
     this.state.goalMovements = this.state.goalMovements.filter((m) => m.id !== id);
     this.logActivity(actor, 'delete', 'ahorro', id, `Eliminó movimiento en "${goalName}"`);
+    this.emit();
+  }
+
+  async saveSavingsPlan(
+    _hid: string,
+    plan: {
+      monthKey: string;
+      targetAmount: number;
+      allocations: SavingsPlanAllocation[];
+    },
+    actor: UserProfileInput
+  ): Promise<void> {
+    if (!isValidMonthKey(plan.monthKey)) {
+      throw new Error('Mes inválido para el plan de ahorro.');
+    }
+    const goalsById = new Map(this.state.goals.map((g) => [g.id, g]));
+    const cleanTarget = roundCents(Math.max(0, Number(plan.targetAmount) || 0));
+    const cleanAllocations = sanitizeSavingsPlanAllocations(plan.allocations, goalsById);
+    const isUpdate = Boolean(this.state.savingsPlans[plan.monthKey]);
+    this.state.savingsPlans = {
+      ...this.state.savingsPlans,
+      [plan.monthKey]: {
+        monthKey: plan.monthKey,
+        targetAmount: cleanTarget,
+        allocations: cleanAllocations,
+        updatedBy: actor.uid,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    this.logActivity(
+      actor,
+      isUpdate ? 'update' : 'create',
+      'plan_ahorro',
+      plan.monthKey,
+      `${isUpdate ? 'Actualizó' : 'Guardó'} plan de ahorro de ${plan.monthKey} (${cleanTarget} €)`
+    );
+    this.emit();
+  }
+
+  async deleteSavingsPlan(_hid: string, monthKey: string, actor: UserProfileInput): Promise<void> {
+    if (!isValidMonthKey(monthKey)) return;
+    if (!this.state.savingsPlans[monthKey]) return;
+    const next = { ...this.state.savingsPlans };
+    delete next[monthKey];
+    this.state.savingsPlans = next;
+    this.logActivity(actor, 'delete', 'plan_ahorro', monthKey, `Eliminó plan de ahorro de ${monthKey}`);
     this.emit();
   }
 
@@ -1910,6 +2241,126 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.emit();
   }
 
+  async upsertShoppingTemplate(
+    _hid: string,
+    tpl: { id?: string; name: string; items: ShoppingTemplateItem[] },
+    actor: UserProfileInput
+  ): Promise<string> {
+    const cleanName = tpl.name.trim().slice(0, MAX_LENGTHS.shoppingTemplateName);
+    if (!cleanName) {
+      throw new Error('Escribe un nombre para la lista reutilizable.');
+    }
+    const cleanItems = sanitizeShoppingTemplateItems(tpl.items);
+    const now = new Date().toISOString();
+    const id = tpl.id?.trim() || generateShoppingTemplateId();
+    const existing = this.state.shoppingTemplates.find((t) => t.id === id);
+    if (existing) {
+      this.state.shoppingTemplates = this.state.shoppingTemplates.map((t) =>
+        t.id === id ? { ...t, name: cleanName, items: cleanItems, updatedAt: now } : t
+      );
+    } else {
+      this.state.shoppingTemplates.push({
+        id,
+        name: cleanName,
+        items: cleanItems,
+        createdBy: actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    this.emit();
+    return id;
+  }
+
+  async deleteShoppingTemplate(_hid: string, id: string): Promise<void> {
+    this.state.shoppingTemplates = this.state.shoppingTemplates.filter((t) => t.id !== id);
+    this.emit();
+  }
+
+  async applyShoppingTemplate(
+    _hid: string,
+    plan: ApplyShoppingTemplatePlan,
+    actor: UserProfileInput
+  ): Promise<{ createdCount: number; updatedCount: number }> {
+    const now = new Date().toISOString();
+    const updatesById = new Map(plan.toUpdate.map((u) => [u.id, u]));
+    if (updatesById.size > 0) {
+      this.state.shopping = this.state.shopping.map((item) => {
+        const upd = updatesById.get(item.id);
+        if (!upd) return item;
+        return {
+          ...item,
+          qty: roundCents(Math.max(0.01, Math.min(999, upd.qty))),
+          ...(upd.section ? { section: upd.section } : {}),
+          done: false,
+          updatedAt: now,
+        };
+      });
+    }
+    for (let i = 0; i < plan.toCreate.length; i++) {
+      const it = plan.toCreate[i];
+      this.state.shopping.push({
+        id: `shop_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+        text: it.text.trim().slice(0, MAX_LENGTHS.shoppingText) || 'Producto',
+        qty: roundCents(Math.max(0.01, Math.min(999, it.qty))),
+        ...(it.unit ? { unit: normalizeShoppingUnit(it.unit) } : {}),
+        done: false,
+        ...(it.catalogId ? { catalogId: it.catalogId } : {}),
+        ...(it.brand ? { brand: it.brand } : {}),
+        ...(it.format ? { format: it.format } : {}),
+        ...(it.section ? { section: it.section } : {}),
+        ...(it.sourceType ? { sourceType: it.sourceType } : {}),
+        addedBy: actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    if (plan.toCreate.length > 0 || plan.toUpdate.length > 0) {
+      this.emit();
+    }
+    return {
+      createdCount: plan.toCreate.length,
+      updatedCount: plan.toUpdate.length,
+    };
+  }
+
+  async setShoppingSectionOverride(
+    _hid: string,
+    productKey: string,
+    section: ShoppingSection,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const cleanKey = productKey.trim().slice(0, MAX_LENGTHS.shoppingOverrideKey);
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(cleanKey)) {
+      throw new Error('Identificador de producto inválido para guardar la sección.');
+    }
+    const cleanSection = normalizeShoppingSection(section);
+    if (!cleanSection) {
+      throw new Error('Sección de supermercado no válida.');
+    }
+    const now = new Date().toISOString();
+    const next: ShoppingSectionOverride = {
+      id: cleanKey,
+      productKey: cleanKey,
+      section: cleanSection,
+      updatedBy: actor.uid,
+      updatedAt: now,
+    };
+    this.state.shoppingSectionOverrides = [
+      ...this.state.shoppingSectionOverrides.filter((ov) => ov.productKey !== cleanKey && ov.id !== cleanKey),
+      next,
+    ];
+    this.emit();
+  }
+
+  async clearShoppingSectionOverride(_hid: string, productKey: string): Promise<void> {
+    const cleanKey = productKey.trim();
+    this.state.shoppingSectionOverrides = this.state.shoppingSectionOverrides.filter(
+      (ov) => ov.productKey !== cleanKey && ov.id !== cleanKey
+    );
+    this.emit();
+  }
+
   async exportBackup(_hid: string, viewerUid: string): Promise<NidoBackupV1> {
     return {
       schemaVersion: 1,
@@ -1917,9 +2368,23 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       exportedAt: new Date().toISOString(),
       householdName: this.state.household.name,
       settings: this.state.household.settings,
+      ...(typeof this.state.household.mudanzaCompleted === 'boolean'
+        ? {
+            mudanzaCompleted: this.state.household.mudanzaCompleted,
+            mudanzaCompletedAt: this.state.household.mudanzaCompletedAt ?? null,
+            mudanzaCompletedBy: this.state.household.mudanzaCompletedBy ?? null,
+          }
+        : {}),
       ...(this.state.household.csvKeywords ? { csvKeywords: this.state.household.csvKeywords } : {}),
       ...(this.state.household.categoryColors && Object.keys(this.state.household.categoryColors).length > 0
         ? { categoryColors: this.state.household.categoryColors }
+        : {}),
+      ...(this.state.household.commonAccountPlannedCategories &&
+      this.state.household.commonAccountPlannedCategories.length > 0
+        ? { commonAccountPlannedCategories: [...this.state.household.commonAccountPlannedCategories] }
+        : {}),
+      ...(this.state.household.commonAccountManualBalance
+        ? { commonAccountManualBalance: { ...this.state.household.commonAccountManualBalance } }
         : {}),
       ...(this.state.customCategories.length > 0
         ? {
@@ -1944,11 +2409,32 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       monthClosures: this.state.monthClosures.map(({ closedAt: _c, ...r }) => r),
       goals: this.state.goals.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       goalMovements: this.state.goalMovements.map(({ createdAt: _c, ...r }) => r),
+      ...(Object.keys(this.state.savingsPlans).length > 0
+        ? {
+            savingsPlans: Object.values(this.state.savingsPlans)
+              .sort((a, b) => a.monthKey.localeCompare(b.monthKey))
+              .map(({ updatedAt: _u, ...r }) => r),
+          }
+        : {}),
       shopping: this.state.shopping.map(({ createdAt: _c, updatedAt: _u, ...r }) => r),
       ...(this.state.shoppingCatalog.length > 0
         ? {
             shoppingCatalog: this.state.shoppingCatalog.map(
               ({ createdAt: _c, updatedAt: _u, ...r }) => r
+            ),
+          }
+        : {}),
+      ...(this.state.shoppingTemplates.length > 0
+        ? {
+            shoppingTemplates: this.state.shoppingTemplates.map(
+              ({ createdAt: _c, updatedAt: _u, ...r }) => r
+            ),
+          }
+        : {}),
+      ...(this.state.shoppingSectionOverrides.length > 0
+        ? {
+            shoppingSectionOverrides: this.state.shoppingSectionOverrides.map(
+              ({ updatedAt: _u, ...r }) => r
             ),
           }
         : {}),
@@ -1959,11 +2445,31 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     const now = new Date().toISOString();
     this.state.household.name = backup.householdName;
     this.state.household.settings = backup.settings;
+    if (typeof backup.mudanzaCompleted === 'boolean') {
+      this.state.household.mudanzaCompleted = backup.mudanzaCompleted;
+      this.state.household.mudanzaCompletedAt = backup.mudanzaCompleted
+        ? (backup.mudanzaCompletedAt ?? now)
+        : null;
+      this.state.household.mudanzaCompletedBy = backup.mudanzaCompleted
+        ? (backup.mudanzaCompletedBy ?? actor.uid)
+        : null;
+    }
     if (backup.csvKeywords) {
       this.state.household.csvKeywords = { ...backup.csvKeywords };
     }
     if (backup.categoryColors) {
       this.state.household.categoryColors = { ...backup.categoryColors };
+    }
+    if (backup.commonAccountPlannedCategories !== undefined) {
+      this.state.household.commonAccountPlannedCategories = sanitizePlannedCommonCategories(
+        backup.commonAccountPlannedCategories
+      );
+    }
+    if (backup.commonAccountManualBalance !== undefined) {
+      this.state.household.commonAccountManualBalance =
+        backup.commonAccountManualBalance === null
+          ? null
+          : sanitizeCommonAccountManualBalance(backup.commonAccountManualBalance);
     }
     if (Array.isArray(backup.customCategories)) {
       this.state.customCategories = backup.customCategories.map((c) => ({
@@ -1988,7 +2494,22 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.state.initialCosts = backup.initialCosts.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.checklist = backup.checklist.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
     this.state.items = backup.items.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
-    this.state.recurring = backup.recurring.map((c) => ({ ...c, createdAt: now, updatedAt: now }));
+    const existingRecurringById = new Map(this.state.recurring.map((r) => [r.id, r]));
+    this.state.recurring = backup.recurring.map((c) => {
+      const prevSkippedClosed = sanitizeSkippedMonths(
+        existingRecurringById.get(c.id)?.skippedMonths
+      ).filter((mk) => alreadyClosedMonths.has(mk));
+      const importedSkippedOpen = sanitizeSkippedMonths(c.skippedMonths).filter(
+        (mk) => !alreadyClosedMonths.has(mk)
+      );
+      const mergedSkipped = sanitizeSkippedMonths([...prevSkippedClosed, ...importedSkippedOpen]);
+      return {
+        ...c,
+        ...(mergedSkipped.length > 0 ? { skippedMonths: mergedSkipped } : {}),
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
     const preservedPrivateFromPartner = this.state.transactions.filter(
       (t) => t.isPrivate && t.createdBy !== actor.uid
     );
@@ -2042,6 +2563,21 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     this.state.monthClosures = Array.from(closuresByMonth.values());
     this.state.goals = backup.goals.map((g) => ({ ...g, createdAt: now, updatedAt: now }));
     this.state.goalMovements = backup.goalMovements.map((m) => ({ ...m, createdAt: now }));
+    if (Array.isArray(backup.savingsPlans)) {
+      const goalsById = new Map(this.state.goals.map((g) => [g.id, g]));
+      const nextPlans: Record<string, MonthlySavingsPlan> = {};
+      for (const sp of backup.savingsPlans) {
+        if (!isValidMonthKey(sp.monthKey)) continue;
+        nextPlans[sp.monthKey] = {
+          monthKey: sp.monthKey,
+          targetAmount: roundCents(Math.max(0, Number(sp.targetAmount) || 0)),
+          allocations: sanitizeSavingsPlanAllocations(sp.allocations, goalsById),
+          updatedBy: sp.updatedBy || actor.uid,
+          updatedAt: now,
+        };
+      }
+      this.state.savingsPlans = nextPlans;
+    }
     if (Array.isArray(backup.shopping)) {
       this.state.shopping = backup.shopping.map((s) => ({
         ...s,
@@ -2055,6 +2591,24 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         ...c,
         createdBy: c.createdBy || actor.uid,
         createdAt: now,
+        updatedAt: now,
+      }));
+    }
+    if (Array.isArray(backup.shoppingTemplates)) {
+      this.state.shoppingTemplates = backup.shoppingTemplates.map((t) => ({
+        ...t,
+        items: sanitizeShoppingTemplateItems(t.items),
+        createdBy: t.createdBy || actor.uid,
+        createdAt: now,
+        updatedAt: now,
+      }));
+    }
+    if (Array.isArray(backup.shoppingSectionOverrides)) {
+      this.state.shoppingSectionOverrides = backup.shoppingSectionOverrides.map((ov) => ({
+        ...ov,
+        id: ov.productKey || ov.id,
+        productKey: ov.productKey || ov.id,
+        updatedBy: actor.uid,
         updatedAt: now,
       }));
     }

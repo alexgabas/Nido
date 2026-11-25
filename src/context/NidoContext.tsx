@@ -9,9 +9,11 @@ import {
 } from '../domain/finance';
 import {
   buildCategoryRegistry,
+  CATEGORY_SELECTOR_PREFS_VERSION,
   mergeMonthlyAndCustomBudgetLimits,
   type CategoryRegistry,
 } from '../domain/categories';
+import { buildSectionOverridesMap } from '../domain/shoppingCatalog';
 import {
   buildLocalNoticeStorageKey,
   LOCAL_NOTICE_UPDATED_EVENT,
@@ -30,7 +32,14 @@ import {
   type ShoppingCheckoutItemSnapshot,
 } from '../domain/shoppingCheckout';
 import { usePwaUpdateBlock } from '../services/pwaUpdateGuard';
+import { annualBalanceSessionCache } from '../domain/annualBalance';
 import { globalSearchSessionCache } from '../domain/globalSearch';
+import {
+  isMudanzaCompleted,
+  isValidNavTab,
+  resolveDeepLinkNavigation,
+  resolveTabForUiMode,
+} from '../domain/mudanzaStage';
 import { DemoHouseholdRepository } from '../repositories/DemoHouseholdRepository';
 import { FirestoreHouseholdRepository } from '../repositories/FirestoreHouseholdRepository';
 import type {
@@ -50,14 +59,19 @@ import type {
   Household,
   HouseholdMember,
   InitialCost,
+  MemberCategoryPreferences,
   MonthClosure,
   MonthlyBudget,
+  MonthlySavingsPlan,
   NavTab,
   PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
   ShoppingCatalogItem,
   ShoppingItem,
+  ShoppingListTemplate,
+  ShoppingSection,
+  ShoppingSectionOverride,
   ThemeMode,
   Transaction,
   UiMode,
@@ -101,9 +115,10 @@ interface NidoContextValue {
   setActiveTab: (tab: NavTab) => void;
   selectedMonthKey: string;
   setSelectedMonthKey: (mk: string) => void;
-  focusMensualSection: 'plantillas' | null;
+  focusMensualSection: 'plantillas' | 'cierre_guiado' | null;
   clearFocusMensualSection: () => void;
   openHabitualSetupInAvanzado: () => Promise<void>;
+  openGuidedMonthClose: (monthKey: string) => void;
   uiMode: UiMode;
   toggleUiMode: () => Promise<void>;
   theme: ThemeMode;
@@ -136,9 +151,11 @@ interface NidoContextValue {
   pendingOpenShopping: boolean;
   consumePendingOpenShopping: () => void;
 
-  // Categories Registry
+  // Categories Registry & Personal Selector Preferences
   customCategories: CustomCategory[];
   categoryRegistry: CategoryRegistry;
+  memberCategoryPreferences: MemberCategoryPreferences | null;
+  saveMemberCategoryPreferences: (visibleCategoryIds: string[]) => Promise<void>;
 
   // Real-time Collections
   activity: ActivityEntry[];
@@ -155,8 +172,12 @@ interface NidoContextValue {
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
   goalMovements: GoalMovement[];
+  savingsPlans: MonthlySavingsPlan[];
   shoppingItems: ShoppingItem[];
   shoppingCatalog: ShoppingCatalogItem[];
+  shoppingTemplates: ShoppingListTemplate[];
+  shoppingSectionOverrides: ShoppingSectionOverride[];
+  shoppingSectionOverridesMap: ReadonlyMap<string, ShoppingSection>;
 
   // Repository & Feedback
   repo: HouseholdRepository;
@@ -210,26 +231,37 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [selectedCategoryBudgets, setSelectedCategoryBudgets] = useState<CategoryBudgetLimit[]>([]);
   const [currentCategoryBudgets, setCurrentCategoryBudgets] = useState<CategoryBudgetLimit[]>([]);
   const [customCategories, setCustomCategories] = useState<CustomCategory[]>([]);
+  const [memberCategoryPreferences, setMemberCategoryPreferences] =
+    useState<MemberCategoryPreferences | null>(null);
+  const [memberPrefsLoaded, setMemberPrefsLoaded] = useState(false);
   const [monthClosures, setMonthClosures] = useState<MonthClosure[]>([]);
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
   const [goalMovements, setGoalMovements] = useState<GoalMovement[]>([]);
+  const [savingsPlans, setSavingsPlans] = useState<MonthlySavingsPlan[]>([]);
   const [shoppingItems, setShoppingItems] = useState<ShoppingItem[]>([]);
   const [shoppingCatalog, setShoppingCatalog] = useState<ShoppingCatalogItem[]>([]);
+  const [shoppingTemplates, setShoppingTemplates] = useState<ShoppingListTemplate[]>([]);
+  const [shoppingSectionOverrides, setShoppingSectionOverrides] = useState<
+    ShoppingSectionOverride[]
+  >([]);
   const [pendingShoppingCheckouts, setPendingShoppingCheckouts] = useState<
     PendingShoppingCheckout[]
   >([]);
+  const categoryPrefsInitKeyRef = useRef<string | null>(null);
   const [localPendingCheckout, setLocalPendingCheckout] =
     useState<LocalPendingShoppingCheckout | null>(null);
   const [resumingShoppingCheckout, setResumingShoppingCheckout] = useState(false);
   const [seedPending, setSeedPending] = useState(false);
   const [seedingDefaults, setSeedingDefaults] = useState(false);
 
-  const [activeTab, setActiveTab] = useState<NavTab>('inicio');
+  const [activeTab, setActiveTabState] = useState<NavTab>('inicio');
+  const activeTabRef = useRef<NavTab>('inicio');
+  const uiModeRef = useRef<UiMode>('sencillo');
   const [selectedMonthKey, setSelectedMonthKey] = useState<string>(() => getCurrentMonthKeyLocal());
-  const [focusMensualSection, setFocusMensualSection] = useState<'plantillas' | null>(null);
+  const [focusMensualSection, setFocusMensualSection] = useState<'plantillas' | 'cierre_guiado' | null>(null);
   const [quickExpenseOpen, setQuickExpenseOpen] = useState(false);
   const [quickExpensePrefill, setQuickExpensePrefill] = useState<ExpensePrefill | null>(null);
-  const [shoppingOpen, setShoppingOpen] = useState(false);
+  const [shoppingOpen, setShoppingOpenState] = useState(false);
   const [pendingShoppingCleanupSnapshots, setPendingShoppingCleanupSnapshots] = useState<
     ShoppingCheckoutItemSnapshot[]
   >([]);
@@ -249,7 +281,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [noticeSettingsTick, setNoticeSettingsTick] = useState(0);
   const quickExpenseOnSavedRef = useRef<(() => Promise<void> | void) | null>(null);
   const pendingDeepLinkRef = useRef<{
-    tab: NavTab | null;
+    tab: string | null;
     action: string | null;
     open: string | null;
   } | null>(
@@ -257,22 +289,75 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (typeof window === 'undefined') return null;
       const params = new URLSearchParams(window.location.search);
       const rawTab = params.get('tab');
-      const allowedTabs: NavTab[] = ['inicio', 'mudanza', 'mensual', 'ahorros', 'ajustes', 'ayuda'];
-      const validTab = rawTab && allowedTabs.includes(rawTab as NavTab) ? (rawTab as NavTab) : null;
       const action = params.get('action');
       const open = params.get('open');
-      if (!validTab && !action && !open) return null;
-      return { tab: validTab, action, open };
+      if (!rawTab && !action && !open) return null;
+      return { tab: rawTab, action, open };
     })()
+  );
+
+  const buildUrlForTab = useCallback((tab: NavTab): string => {
+    if (typeof window === 'undefined') return '/';
+    const url = new URL(window.location.href);
+    url.searchParams.delete('action');
+    url.searchParams.delete('open');
+    if (tab === 'inicio') {
+      url.searchParams.delete('tab');
+    } else {
+      url.searchParams.set('tab', tab);
+    }
+    return `${url.pathname}${url.search}${url.hash}`;
+  }, []);
+
+  const navigateTab = useCallback(
+    (nextTab: NavTab, options?: { replace?: boolean; skipHistory?: boolean }) => {
+      const resolved = resolveTabForUiMode(nextTab, uiModeRef.current);
+      const prev = activeTabRef.current;
+      activeTabRef.current = resolved;
+      setActiveTabState(resolved);
+      if (resolved === 'compra') {
+        setShoppingOpenState(false);
+      }
+      if (typeof window === 'undefined' || options?.skipHistory) return;
+      try {
+        const nextUrl = buildUrlForTab(resolved);
+        if (options?.replace || prev === resolved) {
+          window.history.replaceState({ nidoTab: resolved }, '', nextUrl);
+        } else {
+          window.history.pushState({ nidoTab: resolved }, '', nextUrl);
+        }
+      } catch {
+        // Ignore history errors in restricted environments
+      }
+    },
+    [buildUrlForTab]
+  );
+
+  const setActiveTab = useCallback(
+    (tab: NavTab) => {
+      navigateTab(tab);
+    },
+    [navigateTab]
   );
 
   const consumePendingOpenShopping = useCallback(() => {
     setPendingOpenShopping(false);
   }, []);
 
+  const setShoppingOpen = useCallback(
+    (open: boolean) => {
+      if (open) {
+        navigateTab('compra');
+      } else {
+        setShoppingOpenState(false);
+      }
+    },
+    [navigateTab]
+  );
+
   const openShoppingList = useCallback(() => {
-    setShoppingOpen(true);
-  }, []);
+    navigateTab('compra');
+  }, [navigateTab]);
 
   const clearFocusMensualSection = useCallback(() => {
     setFocusMensualSection(null);
@@ -436,14 +521,38 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [members, currentUserProfile]);
 
   const uiMode: UiMode = currentMember?.uiMode ?? 'sencillo';
-  const effectiveTab: NavTab = uiMode === 'sencillo' && activeTab === 'ajustes' ? 'inicio' : activeTab;
+  uiModeRef.current = uiMode;
+  const effectiveTab: NavTab = resolveTabForUiMode(activeTab, uiMode);
+  const mudanzaCompleted = isMudanzaCompleted(household);
+
+  // Browser Back / Forward navigation sync
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handlePopState = (event: PopStateEvent) => {
+      const stateTab =
+        event.state && typeof event.state === 'object' ? (event.state as { nidoTab?: unknown }).nidoTab : null;
+      const queryTab = new URLSearchParams(window.location.search).get('tab');
+      const raw = typeof stateTab === 'string' ? stateTab : queryTab;
+      const candidate: NavTab = isValidNavTab(raw) ? raw : 'inicio';
+      const resolved = resolveTabForUiMode(candidate, uiModeRef.current);
+      activeTabRef.current = resolved;
+      setActiveTabState(resolved);
+      setShoppingOpenState(false);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   // 1) Base subscriptions always active once inside a household
   useEffect(() => {
     if (!householdId || !viewerUid) {
       setCustomCategories([]);
+      setMemberCategoryPreferences(null);
+      setMemberPrefsLoaded(false);
+      categoryPrefsInitKeyRef.current = null;
       return;
     }
+    setMemberPrefsLoaded(false);
     const onErr = (e: Error) => {
       setHouseholdError(
         toUserFriendlyErrorMessage(e, 'No se pudieron sincronizar los datos del hogar.')
@@ -452,12 +561,52 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const unsubH = repo.subscribeHousehold(householdId, setHousehold, onErr);
     const unsubM = repo.subscribeMembers(householdId, setMembers, onErr);
     const unsubCat = repo.subscribeCustomCategories(householdId, setCustomCategories, onErr);
+    const unsubPrefs = repo.subscribeMemberCategoryPreferences(
+      householdId,
+      viewerUid,
+      (prefs) => {
+        setMemberCategoryPreferences(prefs);
+        setMemberPrefsLoaded(true);
+      },
+      (err) => {
+        // Si las reglas aún no se propagaron o hay error transitorio, no bloqueamos el resto de la app.
+        console.warn('[Nido] Preferencias de categorías no disponibles temporalmente:', err.message);
+        setMemberPrefsLoaded(true);
+      }
+    );
     return () => {
       unsubH();
       unsubM();
       unsubCat();
+      unsubPrefs();
     };
   }, [householdId, viewerUid, repo]);
+
+  // 1b) Idempotent versioned initialization of initial 14 visible categories (never overwrites user customizations)
+  useEffect(() => {
+    if (!householdId || !viewerUid || !currentUserProfile || !memberPrefsLoaded) return;
+    if (
+      memberCategoryPreferences &&
+      memberCategoryPreferences.selectorVersion >= CATEGORY_SELECTOR_PREFS_VERSION
+    ) {
+      return;
+    }
+    const initKey = `${householdId}:${viewerUid}`;
+    if (categoryPrefsInitKeyRef.current === initKey) return;
+    categoryPrefsInitKeyRef.current = initKey;
+
+    void repo
+      .ensureInitialVisibleCategoriesSetup(householdId, viewerUid, currentUserProfile)
+      .then((saved) => {
+        setMemberCategoryPreferences(saved);
+      })
+      .catch(() => {
+        // Permite reintentar si falló por red temporal sin romper la sesión.
+        if (categoryPrefsInitKeyRef.current === initKey) {
+          categoryPrefsInitKeyRef.current = null;
+        }
+      });
+  }, [householdId, viewerUid, currentUserProfile, memberPrefsLoaded, memberCategoryPreferences, repo]);
 
   // 2) Activity (Avanzado · Inicio only)
   useEffect(() => {
@@ -481,9 +630,12 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return repo.subscribeInitialCosts(householdId, setInitialCosts, onErr);
   }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
 
-  // 4) Checklist & Furniture (Inicio or Mudanza in both modes)
+  // 4) Checklist & Furniture (Mudanza always; Inicio/Ajustes only while Mudanza stage is active)
   useEffect(() => {
-    if (!householdId || !viewerUid || (effectiveTab !== 'inicio' && effectiveTab !== 'mudanza')) {
+    const needed =
+      effectiveTab === 'mudanza' ||
+      (!mudanzaCompleted && (effectiveTab === 'inicio' || effectiveTab === 'ajustes'));
+    if (!householdId || !viewerUid || !needed) {
       setChecklist([]);
       setFurnitureItems([]);
       return;
@@ -496,7 +648,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       unsubCl();
       unsubFur();
     };
-  }, [householdId, viewerUid, effectiveTab, repo]);
+  }, [householdId, viewerUid, effectiveTab, mudanzaCompleted, repo]);
 
   // 5) Recurring templates (Inicio, Mensual in both modes, Ahorros, or Avanzado Ajustes)
   useEffect(() => {
@@ -599,9 +751,9 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [householdId, viewerUid, uiMode, effectiveTab, repo]);
 
-  // 9) Selected month budget (Avanzado · Mensual only)
+  // 9) Selected month budget (Mensual in both Sencillo and Avanzado so both modes use identical planning data)
   useEffect(() => {
-    if (!householdId || !viewerUid || uiMode !== 'avanzado' || effectiveTab !== 'mensual') {
+    if (!householdId || !viewerUid || effectiveTab !== 'mensual') {
       setRawBudget(null);
       setSelectedCategoryBudgets([]);
       return;
@@ -665,9 +817,23 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [householdId, viewerUid, effectiveTab, repo]);
 
-  // 13) Shopping list (Inicio or whenever Shopping drawer is open)
+  // 12b) Monthly savings plans (exclusively when Ahorros tab is active — zero reads from Inicio)
   useEffect(() => {
-    if (!householdId || !viewerUid || (effectiveTab !== 'inicio' && !shoppingOpen)) {
+    if (!householdId || !viewerUid || effectiveTab !== 'ahorros') {
+      setSavingsPlans([]);
+      return;
+    }
+    const onErr = (e: Error) =>
+      setHouseholdError(
+        toUserFriendlyErrorMessage(e, 'No se pudo cargar el plan de ahorro mensual.')
+      );
+    return repo.subscribeSavingsPlans(householdId, setSavingsPlans, onErr);
+  }, [householdId, viewerUid, effectiveTab, repo]);
+
+  // 13) Shopping list (Inicio, Compra page, or legacy Shopping drawer)
+  useEffect(() => {
+    const needed = effectiveTab === 'inicio' || effectiveTab === 'compra' || shoppingOpen;
+    if (!householdId || !viewerUid || !needed) {
       setShoppingItems([]);
       return;
     }
@@ -676,18 +842,47 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return repo.subscribeShopping(householdId, setShoppingItems, onErr);
   }, [householdId, viewerUid, effectiveTab, shoppingOpen, repo]);
 
-  // 14) Shopping household catalog (only when Shopping drawer is open)
+  // 14) Shopping household catalog & reusable templates (only when Compra page or drawer is active)
   useEffect(() => {
-    if (!householdId || !viewerUid || !shoppingOpen) {
+    const needed = effectiveTab === 'compra' || shoppingOpen;
+    if (!householdId || !viewerUid || !needed) {
       setShoppingCatalog([]);
+      setShoppingTemplates([]);
       return;
     }
     const onErr = (e: Error) =>
       setHouseholdError(
         toUserFriendlyErrorMessage(e, 'No se pudo cargar el catálogo de la compra.')
       );
-    return repo.subscribeShoppingCatalog(householdId, setShoppingCatalog, onErr);
-  }, [householdId, viewerUid, shoppingOpen, repo]);
+    const unsubCatalog = repo.subscribeShoppingCatalog(householdId, setShoppingCatalog, onErr);
+    const unsubTemplates = repo.subscribeShoppingTemplates(
+      householdId,
+      setShoppingTemplates,
+      (err) => {
+        console.warn('[Nido] Plantillas de compra no disponibles temporalmente:', err.message);
+      }
+    );
+    return () => {
+      unsubCatalog();
+      unsubTemplates();
+    };
+  }, [householdId, viewerUid, effectiveTab, shoppingOpen, repo]);
+
+  // 14b) Product section overrides (active on Inicio, Compra page, or Shopping drawer)
+  useEffect(() => {
+    const needed = effectiveTab === 'inicio' || effectiveTab === 'compra' || shoppingOpen;
+    if (!householdId || !viewerUid || !needed) {
+      setShoppingSectionOverrides([]);
+      return;
+    }
+    return repo.subscribeShoppingSectionOverrides(
+      householdId,
+      setShoppingSectionOverrides,
+      (err) => {
+        console.warn('[Nido] Secciones personalizadas de compra no disponibles temporalmente:', err.message);
+      }
+    );
+  }, [householdId, viewerUid, effectiveTab, shoppingOpen, repo]);
 
   // 15) Pending durable shopping checkouts (0 docs in steady state; enables cross-device & reload recovery)
   useEffect(() => {
@@ -727,6 +922,22 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [customCategories, household?.categoryColors]
   );
 
+  const shoppingSectionOverridesMap = useMemo(
+    () => buildSectionOverridesMap(shoppingSectionOverrides),
+    [shoppingSectionOverrides]
+  );
+
+  const saveMemberCategoryPreferences = useCallback(
+    async (visibleCategoryIds: string[]) => {
+      if (!householdId || !viewerUid) return;
+      await repo.saveMemberCategoryPreferences(householdId, viewerUid, {
+        selectorVersion: CATEGORY_SELECTOR_PREFS_VERSION,
+        visibleCategoryIds,
+      });
+    },
+    [householdId, viewerUid, repo]
+  );
+
   const effectiveSplitPctA = useMemo(() => {
     if (!household) return 50;
     return computeEffectiveSplitPctA(household.settings);
@@ -739,9 +950,15 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const logout = useCallback(async () => {
     globalSearchSessionCache.clearAll();
+    annualBalanceSessionCache.clearAll();
     clearAllLocalPendingCheckouts();
     setLocalPendingCheckout(null);
     setPendingShoppingCheckouts([]);
+    setMemberCategoryPreferences(null);
+    setMemberPrefsLoaded(false);
+    setShoppingTemplates([]);
+    setShoppingSectionOverrides([]);
+    categoryPrefsInitKeyRef.current = null;
     if (isDemoMode) {
       setIsDemoMode(false);
       setHouseholdId(null);
@@ -753,16 +970,26 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const enterDemoMode = useCallback(() => {
     globalSearchSessionCache.clearAll();
+    annualBalanceSessionCache.clearAll();
     clearAllLocalPendingCheckouts();
     setLocalPendingCheckout(null);
+    setMemberCategoryPreferences(null);
+    setMemberPrefsLoaded(false);
+    categoryPrefsInitKeyRef.current = null;
     setIsDemoMode(true);
   }, []);
 
   const exitDemoMode = useCallback(() => {
     globalSearchSessionCache.clearAll();
+    annualBalanceSessionCache.clearAll();
     clearAllLocalPendingCheckouts();
     setLocalPendingCheckout(null);
     setPendingShoppingCheckouts([]);
+    setMemberCategoryPreferences(null);
+    setMemberPrefsLoaded(false);
+    setShoppingTemplates([]);
+    setShoppingSectionOverrides([]);
+    categoryPrefsInitKeyRef.current = null;
     setIsDemoMode(false);
     setHouseholdId(null);
     setHousehold(null);
@@ -818,14 +1045,16 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const next: UiMode = uiMode === 'sencillo' ? 'avanzado' : 'sencillo';
     try {
       await repo.updateMemberUiMode(householdId, currentUserProfile.uid, next);
-      if (next === 'sencillo' && activeTab === 'ajustes') {
-        setActiveTab('inicio');
+      uiModeRef.current = next;
+      const equivalentTab = resolveTabForUiMode(activeTabRef.current, next);
+      if (equivalentTab !== activeTabRef.current) {
+        navigateTab(equivalentTab, { replace: true });
       }
       showToast(next === 'avanzado' ? 'Modo Avanzado activado' : 'Modo Sencillo activado');
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo cambiar el modo de interfaz.'));
     }
-  }, [householdId, currentUserProfile, uiMode, activeTab, repo, showToast]);
+  }, [householdId, currentUserProfile, uiMode, navigateTab, repo, showToast]);
 
   const openHabitualSetupInAvanzado = useCallback(async () => {
     try {
@@ -839,6 +1068,12 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo abrir la configuración de habituales.'));
     }
   }, [uiMode, householdId, currentUserProfile, repo, showToast]);
+
+  const openGuidedMonthClose = useCallback((monthKey: string) => {
+    setSelectedMonthKey(monthKey);
+    setFocusMensualSection('cierre_guiado');
+    setActiveTab('mensual');
+  }, []);
 
   const registerPendingShoppingCleanup = useCallback(
     (snapshots: ShoppingCheckoutItemSnapshot[]) => {
@@ -976,6 +1211,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
               repo.cleanupShoppingCheckoutBatch(householdId, id, snapsById),
             onPhase1Confirmed: (_expenseId, pendingIds) => {
               globalSearchSessionCache.invalidateHousehold(householdId);
+              annualBalanceSessionCache.invalidateHousehold(householdId);
               if (pendingIds.length > 0) {
                 const updated: LocalPendingShoppingCheckout = {
                   ...targetLocal,
@@ -1107,34 +1343,30 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [householdId, viewerUid, pendingShoppingCheckouts, repo, showToast]
   );
 
-  // Apply PWA deep link ONLY once auth + household + members are ready, then clean URL params
+  // Apply PWA & legacy deep links ONLY once auth + household + members are ready, then normalize history state
   useEffect(() => {
-    const dl = pendingDeepLinkRef.current;
-    if (!dl) return;
     if (!isDemoMode && !authReady) return;
     if (!householdId || !household || members.length === 0) return;
 
-    pendingDeepLinkRef.current = null;
-    if (dl.action === 'add-expense') {
-      setQuickExpenseOpen(true);
-    }
-    if (dl.open === 'shopping') {
-      setShoppingOpen(true);
-    } else if (dl.tab) {
-      setActiveTab(uiMode === 'sencillo' && dl.tab === 'ajustes' ? 'inicio' : dl.tab);
+    const dl = pendingDeepLinkRef.current;
+    if (!dl) {
+      try {
+        if (!window.history.state?.nidoTab) {
+          window.history.replaceState({ nidoTab: activeTabRef.current }, '', buildUrlForTab(activeTabRef.current));
+        }
+      } catch {
+        // Ignore history errors
+      }
+      return;
     }
 
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.delete('tab');
-      url.searchParams.delete('action');
-      url.searchParams.delete('open');
-      const nextUrl = `${url.pathname}${url.search}${url.hash}`;
-      window.history.replaceState({}, '', nextUrl);
-    } catch {
-      // Ignore history errors
+    pendingDeepLinkRef.current = null;
+    const resolved = resolveDeepLinkNavigation(dl, uiMode);
+    if (resolved.openQuickExpense) {
+      setQuickExpenseOpen(true);
     }
-  }, [isDemoMode, authReady, householdId, household, members.length, uiMode]);
+    navigateTab(resolved.targetTab ?? 'inicio', { replace: true });
+  }, [isDemoMode, authReady, householdId, household, members.length, uiMode, navigateTab, buildUrlForTab]);
 
   // Keep local foreground notification settings reactive across AjustesView <-> NidoContext
   useEffect(() => {
@@ -1221,6 +1453,7 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     focusMensualSection,
     clearFocusMensualSection,
     openHabitualSetupInAvanzado,
+    openGuidedMonthClose,
     uiMode,
     toggleUiMode,
     theme,
@@ -1249,6 +1482,8 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     consumePendingOpenShopping,
     customCategories,
     categoryRegistry,
+    memberCategoryPreferences,
+    saveMemberCategoryPreferences,
     activity,
     initialCosts,
     checklist,
@@ -1263,8 +1498,12 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     monthClosures,
     goals,
     goalMovements,
+    savingsPlans,
     shoppingItems,
     shoppingCatalog,
+    shoppingTemplates,
+    shoppingSectionOverrides,
+    shoppingSectionOverridesMap,
     repo,
     toastMessage,
     showToast,

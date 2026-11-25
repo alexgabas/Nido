@@ -2043,6 +2043,728 @@ test('20. Consultas reales de FirestoreHouseholdRepository cumplen las reglas y 
   );
 });
 
+// ─── 21. Creación de categorías manuales y sugeridas (incluidos IDs de 1 letra) ─
+test('21. Categorías — Creación manual y sugerida válida, rechazo de icono/ID inválido y aislamiento del hogar', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Creación sugerida (cat_restaurantes_pedidos) por Miembro A + log de actividad
+  const sugBatch = dbAlex.batch();
+  sugBatch.set(dbAlex.doc('households/h1/categories/cat_restaurantes_pedidos'), {
+    name: 'Restaurantes y pedidos',
+    color: '#EA580C',
+    icon: 'utensils',
+    order: 3,
+    archived: false,
+    csvKeywords: 'restaurante, glovo',
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  sugBatch.set(dbAlex.doc('households/h1/activity/act_cat_sug'), {
+    uid: 'uid_alex',
+    actorName: 'Alex',
+    action: 'create',
+    entity: 'categoria',
+    entityId: 'cat_restaurantes_pedidos',
+    summary: 'Creó categoría "Restaurantes y pedidos"',
+    timestamp: ts,
+  });
+  await assertSucceeds(sugBatch.commit());
+
+  // Creación manual de 1 letra normalizada (cat_a_cat) por Miembro B
+  await assertSucceeds(
+    dbMarta.doc('households/h1/categories/cat_a_cat').set({
+      name: 'A',
+      color: '#0F766E',
+      icon: 'tag',
+      order: 4,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Rechazar ID demasiado corto (< 6 chars), icono no permitido o color no hexadecimal
+  await assertFails(
+    dbAlex.doc('households/h1/categories/cat_a').set({
+      name: 'A',
+      color: '#0F766E',
+      icon: 'tag',
+      order: 5,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/categories/cat_bad_icon').set({
+      name: 'Malo',
+      color: '#0F766E',
+      icon: 'invalid-icon',
+      order: 5,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso ajeno al hogar no puede leer ni escribir categorías
+  await assertFails(dbIntruder.doc('households/h1/categories/cat_a_cat').get());
+  await assertFails(
+    dbIntruder.doc('households/h1/categories/cat_intruso').set({
+      name: 'Intruso',
+      color: '#0F766E',
+      icon: 'tag',
+      order: 6,
+      archived: false,
+      csvKeywords: '',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+});
+
+// ─── 22. memberPreferences — Aislamiento estricto por usuario dentro del hogar ─
+test('22. memberPreferences — Cada miembro solo lee/escribe sus propias preferencias y nunca lista ni borra', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  await assertSucceeds(
+    dbAlex.doc('households/h1/memberPreferences/uid_alex').set({
+      selectorVersion: 1,
+      visibleCategoryIds: ['supermercado', 'ocio', 'otros'],
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(dbAlex.doc('households/h1/memberPreferences/uid_alex').get());
+  await assertSucceeds(
+    dbAlex.doc('households/h1/memberPreferences/uid_alex').update({
+      selectorVersion: 1,
+      visibleCategoryIds: ['otros', 'supermercado'],
+      updatedAt: ts,
+    })
+  );
+
+  // Pareja e intruso no pueden leer, crear, modificar, listar ni borrar preferencias ajenas
+  await assertFails(dbMarta.doc('households/h1/memberPreferences/uid_alex').get());
+  await assertFails(
+    dbMarta.doc('households/h1/memberPreferences/uid_alex').update({
+      selectorVersion: 1,
+      visibleCategoryIds: ['ocio'],
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h1/memberPreferences/uid_other').set({
+      selectorVersion: 1,
+      visibleCategoryIds: ['ocio'],
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbAlex.collection('households/h1/memberPreferences').get());
+  await assertFails(dbAlex.doc('households/h1/memberPreferences/uid_alex').delete());
+  await assertFails(dbIntruder.doc('households/h1/memberPreferences/uid_alex').get());
+});
+
+// ─── 23. shoppingTemplates y shoppingSectionOverrides — Reglas compartidas ───
+test('23. shoppingTemplates y shoppingSectionOverrides — CRUD válido en hogar, validación de campos y bloqueo de suplantación/intrusos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Plantilla reutilizable creada por Alex y editada/borrada por Marta
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shoppingTemplates/tpl_semanal').set({
+      name: 'Compra semanal',
+      items: [
+        {
+          text: 'Leche entera',
+          qty: 2,
+          unit: 'L',
+          section: 'Lácteos, quesos y bebidas vegetales',
+          sourceType: 'mercadona',
+        },
+      ],
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(dbMarta.collection('households/h1/shoppingTemplates').get());
+  await assertSucceeds(
+    dbMarta.doc('households/h1/shoppingTemplates/tpl_semanal').update({
+      name: 'Compra semanal actualizada',
+      items: [{ text: 'Leche entera', qty: 3, unit: 'L' }],
+      updatedAt: ts,
+    })
+  );
+
+  // Suplantación de createdBy o qty <= 0 -> RECHAZADO
+  await assertFails(
+    dbMarta.doc('households/h1/shoppingTemplates/tpl_spoof').set({
+      name: 'Spoof',
+      items: [{ text: 'Pan', qty: 1 }],
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingTemplates/tpl_bad_qty').set({
+      name: 'Mala cantidad',
+      items: [{ text: 'Pan', qty: 0 }],
+      createdBy: 'uid_alex',
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbIntruder.doc('households/h1/shoppingTemplates/tpl_semanal').get());
+
+  // Sobrescritura manual de sección por producto (incluyendo 'Sin clasificar')
+  await assertSucceeds(
+    dbAlex.doc('households/h1/shoppingSectionOverrides/gen_platanos').set({
+      productKey: 'gen_platanos',
+      section: 'Sin clasificar',
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbMarta.doc('households/h1/shoppingSectionOverrides/gen_platanos').update({
+      productKey: 'gen_platanos',
+      section: 'Fruta y verdura',
+      updatedBy: 'uid_marta',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza sección vacía '', updatedBy suplantado, productKey distinto del docId e intruso
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingSectionOverrides/gen_bad').set({
+      productKey: 'gen_bad',
+      section: '',
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h1/shoppingSectionOverrides/gen_spoof').set({
+      productKey: 'gen_spoof',
+      section: 'Bebidas',
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/shoppingSectionOverrides/gen_mismatch').set({
+      productKey: 'otro_id',
+      section: 'Bebidas',
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbIntruder.doc('households/h1/shoppingSectionOverrides/gen_platanos').get());
+
+  await assertSucceeds(dbMarta.doc('households/h1/shoppingSectionOverrides/gen_platanos').delete());
+  await assertSucceeds(dbMarta.doc('households/h1/shoppingTemplates/tpl_semanal').delete());
+});
+
+test('24. Planificación Cuenta común en /households/{hid}: categorías variables y saldo disponible manual (Acciones 7 y 8)', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Acción 7: miembro guarda categorías variables planificadas (válido)
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      commonAccountPlannedCategories: ['supermercado', 'cat_mascotas'],
+      updatedAt: ts,
+    })
+  );
+  // Pareja puede vaciar la lista
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      commonAccountPlannedCategories: [],
+      updatedAt: ts,
+    })
+  );
+  // Lista con más de 60 categorías rechazada
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      commonAccountPlannedCategories: Array.from({ length: 61 }, (_, i) => `cat_${i}`),
+      updatedAt: ts,
+    })
+  );
+  // Intruso rechazado
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      commonAccountPlannedCategories: ['supermercado'],
+      updatedAt: ts,
+    })
+  );
+
+  // Acción 8: miembro guarda saldo manual con su propio uid y fecha válida
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      commonAccountManualBalance: {
+        amount: 420.5,
+        referenceDate: '2026-11-10',
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-10T10:00:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+  // Pareja puede actualizar con su propio uid
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      commonAccountManualBalance: {
+        amount: 0,
+        referenceDate: '2026-11-12',
+        updatedBy: 'uid_marta',
+        updatedAt: '2026-11-12T10:00:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+  // Suplantación de updatedBy rechazada
+  await assertFails(
+    dbMarta.doc('households/h1').update({
+      commonAccountManualBalance: {
+        amount: 300,
+        referenceDate: '2026-11-12',
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-12T10:00:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+  // Importe negativo o fecha inválida rechazados
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      commonAccountManualBalance: {
+        amount: -10,
+        referenceDate: '2026-11-12',
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-12T10:00:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      commonAccountManualBalance: {
+        amount: 200,
+        referenceDate: '12/11/2026',
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-12T10:00:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+  // Mezclar saldo manual con settings o inviteCode rechazado
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      commonAccountManualBalance: null,
+      inviteCode: 'HACK99',
+      updatedAt: ts,
+    })
+  );
+  // Eliminar saldo (poner a null) permitido por miembro, rechazado para intruso
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      commonAccountManualBalance: null,
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      commonAccountManualBalance: null,
+      updatedAt: ts,
+    })
+  );
+});
+
+// ─── 25. recurring.skippedMonths: formato, omisión por mes y bloqueo en mes cerrado ──
+test('25. recurring.skippedMonths permite omitir/deshacer solo meses abiertos y bloquea meses cerrados o payloads inválidos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Crear plantilla activa sin skippedMonths (compatibilidad histórica)
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_luz').set({
+      concept: 'Luz',
+      category: 'luz',
+      amount: 68,
+      frequency: 'mensual',
+      dayOfMonth: 10,
+      startMonth: '2026-09',
+      splitOverride: null,
+      paidByDefault: 'cuenta_comun',
+      active: true,
+      createdAt: ts,
+      updatedAt: ts,
+    })
+  );
+
+  // Añadir 2026-10 (mes abierto) a skippedMonths -> permitido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10'],
+      updatedAt: ts,
+    })
+  );
+
+  // Pareja añade 2026-11 (mes abierto) -> permitido
+  await assertSucceeds(
+    dbMarta.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10', '2026-11'],
+      updatedAt: ts,
+    })
+  );
+
+  // Deshacer 2026-11 mientras está abierto -> permitido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10'],
+      updatedAt: ts,
+    })
+  );
+
+  // Cerrar 2026-10 y 2026-12
+  await assertSucceeds(
+    dbAlex.doc('households/h1/monthClosures/2026-10').set({
+      monthKey: '2026-10',
+      totalSpent: 100,
+      paidA: 50,
+      paidB: 50,
+      paidComun: 0,
+      shareA: 50,
+      shareB: 50,
+      balanceA: 0,
+      settlementText: 'Estáis en paz',
+      closedBy: 'uid_alex',
+      closedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbAlex.doc('households/h1/monthClosures/2026-12').set({
+      monthKey: '2026-12',
+      totalSpent: 100,
+      paidA: 50,
+      paidB: 50,
+      paidComun: 0,
+      shareA: 50,
+      shareB: 50,
+      balanceA: 0,
+      settlementText: 'Estáis en paz',
+      closedBy: 'uid_alex',
+      closedAt: ts,
+    })
+  );
+
+  // Quitar un mes cerrado (2026-10) -> RECHAZADO
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: [],
+      updatedAt: ts,
+    })
+  );
+
+  // Añadir un mes cerrado (2026-12) -> RECHAZADO
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10', '2026-12'],
+      updatedAt: ts,
+    })
+  );
+
+  // Añadir formato inválido o cambiar 2 meses a la vez o mezclar con amount -> RECHAZADO
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10', '2026/11'],
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10', '2026-11', '2027-01'],
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10', '2026-11'],
+      amount: 99,
+      updatedAt: ts,
+    })
+  );
+
+  // Editar importe normal SIN tocar skippedMonths sigue funcionando incluso si hay meses cerrados omitidos
+  await assertSucceeds(
+    dbAlex.doc('households/h1/recurring/rec_luz').update({
+      amount: 72,
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso rechazado
+  await assertFails(
+    dbIntruder.doc('households/h1/recurring/rec_luz').update({
+      skippedMonths: ['2026-10', '2026-11'],
+      updatedAt: ts,
+    })
+  );
+});
+
+// ─── 26. savingsPlans/{monthKey} — Plan de ahorro mensual compartido ──────────
+test('26. savingsPlans/{monthKey} — CRUD compartido, validación estricta y rechazo de suplantación/intrusos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  await joinHouseholdSecondMember('uid_marta', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Crear plan válido con targetAmount >= 0 y asignaciones ordenadas (incluso 0 € válido)
+  await assertSucceeds(
+    dbAlex.doc('households/h1/savingsPlans/2026-11').set({
+      monthKey: '2026-11',
+      targetAmount: 250,
+      allocations: [
+        { goalId: 'goal_1', plannedAmount: 150, priority: 0, goalNameSnapshot: 'Colchón' },
+        { goalId: 'goal_2', plannedAmount: 100, priority: 1, goalNameSnapshot: 'Viajes' },
+        { goalId: 'goal_3', plannedAmount: 0, priority: 2 },
+      ],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Ambos miembros pueden leer, listar y actualizar el plan compartido
+  await assertSucceeds(dbMarta.doc('households/h1/savingsPlans/2026-11').get());
+  await assertSucceeds(dbMarta.collection('households/h1/savingsPlans').get());
+  await assertSucceeds(
+    dbMarta.doc('households/h1/savingsPlans/2026-11').set({
+      monthKey: '2026-11',
+      targetAmount: 300,
+      allocations: [
+        { goalId: 'goal_2', plannedAmount: 180, priority: 0, goalNameSnapshot: 'Viajes' },
+        { goalId: 'goal_1', plannedAmount: 70, priority: 1, goalNameSnapshot: 'Colchón' },
+      ],
+      updatedBy: 'uid_marta',
+      updatedAt: ts,
+    })
+  );
+
+  // Plan vacío a 0 € también válido
+  await assertSucceeds(
+    dbAlex.doc('households/h1/savingsPlans/2026-12').set({
+      monthKey: '2026-12',
+      targetAmount: 0,
+      allocations: [],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza monthKey que no coincide con docId o formato inválido
+  await assertFails(
+    dbAlex.doc('households/h1/savingsPlans/2026-10').set({
+      monthKey: '2026-11',
+      targetAmount: 100,
+      allocations: [],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/savingsPlans/bad_month').set({
+      monthKey: 'bad_month',
+      targetAmount: 100,
+      allocations: [],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza targetAmount negativo, plannedAmount negativo o campo fantasma (ej. totalAssigned)
+  await assertFails(
+    dbAlex.doc('households/h1/savingsPlans/2026-09').set({
+      monthKey: '2026-09',
+      targetAmount: -10,
+      allocations: [],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/savingsPlans/2026-09').set({
+      monthKey: '2026-09',
+      targetAmount: 100,
+      allocations: [{ goalId: 'goal_1', plannedAmount: -5, priority: 0 }],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1/savingsPlans/2026-09').set({
+      monthKey: '2026-09',
+      targetAmount: 100,
+      allocations: [],
+      totalAssigned: 100,
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza suplantación de updatedBy
+  await assertFails(
+    dbMarta.doc('households/h1/savingsPlans/2026-09').set({
+      monthKey: '2026-09',
+      targetAmount: 100,
+      allocations: [],
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso no puede leer, listar, crear ni borrar
+  await assertFails(dbIntruder.doc('households/h1/savingsPlans/2026-11').get());
+  await assertFails(dbIntruder.collection('households/h1/savingsPlans').get());
+  await assertFails(
+    dbIntruder.doc('households/h1/savingsPlans/2026-09').set({
+      monthKey: '2026-09',
+      targetAmount: 50,
+      allocations: [],
+      updatedBy: 'uid_intruder',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(dbIntruder.doc('households/h1/savingsPlans/2026-11').delete());
+
+  // Miembro puede eliminar un plan
+  await assertSucceeds(dbMarta.doc('households/h1/savingsPlans/2026-12').delete());
+});
+
+test('27. Fin de etapa de mudanza (Acción 9): completar/reabrir compartido, anti-suplantación y aislamiento', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'SNT26A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  // Marta se une al hogar
+  const joinBatch = dbMarta.batch();
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: ['uid_alex', 'uid_marta'],
+    updatedAt: ts,
+  });
+  await assertSucceeds(joinBatch.commit());
+
+  // Alex da por terminada la mudanza (estado compartido)
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      mudanzaCompleted: true,
+      mudanzaCompletedAt: '2026-11-25T12:00:00.000Z',
+      mudanzaCompletedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Marta puede reabrir la mudanza limpiando timestamp/autor a null
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      mudanzaCompleted: false,
+      mudanzaCompletedAt: null,
+      mudanzaCompletedBy: null,
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza suplantación de mudanzaCompletedBy
+  await assertFails(
+    dbMarta.doc('households/h1').update({
+      mudanzaCompleted: true,
+      mudanzaCompletedAt: '2026-11-25T12:05:00.000Z',
+      mudanzaCompletedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza completar sin fecha válida o reabrir dejando autor/fecha no nulos
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      mudanzaCompleted: true,
+      mudanzaCompletedAt: '',
+      mudanzaCompletedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      mudanzaCompleted: false,
+      mudanzaCompletedAt: '2026-11-25T12:05:00.000Z',
+      mudanzaCompletedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza mezclar mudanzaCompleted con cambios no permitidos (ej. inviteCode o name)
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      mudanzaCompleted: true,
+      mudanzaCompletedAt: '2026-11-25T12:05:00.000Z',
+      mudanzaCompletedBy: 'uid_alex',
+      inviteCode: 'HACK99',
+      updatedAt: ts,
+    })
+  );
+
+  // Intruso no miembro rechazado
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      mudanzaCompleted: true,
+      mudanzaCompletedAt: '2026-11-25T12:05:00.000Z',
+      mudanzaCompletedBy: 'uid_intruder',
+      updatedAt: ts,
+    })
+  );
+});
+
+
+
+
+
 
 
 

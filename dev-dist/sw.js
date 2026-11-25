@@ -82,12 +82,34 @@ define(['./workbox-7b16fee0'], (function (workbox) { 'use strict';
    */
   workbox.precacheAndRoute([{
     "url": "index.html",
-    "revision": "0.fss8lp9j9t"
+    "revision": "0.4jq6pqfvbmg"
   }], {});
   workbox.cleanupOutdatedCaches();
   workbox.registerRoute(new workbox.NavigationRoute(workbox.createHandlerBoundToURL("index.html"), {
-    allowlist: [/^\/$/]
+    allowlist: [/^\/$/],
+    denylist: [/^\/assets\//, /^\/data\//]
   }));
+  workbox.registerRoute(/\/assets\/(pdfExport|html2canvas|purify\.es|index\.es)-.*\.js(\?.*)?$/i, new workbox.CacheFirst({
+    "cacheName": "nido-pdf-module-v1",
+    "matchOptions": {
+      "ignoreSearch": true
+    },
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 10,
+      maxAgeSeconds: 7776000
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [200]
+    })]
+  }), 'GET');
+  workbox.registerRoute(/\/data\/mercadona-catalog.*\.json$/i, new workbox.CacheFirst({
+    "cacheName": "nido-mercadona-catalog-v1",
+    plugins: [new workbox.ExpirationPlugin({
+      maxEntries: 3,
+      maxAgeSeconds: 7776000
+    }), new workbox.CacheableResponsePlugin({
+      statuses: [200]
+    })]
+  }), 'GET');
   workbox.registerRoute(/^https:\/\/fonts\.googleapis\.com\/.*/i, new workbox.CacheFirst({
     "cacheName": "google-fonts-cache",
     plugins: [new workbox.ExpirationPlugin({

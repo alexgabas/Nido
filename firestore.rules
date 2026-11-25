@@ -61,6 +61,10 @@ service cloud.firestore {
       return id is string && id.size() >= 10 && id.size() <= 48 && id.matches('^chk_[a-zA-Z0-9_]{6,40}$');
     }
 
+    function isValidShoppingOverrideKey(id) {
+      return id is string && id.size() >= 2 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
     function isMonthClosed(hid, monthKey) {
       return exists(/databases/$(database)/documents/households/$(hid)/monthClosures/$(monthKey));
     }
@@ -208,9 +212,33 @@ service cloud.firestore {
         && isValidCategoryColorVal(cc, 'otros');
     }
 
+    function isValidCommonAccountPlannedCategories(cats) {
+      return cats is list
+        && cats.size() <= 60
+        && (cats.size() == 0 || (cats[0] is string && cats[0].size() >= 1 && cats[0].size() <= 64));
+    }
+
+    function isValidCommonAccountManualBalance(bal) {
+      return bal == null
+        || (
+          bal is map
+          && bal.keys().hasAll(['amount', 'referenceDate', 'updatedBy', 'updatedAt'])
+          && bal.keys().hasOnly(['amount', 'referenceDate', 'updatedBy', 'updatedAt'])
+          && isNonNegNumber(bal.amount)
+          && isValidDateStr(bal.referenceDate)
+          && bal.updatedBy is string && bal.updatedBy.size() >= 1 && bal.updatedBy.size() <= 128
+          && bal.updatedAt is string && bal.updatedAt.size() >= 1 && bal.updatedAt.size() <= 64
+        );
+    }
+
     function isValidHousehold(data) {
       return data.keys().hasAll(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'categoryColors', 'seedPending', 'recurringSeedVersion', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'categoryColors',
+          'commonAccountPlannedCategories', 'commonAccountManualBalance',
+          'mudanzaCompleted', 'mudanzaCompletedAt', 'mudanzaCompletedBy',
+          'seedPending', 'recurringSeedVersion', 'createdAt', 'updatedAt'
+        ])
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
         && data.memberUids is list
         && data.memberUids.size() >= 1 && data.memberUids.size() <= 2
@@ -220,6 +248,11 @@ service cloud.firestore {
         && isValidSettings(data.settings)
         && (!('csvKeywords' in data) || isValidCsvKeywords(data.csvKeywords))
         && (!('categoryColors' in data) || isValidCategoryColors(data.categoryColors))
+        && (!('commonAccountPlannedCategories' in data) || isValidCommonAccountPlannedCategories(data.commonAccountPlannedCategories))
+        && (!('commonAccountManualBalance' in data) || isValidCommonAccountManualBalance(data.commonAccountManualBalance))
+        && (!('mudanzaCompleted' in data) || data.mudanzaCompleted is bool)
+        && (!('mudanzaCompletedAt' in data) || data.mudanzaCompletedAt == null || (data.mudanzaCompletedAt is string && data.mudanzaCompletedAt.size() <= 64))
+        && (!('mudanzaCompletedBy' in data) || data.mudanzaCompletedBy == null || (data.mudanzaCompletedBy is string && data.mudanzaCompletedBy.size() <= 128))
         && (!('seedPending' in data) || data.seedPending is bool)
         && (!('recurringSeedVersion' in data) || (data.recurringSeedVersion is int && data.recurringSeedVersion >= 0 && data.recurringSeedVersion <= 1000))
         && data.createdAt is timestamp
@@ -293,15 +326,33 @@ service cloud.firestore {
         && data.updatedAt == request.time;
     }
 
+    function isValidSkippedMonths(listVal) {
+      return listVal is list
+        && listVal.size() <= 120
+        && (listVal.size() == 0 || isValidMonthKey(listVal[0]));
+    }
+
+    function isValidSingleSkippedMonthChange(hid, ex, inc) {
+      let oldList = ('skippedMonths' in ex && ex.skippedMonths is list) ? ex.skippedMonths : [];
+      let newList = ('skippedMonths' in inc && inc.skippedMonths is list) ? inc.skippedMonths : [];
+      let added = newList.removeAll(oldList);
+      let removed = oldList.removeAll(newList);
+      return (
+        (added.size() == 1 && removed.size() == 0 && isValidMonthKey(added[0]) && !isMonthClosed(hid, added[0]))
+        || (removed.size() == 1 && added.size() == 0 && isValidMonthKey(removed[0]) && !isMonthClosed(hid, removed[0]))
+      );
+    }
+
     function isValidRecurring(data, hid) {
       return data.keys().hasAll(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'skippedMonths', 'splitOverride', 'paidByDefault', 'active', 'createdAt', 'updatedAt'])
         && data.concept is string && data.concept.size() >= 1 && data.concept.size() <= 120
         && isValidHouseholdExpenseCategory(data.category, hid)
         && isNonNegNumber(data.amount)
         && (data.frequency in ['mensual', 'bimestral', 'trimestral', 'anual'])
         && isFiniteNumber(data.dayOfMonth) && data.dayOfMonth >= 1 && data.dayOfMonth <= 31
         && (!('startMonth' in data) || data.startMonth == '' || isValidMonthKey(data.startMonth))
+        && (!('skippedMonths' in data) || isValidSkippedMonths(data.skippedMonths))
         && (data.splitOverride == null || (isFiniteNumber(data.splitOverride) && data.splitOverride >= 0 && data.splitOverride <= 100))
         && isHouseholdPayer(hid, data.paidByDefault)
         && data.active is bool
@@ -403,6 +454,29 @@ service cloud.firestore {
         && data.createdAt == request.time;
     }
 
+    function isValidSavingsPlan(data, monthKey) {
+      return data.keys().hasAll(['monthKey', 'targetAmount', 'allocations', 'updatedBy', 'updatedAt'])
+        && data.keys().hasOnly(['monthKey', 'targetAmount', 'allocations', 'updatedBy', 'updatedAt'])
+        && data.monthKey == monthKey
+        && isValidMonthKey(data.monthKey)
+        && isNonNegNumber(data.targetAmount)
+        && data.allocations is list && data.allocations.size() <= 50
+        && (
+          data.allocations.size() == 0
+          || (
+            data.allocations[0] is map
+            && data.allocations[0].keys().hasAll(['goalId', 'plannedAmount', 'priority'])
+            && data.allocations[0].keys().hasOnly(['goalId', 'plannedAmount', 'priority', 'goalNameSnapshot'])
+            && isValidId(data.allocations[0].goalId)
+            && isNonNegNumber(data.allocations[0].plannedAmount)
+            && data.allocations[0].priority is int && data.allocations[0].priority >= 0 && data.allocations[0].priority <= 99
+            && (!('goalNameSnapshot' in data.allocations[0]) || (data.allocations[0].goalNameSnapshot is string && data.allocations[0].goalNameSnapshot.size() <= 80))
+          )
+        )
+        && data.updatedBy is string && data.updatedBy == request.auth.uid
+        && data.updatedAt == request.time;
+    }
+
     function isValidShoppingSection(s) {
       return s is string && s in [
         '',
@@ -419,7 +493,8 @@ service cloud.firestore {
         'Limpieza y hogar',
         'Cuidado personal e higiene',
         'Bebé y mascotas',
-        'Otros de supermercado'
+        'Otros de supermercado',
+        'Sin clasificar'
       ];
     }
 
@@ -510,6 +585,51 @@ service cloud.firestore {
         );
     }
 
+    function isValidMemberCategoryPreferences(data) {
+      return data.keys().hasAll(['selectorVersion', 'visibleCategoryIds', 'updatedAt'])
+        && data.keys().hasOnly(['selectorVersion', 'visibleCategoryIds', 'updatedAt'])
+        && data.selectorVersion is int && data.selectorVersion >= 1 && data.selectorVersion <= 100
+        && data.visibleCategoryIds is list && data.visibleCategoryIds.size() <= 60
+        && (
+          data.visibleCategoryIds.size() == 0
+          || (
+            data.visibleCategoryIds[0] is string
+            && data.visibleCategoryIds[0].size() >= 2
+            && data.visibleCategoryIds[0].size() <= 48
+          )
+        )
+        && data.updatedAt == request.time;
+    }
+
+    function isValidShoppingTemplate(data) {
+      return data.keys().hasAll(['name', 'items', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'items', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.items is list && data.items.size() <= 100
+        && (
+          data.items.size() == 0
+          || (
+            data.items[0] is map
+            && data.items[0].keys().hasAll(['text', 'qty'])
+            && data.items[0].keys().hasOnly(['text', 'qty', 'unit', 'catalogId', 'brand', 'format', 'section', 'sourceType'])
+            && data.items[0].text is string && data.items[0].text.size() >= 1 && data.items[0].text.size() <= 120
+            && isFiniteNumber(data.items[0].qty) && data.items[0].qty > 0 && data.items[0].qty <= 999
+          )
+        )
+        && data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidShoppingSectionOverride(data, overrideId) {
+      return data.keys().hasAll(['productKey', 'section', 'updatedBy', 'updatedAt'])
+        && data.keys().hasOnly(['productKey', 'section', 'updatedBy', 'updatedAt'])
+        && data.productKey is string && data.productKey == overrideId
+        && isValidShoppingSection(data.section) && data.section != ''
+        && data.updatedBy is string && data.updatedBy == request.auth.uid
+        && data.updatedAt == request.time;
+    }
+
     // ─── /users/{uid} ────────────────────────────────────────────────────────
     match /users/{uid} {
       allow get: if isSignedIn() && isValidId(uid) && request.auth.uid == uid;
@@ -598,6 +718,46 @@ service cloud.firestore {
           (
             (request.auth.uid in existing().memberUids)
             && incoming().diff(existing()).affectedKeys().hasOnly(['categoryColors', 'updatedAt'])
+          )
+          ||
+          // Action 7: Update shared Common Account planned variable categories by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['commonAccountPlannedCategories', 'updatedAt'])
+          )
+          ||
+          // Action 8: Update or clear manual Common Account available balance by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['commonAccountManualBalance', 'updatedAt'])
+            && (
+              incoming().commonAccountManualBalance == null
+              || incoming().commonAccountManualBalance.updatedBy == request.auth.uid
+            )
+          )
+          ||
+          // Action 9: Mark moving stage as completed or reopen it by existing member (shared & reversible)
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['mudanzaCompleted', 'mudanzaCompletedAt', 'mudanzaCompletedBy', 'updatedAt'])
+            && ('mudanzaCompleted' in incoming())
+            && (
+              (
+                incoming().mudanzaCompleted == true
+                && ('mudanzaCompletedAt' in incoming())
+                && incoming().mudanzaCompletedAt is string
+                && incoming().mudanzaCompletedAt.size() >= 1
+                && incoming().mudanzaCompletedAt.size() <= 64
+                && ('mudanzaCompletedBy' in incoming())
+                && incoming().mudanzaCompletedBy == request.auth.uid
+              )
+              ||
+              (
+                incoming().mudanzaCompleted == false
+                && (!('mudanzaCompletedAt' in incoming()) || incoming().mudanzaCompletedAt == null)
+                && (!('mudanzaCompletedBy' in incoming()) || incoming().mudanzaCompletedBy == null)
+              )
+            )
           )
         );
 
@@ -698,7 +858,13 @@ service cloud.firestore {
           && isHouseholdMember(hid)
           && isValidRecurring(incoming(), hid)
           && incoming().createdAt == existing().createdAt
-          && incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'splitOverride', 'paidByDefault', 'active', 'updatedAt']);
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['concept', 'category', 'amount', 'frequency', 'dayOfMonth', 'startMonth', 'splitOverride', 'paidByDefault', 'active', 'updatedAt'])
+            || (
+              incoming().diff(existing()).affectedKeys().hasOnly(['skippedMonths', 'updatedAt'])
+              && isValidSingleSkippedMonthChange(hid, existing(), incoming())
+            )
+          );
         allow delete: if isValidId(hid) && isValidId(recId) && isHouseholdMember(hid);
       }
 
@@ -808,6 +974,21 @@ service cloud.firestore {
         allow delete: if isValidId(hid) && isValidId(movId) && isHouseholdMember(hid);
       }
 
+      // ─── /households/{hid}/savingsPlans/{monthKey} ────────────────────────
+      match /savingsPlans/{monthKey} {
+        allow get: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidMonthKey(monthKey)
+          && isValidSavingsPlan(incoming(), monthKey)
+          && isHouseholdMember(hid);
+        allow update: if isValidId(hid) && isValidMonthKey(monthKey)
+          && isValidSavingsPlan(incoming(), monthKey)
+          && isHouseholdMember(hid)
+          && incoming().monthKey == existing().monthKey
+          && incoming().diff(existing()).affectedKeys().hasOnly(['targetAmount', 'allocations', 'updatedBy', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
+      }
+
       // ─── /households/{hid}/categories/{catId} ─────────────────────────────
       match /categories/{catId} {
         allow get: if isValidId(hid) && isCustomCategoryId(catId) && isHouseholdMember(hid);
@@ -911,6 +1092,57 @@ service cloud.firestore {
         allow delete: if isValidId(hid) && isValidCheckoutId(checkoutId)
           && isHouseholdMember(hid)
           && (existing().isPrivate == false || existing().createdBy == request.auth.uid);
+      }
+
+      // ─── /households/{hid}/memberPreferences/{prefUid} ─────────────────────
+      match /memberPreferences/{prefUid} {
+        allow get: if isValidId(hid) && isValidId(prefUid)
+          && isHouseholdMember(hid)
+          && request.auth.uid == prefUid;
+        allow list: if false;
+        allow create: if isValidId(hid) && isValidId(prefUid)
+          && isHouseholdMember(hid)
+          && request.auth.uid == prefUid
+          && isValidMemberCategoryPreferences(incoming());
+        allow update: if isValidId(hid) && isValidId(prefUid)
+          && isHouseholdMember(hid)
+          && request.auth.uid == prefUid
+          && isValidMemberCategoryPreferences(incoming())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['selectorVersion', 'visibleCategoryIds', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      // ─── /households/{hid}/shoppingTemplates/{tplId} ──────────────────────
+      match /shoppingTemplates/{tplId} {
+        allow get: if isValidId(hid) && isValidId(tplId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidId(tplId)
+          && isHouseholdMember(hid)
+          && isValidShoppingTemplate(incoming())
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(hid) && isValidId(tplId)
+          && isHouseholdMember(hid)
+          && isValidShoppingTemplate(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().createdBy == existing().createdBy
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'items', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidId(tplId) && isHouseholdMember(hid);
+      }
+
+      // ─── /households/{hid}/shoppingSectionOverrides/{overrideId} ───────────
+      match /shoppingSectionOverrides/{overrideId} {
+        allow get: if isValidId(hid) && isValidShoppingOverrideKey(overrideId) && isHouseholdMember(hid);
+        allow list: if isValidId(hid) && isHouseholdMember(hid);
+        allow create: if isValidId(hid) && isValidShoppingOverrideKey(overrideId)
+          && isHouseholdMember(hid)
+          && isValidShoppingSectionOverride(incoming(), overrideId);
+        allow update: if isValidId(hid) && isValidShoppingOverrideKey(overrideId)
+          && isHouseholdMember(hid)
+          && isValidShoppingSectionOverride(incoming(), overrideId)
+          && incoming().productKey == existing().productKey
+          && incoming().diff(existing()).affectedKeys().hasOnly(['section', 'updatedBy', 'updatedAt']);
+        allow delete: if isValidId(hid) && isValidShoppingOverrideKey(overrideId) && isHouseholdMember(hid);
       }
     }
   }

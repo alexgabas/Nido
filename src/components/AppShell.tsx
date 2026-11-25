@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Archive,
   CalendarDays,
   ChevronDown,
   HelpCircle,
@@ -16,6 +17,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { useNido } from '../context/NidoContext';
+import { isMudanzaCompleted } from '../domain/mudanzaStage';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import type { NavTab } from '../types/nido';
@@ -24,25 +26,15 @@ import { PWAUpdateBanner } from './PWAUpdateBanner';
 import { QuickExpenseModal } from './QuickExpenseModal';
 import { ShoppingListSection } from './ShoppingListSection';
 
-const AVANZADO_NAV_ITEMS: Array<{
+const PRIMARY_NAV_ITEMS: Array<{
   id: NavTab;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }> = [
   { id: 'inicio', label: 'Inicio', icon: Home },
-  { id: 'mudanza', label: 'Mudanza', icon: Package },
   { id: 'mensual', label: 'Mensual', icon: CalendarDays },
+  { id: 'compra', label: 'Compra', icon: ShoppingCart },
   { id: 'ahorros', label: 'Ahorros', icon: PiggyBank },
-  { id: 'ajustes', label: 'Ajustes', icon: Settings },
-];
-
-const SENCILLO_DESKTOP_NAV_ITEMS: Array<{
-  id: NavTab;
-  label: string;
-}> = [
-  { id: 'inicio', label: 'Inicio' },
-  { id: 'ahorros', label: 'Ahorros' },
-  { id: 'ayuda', label: 'Ayuda' },
 ];
 
 function getInitials(name: string | undefined): string {
@@ -73,7 +65,6 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
     clearQuickExpensePrefill,
     shoppingOpen,
     setShoppingOpen,
-    openShoppingList,
     shoppingItems,
     toastMessage,
     showToast,
@@ -122,7 +113,8 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
 
   const displayName = currentMember?.displayName || currentUserProfile?.displayName || 'Usuario';
   const photoURL = currentMember?.photoURL || currentUserProfile?.photoURL || '';
-  const desktopNavItems = uiMode === 'sencillo' ? SENCILLO_DESKTOP_NAV_ITEMS : AVANZADO_NAV_ITEMS;
+  const pendingShoppingCount = shoppingItems.filter((i) => !i.done).length;
+  const mudanzaCompleted = isMudanzaCompleted(household);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F6F8F8] dark:bg-[#0B1316] text-[#0F1F24] dark:text-[#F0F5F6]">
@@ -147,22 +139,28 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
             )}
           </button>
 
-          {/* Zone 2: Desktop Navigation */}
+          {/* Zone 2: Desktop Navigation (unified primary tabs without duplicates) */}
           <nav aria-label="Navegación principal" className="hidden md:flex items-center gap-6">
-            {desktopNavItems.map((item) => {
+            {PRIMARY_NAV_ITEMS.map((item) => {
               const active = activeTab === item.id;
               return (
                 <button
                   key={item.id}
                   type="button"
+                  aria-current={active ? 'page' : undefined}
                   onClick={() => setActiveTab(item.id)}
-                  className={`min-h-[44px] px-1 text-sm font-medium whitespace-nowrap shrink-0 border-b-2 transition-colors ${
+                  className={`min-h-[44px] px-1 text-sm font-medium whitespace-nowrap shrink-0 border-b-2 transition-colors inline-flex items-center gap-1.5 ${
                     active
                       ? 'border-[#0E5A64] dark:border-[#5EEAD4] text-[#0F1F24] dark:text-[#F0F5F6]'
                       : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-[#0F1F24] dark:hover:text-[#F0F5F6]'
                   }`}
                 >
-                  {item.label}
+                  <span>{item.label}</span>
+                  {item.id === 'compra' && pendingShoppingCount > 0 && (
+                    <span className="px-1.5 py-0.5 rounded-full bg-[#15803D]/15 text-[#15803D] dark:text-[#4ADE80] text-[11px] font-bold tabular-nums leading-none">
+                      {pendingShoppingCount}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -300,25 +298,31 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                     </div>
                   </div>
 
-                  {/* Quick Secondary Actions */}
+                  {/* Hogar & Secondary Actions */}
                   <div className="space-y-1">
+                    <p className="px-3 pt-1 text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                      Hogar
+                    </p>
                     <button
                       type="button"
                       onClick={() => {
-                        openShoppingList();
+                        setActiveTab('mudanza');
                         setMenuOpen(false);
                       }}
-                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center justify-between hover:bg-slate-100 dark:hover:bg-slate-800"
+                      className={`w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center justify-between hover:bg-slate-100 dark:hover:bg-slate-800 ${
+                        activeTab === 'mudanza'
+                          ? 'bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                          : ''
+                      }`}
                     >
                       <span className="flex items-center gap-2.5">
-                        <ShoppingCart className="w-4 h-4 text-[#15803D] dark:text-[#4ADE80]" />
-                        <span>Lista de la compra</span>
+                        {mudanzaCompleted ? (
+                          <Archive className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                        ) : (
+                          <Package className="w-4 h-4 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                        )}
+                        <span>{mudanzaCompleted ? 'Histórico de mudanza' : 'Mudanza'}</span>
                       </span>
-                      {shoppingItems.filter((i) => !i.done).length > 0 && (
-                        <span className="px-2 py-0.5 rounded-full bg-[#15803D]/15 text-[#15803D] dark:text-[#4ADE80] text-[11px] font-bold tabular-nums">
-                          {shoppingItems.filter((i) => !i.done).length}
-                        </span>
-                      )}
                     </button>
 
                     {uiMode === 'avanzado' && (
@@ -328,12 +332,18 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                           setActiveTab('ajustes');
                           setMenuOpen(false);
                         }}
-                        className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        className={`w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800 ${
+                          activeTab === 'ajustes'
+                            ? 'bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                            : ''
+                        }`}
                       >
                         <Settings className="w-4 h-4 text-slate-600 dark:text-slate-400" />
                         <span>Ajustes del hogar</span>
                       </button>
                     )}
+
+                    <div className="my-1 border-t border-slate-100 dark:border-slate-800" />
 
                     <button
                       type="button"
@@ -341,7 +351,11 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         setActiveTab('ayuda');
                         setMenuOpen(false);
                       }}
-                      className="w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      className={`w-full min-h-[44px] px-3 rounded-xl text-left text-xs font-semibold flex items-center gap-2.5 hover:bg-slate-100 dark:hover:bg-slate-800 ${
+                        activeTab === 'ayuda'
+                          ? 'bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
+                          : ''
+                      }`}
                     >
                       <HelpCircle className="w-4 h-4 text-slate-600 dark:text-slate-400" />
                       <span>Ayuda e instalación</span>
@@ -475,23 +489,34 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
       ) : (
         <nav
           aria-label="Navegación inferior móvil"
-          className="md:hidden fixed bottom-0 left-0 right-0 z-40 min-h-[calc(62px+env(safe-area-inset-bottom))] pb-[env(safe-area-inset-bottom)] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-5 items-center px-1"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 min-h-[calc(62px+env(safe-area-inset-bottom))] pb-[env(safe-area-inset-bottom)] bg-white/95 dark:bg-[#132025]/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 grid grid-cols-4 items-center px-2"
         >
-          {AVANZADO_NAV_ITEMS.map((item) => {
+          {PRIMARY_NAV_ITEMS.map((item) => {
             const Icon = item.icon;
             const active = activeTab === item.id;
             return (
               <button
                 key={item.id}
                 type="button"
+                aria-current={active ? 'page' : undefined}
                 onClick={() => setActiveTab(item.id)}
-                className={`min-h-[48px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
+                className={`relative min-h-[48px] flex flex-col items-center justify-center gap-0.5 rounded-xl transition-colors ${
                   active
                     ? 'text-[#0E5A64] dark:text-[#5EEAD4] font-semibold'
                     : 'text-slate-600 dark:text-slate-400'
                 }`}
               >
-                <Icon className="w-5 h-5" />
+                <span className="relative inline-flex">
+                  <Icon className="w-5 h-5" />
+                  {item.id === 'compra' && pendingShoppingCount > 0 && (
+                    <span
+                      aria-label={`${pendingShoppingCount} artículos pendientes`}
+                      className="absolute -top-1.5 -right-2.5 min-w-[16px] h-4 px-1 rounded-full bg-[#15803D] text-white text-[10px] font-bold flex items-center justify-center tabular-nums leading-none"
+                    >
+                      {pendingShoppingCount > 99 ? '99+' : pendingShoppingCount}
+                    </span>
+                  )}
+                </span>
                 <span className="text-[11px] leading-none">{item.label}</span>
               </button>
             );
@@ -520,10 +545,12 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         onSaved={quickExpenseOnSaved}
       />
 
-      <ShoppingListSection
-        open={shoppingOpen}
-        onClose={() => setShoppingOpen(false)}
-      />
+      {activeTab !== 'compra' && (
+        <ShoppingListSection
+          open={shoppingOpen}
+          onClose={() => setShoppingOpen(false)}
+        />
+      )}
 
       {/* Undo snackbar (5 seconds) */}
       {undoToast && (

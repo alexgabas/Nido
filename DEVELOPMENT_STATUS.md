@@ -1,84 +1,80 @@
 # Estado de desarrollo de Nido
 
-Última actualización: 2026-11-23
+Última actualización: 2026-11-25
 
 ## 1. Resumen ejecutivo
 
-- **Aplicación**: **Nido** (finanzas compartidas del hogar, gastos de mudanza, presupuestos, metas de ahorro y lista de la compra compartida). Idioma: español de España (`es-ES`). Moneda: `EUR`.
-- **Arquitectura**: SPA React + TypeScript + Vite + Tailwind + PWA offline-first (`vite-plugin-pwa`) + Firebase Auth / Firestore en plan gratuito Spark (coste cero: sin Cloud Functions, Cloud Billing ni servicios de pago), con paridad funcional en modo demostración local (`DemoHouseholdRepository`).
-- **Estado actual**: Cierre de verificaciones pendientes y endurecimiento de los casos límite solicitados completado en código y pruebas locales (**39/39 pruebas unitarias**, `tsc --noEmit`, ESLint de `firestore.rules`, build de producción + PWA y **2 suites E2E en Chromium**). Quedan pendientes exclusivamente la ejecución en GitHub Actions / máquina con Java 21+ del workflow de emulador de `firestore.rules` (preparado pero no ejecutado aún) y el checklist manual de 8 pruebas con 2 cuentas y 2 dispositivos (`/MANUAL_ACCEPTANCE_CHECKLIST.md`).
+- **Aplicación**: **Nido** (finanzas compartidas del hogar, etapa de mudanza e histórico, presupuestos, planificación mensual, Cuenta común, cierre de mes guiado, balance anual del hogar, metas y plan de ahorro mensual, y lista de la compra compartida). Idioma: español de España (`es-ES`). Moneda: `EUR`.
+- **Arquitectura**: SPA React + TypeScript + Vite + Tailwind + PWA offline-first (`vite-plugin-pwa`) + Firebase Auth / Firestore en plan gratuito Spark (coste cero: sin Cloud Functions, Cloud Billing, notificaciones push de pago, SDKs de IA ni APIs bancarias), con paridad funcional en modo demostración local (`DemoHouseholdRepository`).
+- **Proyecto y base de datos objetivo** (verificado en `firebase-applet-config.json`): `projectId = "irontrack-509315"`, `firestoreDatabaseId = "ai-studio-9bf93440-758c-4b3e-8cff-72543716da70"`.
+- **Estado actual**: Iteración de **revisión global de navegación y fin de etapa de Mudanza** **implementada, con reglas desplegadas en Firestore y verificada en local** (`tsc --noEmit`, **66/66 pruebas unitarias**, ESLint de `firestore.rules` 0 errores, despliegue de reglas `DeployRules` OK, build de producción + PWA, **E2E navegación + Mudanza + capturas ANTES/DESPUÉS** y las **6 suites E2E de regresión** en verde). Quedan pendientes la ejecución de los **27 tests del emulador** (`npm run test:rules` en GitHub Actions o máquina con Java 21+) y la verificación manual en cuenta real.
 
 ---
 
-## 2. Código implementado
+## 2. Completado en la última iteración (Reorganización de navegación y fin de etapa de Mudanza)
 
-### A) Cierre de verificaciones y casos límite de compra (última iteración)
-- **Pagador por defecto = Cuenta común (`COMMON_ACCOUNT_ID`) en nuevos gastos**:
-  - `src/components/QuickExpenseModal.tsx`: al crear un gasto nuevo, `paidBy` se inicializa a `COMMON_ACCOUNT_ID` (salvo `prefill.paidBy` explícito); al editar gastos existentes se respeta el pagador guardado y al marcar **Gasto solo mío (privado)** se fuerza `currentUserProfile.uid`.
-  - `src/components/ShoppingCheckoutPanel.tsx`: `paidBy` inicializado a `COMMON_ACCOUNT_ID` (coherente con `RecurringTemplateModal`, `MudanzaView` y `BankCsvImportModal`).
-- **Recuperación en compras ≤10 artículos tras respuesta perdida + cierre de sesión/cambio de hogar + reentrada**:
-  - Al cerrarse de forma atómica en Fase 1 (`transactions/tx_${checkoutId}` + borrado de `≤10` artículos sin crear `shoppingCheckouts`), cerrar sesión borra `localStorage` (`clearAllLocalPendingCheckouts()`, cero fuga de datos privados). Al reentrar, el estado sincronizado ya muestra el gasto una sola vez y los artículos retirados; incluso si un cliente desactualizado reintenta con un nuevo `checkoutId` sobre las instantáneas antiguas, el servidor aborta con `overlap_conflict` sin duplicar gasto.
-  - `src/components/ShoppingCheckoutPanel.tsx`: mensaje de conflicto actualizado para explicar ambas causas (cierre por la pareja o intento previo confirmado en servidor tras corte de red o cierre de sesión).
-- **Solapamiento en compras >10 artículos exclusivo en lotes posteriores (lote 2+)**:
-  - `src/repositories/FirestoreHouseholdRepository.ts` y `src/repositories/DemoHouseholdRepository.ts`: `commitShoppingCheckoutPhase1` verifica ahora **todos** los artículos seleccionados (`ordered`, lote 1 y lotes posteriores `≥11`) dentro de la misma `runTransaction`, manteniendo el límite de escrituras en Fase 1 (`≤10` borrados, `≤13` escrituras totales). Si cualquier artículo de lote 2+ ya fue retirado, aborta con `overlap_conflict` sin crear gasto; si algún artículo de lote 2+ fue editado/desmarcado concurrentemente, se excluye de `pendingItemIds`.
-  - `src/components/ShoppingCheckoutPanel.tsx`: comprobación previa frente a `pendingShoppingCheckouts` activos en el hogar para bloquear inmediatamente solapamientos sobre lotes pendientes de otro cierre en curso.
-  - `src/domain/shoppingCheckout.ts` y `src/context/NidoContext.tsx`: acumulación explícita de `alreadyGoneCount` en `executeDurableShoppingCheckout` y `resumePendingShoppingCheckout`, mostrando aviso visible si en una carrera simultánea en Fase 1 con lotes 1 disjuntos algún artículo de lote 2+ ya había sido retirado por otro cierre.
-- **Workflow reproducible de emulador de reglas (sin credenciales ni producción)**:
-  - `package.json`: script `test:rules` fijado con `--project demo-nido-rules-test` para ejecución 100 % local sin credenciales ni acceso a producción.
-  - `.github/workflows/firestore-rules.yml`: workflow preparado para GitHub Actions con Node 22 + Java 21 + `firebase-tools` ejecutando `npm run lint`, `npx eslint firestore.rules`, `npm run test:unit` y `npm run test:rules` (solo lectura de código, cero secretos, cero despliegues, coste cero).
-- **Checklist manual acotado (8 pruebas)**:
-  - `MANUAL_ACCEPTANCE_CHECKLIST.md`: 8 recorridos concretos para 2 cuentas y 2 dispositivos (todos marcados como pendientes).
+### 1. Reorganización de navegación sin duplicidades (`src/components/AppShell.tsx`, `src/views/InicioView.tsx`, `src/views/CompraView.tsx`, `src/components/ShoppingListSection.tsx`, `src/context/NidoContext.tsx`, `src/App.tsx`)
+- **Modo Sencillo (móvil `390×844`)**:
+  - Se conserva la barra inferior de 3 ranuras (`Inicio`, `+`, `Ahorros`).
+  - **Compra** y **Mensual** pasan a una fila compacta de 2 columnas al principio de `Inicio` (visibles sobre el pliegue a `y = 148 px`, frente a `1103 px` y `1014 px` antes), eliminando los accesos duplicados del final de la pantalla.
+- **Modo Avanzado (móvil `390×844`)**:
+  - Navegación inferior simplificada a 4 pestañas principales: **Inicio**, **Mensual**, **Compra** (con insignia de pendientes) y **Ahorros**.
+  - **+ Gasto** permanece accesible en la cabecera superior.
+  - **Ajustes del hogar**, **Ayuda e instalación** y **Hogar → Mudanza / Histórico de mudanza** pasan al menú avatar sin crear ninguna pestaña principal «Hogar».
+  - Eliminada la tarjeta duplicada de «Lista de la compra» en `Inicio` y el enlace duplicado en el menú avatar.
+- **Escritorio (`1280×800`)**:
+  - Barra superior unificada en ambos modos con las 4 áreas principales (`Inicio`, `Mensual`, `Compra`, `Ahorros`), `+ Añadir gasto` y menú avatar sin duplicar `Ajustes`, `Ayuda` ni `Mudanza`.
+- **Lista de la compra como pantalla dedicada (`CompraView` + `ShoppingListSection variant="page"`)**:
+  - Reutiliza íntegramente el componente existente sin duplicar lógica; mantiene el botón `← Inicio` en Sencillo móvil y evita abrir un modal superpuesto.
+- **Compatibilidad, botón Atrás y cambio de modo (`src/domain/mudanzaStage.ts`, `src/context/NidoContext.tsx`)**:
+  - Conservados todos los atajos PWA (`/?action=add-expense`, `/?tab=inicio&open=shopping`, `/?tab=mensual`) y enlaces anteriores (`/?tab=mudanza`, `/?tab=compra`, `/?tab=ajustes`, `/?tab=ahorros`, `/?tab=ayuda`).
+  - Historial del navegador sincronizado con `history.pushState` / `popstate` para que el botón **Atrás** recorra las pantallas de forma natural.
+  - Cambiar entre Sencillo y Avanzado conserva la sección equivalente (`Compra`, `Mensual`, `Ahorros`, `Mudanza`, `Ayuda`) y redirige `Ajustes → Inicio` al pasar a Sencillo sin cambiar nunca de modo silenciosamente.
+  - **Balance anual** y **cierre guiado** permanecen dentro de `Mensual`; **Plan de ahorro mensual** permanece dentro de `Ahorros`.
 
-### B) Base de fiabilidad ya implementada anteriormente
-- Idempotencia duradera de `Finalizar compra` (`chk_<ts>_<rand>`, `tx_${checkoutId}`, estado local aislado por `(householdId, viewerUid)` y `shoppingCheckouts/{checkoutId}` solo si `>10` artículos).
-- Limpieza atómica por lotes (`≤10` artículos/transacción) con preservación de ediciones/desmarcados/altas concurrentes de pareja.
-- Endurecimiento de `firestore.rules` (bloqueo de meses cerrados en servidor en `transactions`, `budgets` y `categoryBudgets`; reglas estrictas para `shoppingCheckouts`; consultas sin índices compuestos faltantes) ya desplegado en la iteración anterior.
-- Protección PWA (registro único, bloqueo de recarga durante edición/escritura, reintento real de chunks tras volver online con bypass de caché de módulo fallido, validación de caché de catálogo Mercadona y freno anti-bucle de 60 s).
+### 2. Fin de la etapa de Mudanza compartido y reversible (`src/domain/mudanzaStage.ts`, `src/views/MudanzaView.tsx`, `src/views/AjustesView.tsx`, `src/repositories/*`, `firestore.rules`, `src/domain/backup.ts`)
+- **Estado compartido y retrocompatible**: campos opcionales `mudanzaCompleted`, `mudanzaCompletedAt` y `mudanzaCompletedBy` en el documento del hogar. Los hogares existentes sin el campo mantienen Mudanza activa por defecto (`false`).
+- **Acciones «Dar por terminada la mudanza» y «Reabrir mudanza»** disponibles en `MudanzaView` (Sencillo y Avanzado) y en `Ajustes → Hogar compartido` (Avanzado).
+- **Aviso no bloqueante ni destructivo**: al darla por terminada muestra el recuento exacto de muebles pendientes y tareas sin completar sin bloquear la acción ni marcar ningún elemento como hecho o comprado.
+- **Visibilidad al terminar**: oculta el acceso destacado en `Inicio` (Sencillo y Avanzado) y deja el acceso en **menú avatar → Hogar → Histórico de mudanza** y en **Ajustes → Hogar**, conservando intactos la búsqueda global, los gastos iniciales, el mobiliario, el checklist, los informes CSV/PDF y los backups JSON `NidoBackupV1` (con compatibilidad hacia atrás con copias antiguas sin estos campos).
+- **Firestore Rules (`firestore.rules`, `firebase-blueprint.json`, `firestore.rules.test.ts`)**:
+  - Añadida **Acción 9** en `/households/{hid}` (`allow update` restringida a miembros, `affectedKeys().hasOnly(['mudanzaCompleted', 'mudanzaCompletedAt', 'mudanzaCompletedBy', 'updatedAt'])`, anti-suplantación `mudanzaCompletedBy == request.auth.uid`, timestamps validados con `request.time`).
+  - Validada con ESLint (0 errores) y desplegada mediante `DeployRules`. Añadido **Test 27** en `firestore.rules.test.ts`.
+- **Optimización de suscripciones**: `checklist` y `furniture` dejan de suscribirse en `Inicio` cuando `mudanzaCompleted === true`.
 
 ---
 
-## 3. Pruebas ejecutadas (verificadas localmente)
+## 3. Estado de verificación
 
 | Comprobación | Estado | Evidencia real |
 |---|---|---|
-| Comprobación de tipos (`npm run lint` / `tsc --noEmit`) | **Verificado mediante prueba ejecutada** | 0 errores (`src/` y `firestore.rules.test.ts`) |
-| Pruebas unitarias (`npm run test:unit`) | **Verificado mediante prueba ejecutada** | **39/39 en verde** (`src/domain/finance.test.ts`, incluyendo nuevas pruebas **31**: recuperación ≤10 artículos tras respuesta perdida + logout + reentrada sin duplicar gasto, y **32**: solapamiento exclusivo en lote 2+ tanto secuencial como carrera simultánea en Fase 1) |
+| Comprobación de tipos (`npx tsc --noEmit`) | **Verificado mediante prueba ejecutada** | 0 errores |
+| Pruebas unitarias (`npm run test:unit`) | **Verificado mediante prueba ejecutada** | **66/66 en verde** (`src/domain/finance.test.ts`, incluidas pruebas **65–66** de navegación, equivalencia de modo, atajos PWA, estado compartido reversible de Mudanza, aviso sin mutar pendientes, búsqueda global e import/export de backups antiguos y nuevos) |
 | Lint de Security Rules (`npx eslint firestore.rules`) | **Verificado mediante prueba ejecutada** | 0 errores, 0 advertencias |
-| Build de producción + PWA (`npm run build`) | **Verificado mediante prueba ejecutada** | `dist/sw.js` generado (29 entradas precacheadas, PDF y catálogo Mercadona diferidos bajo demanda) |
-| E2E general móvil/escritorio (`node scripts/verify_nido_e2e.mjs`) | **Verificado mediante prueba ejecutada** | `E2E_PASS` (móvil `390×844` y escritorio `1280×800`, 0 errores) |
-| E2E fiabilidad PWA/offline/chunks (`node scripts/verify_pwa_reliability.mjs`) | **Verificado mediante prueba ejecutada** | `PWA_RELIABILITY_PASS` sobre `vite preview` con Service Worker real (8/8 escenarios en verde) |
+| Despliegue de Security Rules (`DeployRules`) | **Verificado mediante acción ejecutada** | Desplegadas en `irontrack-509315` / `ai-studio-9bf93440-758c-4b3e-8cff-72543716da70` |
+| Build de producción + PWA (`npm run build`) | **Verificado mediante prueba ejecutada** | Build limpio, `dist/sw.js` generado |
+| E2E navegación, enlaces, Atrás, modos y fin de Mudanza (`node scripts/verify_navigation_and_mudanza.mjs`) | **Verificado mediante prueba ejecutada** | Pasado en móvil `390×844` (Sencillo y Avanzado) y escritorio `1280×800`, con inspección visual de capturas **ANTES y DESPUÉS** |
+| E2E general móvil/escritorio (`node scripts/verify_nido_e2e.mjs`) | **Verificado mediante prueba ejecutada** | `E2E_PASS` |
+| E2E planificación mensual y Cuenta común (`node scripts/verify_monthly_planning.mjs`) | **Verificado mediante prueba ejecutada** | `MONTHLY_PLANNING_E2E_PASS` |
+| E2E cierre de mes guiado (`node scripts/verify_guided_close.mjs`) | **Verificado mediante prueba ejecutada** | `verify_guided_close: TODOS LOS RECORRIDOS PASARON` |
+| E2E balance anual del hogar (`node scripts/verify_annual_balance.mjs`) | **Verificado mediante prueba ejecutada** | `verify_annual_balance: TODOS LOS RECORRIDOS PASARON` |
+| E2E plan de ahorro mensual (`node scripts/verify_savings_plan.mjs`) | **Verificado mediante prueba ejecutada** | `verify_savings_plan.mjs completado con éxito` |
+| E2E fiabilidad PWA/offline/chunks (`node scripts/verify_pwa_reliability.mjs`) | **Verificado mediante prueba ejecutada** | `PWA_RELIABILITY_PASS` (8/8) |
+| Tests de Security Rules en emulador (`npm run test:rules`) | **Implementado, pendiente de verificación en emulador** | **27 casos** en `firestore.rules.test.ts` (incluido Test 27 para Acción 9 de `mudanzaCompleted`). No ejecutado aquí porque el contenedor carece de Java; ejecutable vía `.github/workflows/firestore-rules.yml` o en local con Java 21+ |
+| Pruebas manuales en cuenta real y 2 dispositivos | **Pendiente de verificar por el usuario** | Comprobar en cuenta real la nueva barra en móvil/escritorio, «Dar por terminada la mudanza» / «Reabrir mudanza» sincronizado entre los dos miembros y atajos de la PWA instalada |
 
 ---
 
-## 4. Workflow preparado pero no ejecutado
+## 4. Riesgos conocidos y limitaciones
 
-- **Archivo**: `.github/workflows/firestore-rules.yml`
-- **Estado**: **Preparado, pendiente de ejecución en GitHub Actions** (en este contenedor no existe Java, por lo que no se ha ejecutado `npm run test:rules` ni se ha ejecutado el workflow en GitHub; no se afirma que los 20 tests del emulador hayan pasado todavía).
-- **Qué ejecuta**: `npm run lint`, `npx eslint firestore.rules`, `npm run test:unit` y `npm run test:rules` (`firebase emulators:exec --project demo-nido-rules-test --only firestore "npx tsx --test firestore.rules.test.ts"`) usando únicamente el proyecto demo local del emulador, sin secretos, sin acceso a producción y sin despliegues.
-- **Cómo activarlo**:
-  1. Hacer commit y push de `.github/workflows/firestore-rules.yml` y `package.json` a la rama `main` (o `master`) en GitHub, o abrir una Pull Request.
-  2. En el repositorio de GitHub, abrir la pestaña **Actions** (habilitar GitHub Actions si estuviera desactivado).
-  3. Ejecutar automáticamente con el push/PR o manualmente mediante **Verificación de reglas de Firestore → Run workflow** (`workflow_dispatch`).
-  4. Como alternativa local en cualquier equipo con **Java 21+** y `firebase-tools`: ejecutar directamente `npm run test:rules`.
+- **Emulador de reglas pendiente**: ESLint y el despliegue están confirmados, pero los **27 casos** de `firestore.rules.test.ts` siguen pendientes de ejecutarse en un entorno con Java 21+ (local o GitHub Actions `.github/workflows/firestore-rules.yml`).
+- **Verificación de facturación GCP/Firebase**: este entorno no tiene acceso a la API de Google Cloud Billing ni a la consola de Firebase, por lo que el plan activo (Spark vs Blaze) debe comprobarse manualmente en Firebase Console → *Uso y facturación*.
+- **Propuestas de mejora e IA (Bloque 4)**: documentadas exclusivamente como propuestas; no se ha instalado ningún SDK de IA ni habilitado ninguna API externa.
 
 ---
 
-## 5. Pruebas manuales pendientes
+## 5. Siguiente paso exacto
 
-- **Archivo**: `MANUAL_ACCEPTANCE_CHECKLIST.md`
-- **Estado**: **Pendiente de ejecución manual por el usuario** con 2 cuentas y 2 dispositivos reales (8 pruebas: sincronización de gasto compartido y pagador por defecto en Cuenta común, privacidad de gasto personal, categoría personalizada y presupuesto, cierre simultáneo de compra, recuperación tras pérdida de conexión, mes cerrado, actualización PWA con formulario abierto, y cerrar sesión y volver a entrar).
-
----
-
-## 6. Riesgos conocidos y limitaciones
-
-- **Tests de emulador (`firestore.rules.test.ts`) aún no ejecutados**: hasta que el workflow `.github/workflows/firestore-rules.yml` se ejecute en GitHub Actions (o `npm run test:rules` en local con Java 21+), la autorización en emulador sigue pendiente de verificación real (ESLint y el despliegue previo no sustituyen la ejecución de los 20 casos de `firestore.rules.test.ts`).
-- **Carrera simultánea pura en Fase 1 sobre lotes 1 disjuntos con solapamiento en lote 2**: si ambos miembros confirman exactamente a la vez dos compras `>10` artículos cuyos primeros 10 artículos son distintos y solo coinciden en los artículos `11+`, Firestore puede aceptar ambas transacciones Fase 1 (al no modificar los artículos `11+` en Fase 1); ahora la comprobación previa contra `pendingShoppingCheckouts` bloquea la ventana cuando un cierre ya está visible, Fase 1 bloquea cualquier solapamiento en lote 2+ una vez borrado, y Fase 2 acumula y muestra `alreadyGoneCount` avisando explícitamente al segundo miembro para revisar los gastos recientes sin duplicar su propio gasto.
-- **Límite de 100 artículos por cierre de compra**: `MAX_CHECKOUT_PENDING_ITEMS = 100` (procesado en transacciones de `≤ 10` artículos).
-
----
-
-## 7. Siguiente paso exacto
-
-1. Subir los cambios a GitHub y ejecutar el workflow **Verificación de reglas de Firestore** (`.github/workflows/firestore-rules.yml`) o correr `npm run test:rules` en local con Java 21+ para verificar los 20 casos de `firestore.rules.test.ts`.
-2. Ejecutar las 8 pruebas manuales de `MANUAL_ACCEPTANCE_CHECKLIST.md` con 2 cuentas y 2 dispositivos reales.
+1. Probar en tu cuenta real (móvil y escritorio, Sencillo y Avanzado) la nueva navegación, el botón Atrás y «Dar por terminada la mudanza» / «Reabrir mudanza» entre los dos dispositivos.
+2. Ejecutar `.github/workflows/firestore-rules.yml` (o `npm run test:rules` con Java 21+) para verificar en emulador los **27 casos** de Security Rules.
+3. Si decides priorizar alguna de las propuestas del Bloque 4 (p. ej. pegado rápido de lista o resumen local), indícalo para diseñarla e implementarla en la siguiente iteración.

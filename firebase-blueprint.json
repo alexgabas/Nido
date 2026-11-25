@@ -113,6 +113,42 @@
           },
           "additionalProperties": false
         },
+        "commonAccountPlannedCategories": {
+          "type": "array",
+          "maxItems": 60,
+          "description": "Optional shared household preference listing category IDs whose variable budget margin is planned to be funded from the Common Account.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "commonAccountManualBalance": {
+          "type": ["object", "null"],
+          "description": "Optional manually reported available balance of the Common Account with explicit reference date and author.",
+          "properties": {
+            "amount": { "type": "number", "minimum": 0 },
+            "referenceDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+            "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "updatedAt": { "type": "string", "minLength": 1, "maxLength": 64 }
+          },
+          "required": ["amount", "referenceDate", "updatedBy", "updatedAt"],
+          "additionalProperties": false
+        },
+        "mudanzaCompleted": {
+          "type": "boolean",
+          "description": "Optional shared household flag marking the moving stage as completed (reversible; absent defaults to false)."
+        },
+        "mudanzaCompletedAt": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "description": "Optional ISO timestamp recording when the moving stage was marked completed."
+        },
+        "mudanzaCompletedBy": {
+          "type": ["string", "null"],
+          "maxLength": 128,
+          "description": "Optional UID of the member who marked the moving stage as completed."
+        },
         "seedPending": {
           "type": "boolean",
           "description": "True while Phase B default seeds (including inactive recurring catalog) are pending completion."
@@ -377,6 +413,16 @@
           "type": "string",
           "pattern": "^(\\d{4}-\\d{2})?$",
           "maxLength": 7
+        },
+        "skippedMonths": {
+          "type": "array",
+          "maxItems": 120,
+          "description": "Optional sorted list of YYYY-MM month keys where this template did not occur without deactivating the template.",
+          "items": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}$",
+            "maxLength": 7
+          }
         },
         "splitOverride": {
           "type": "number"
@@ -670,7 +716,8 @@
             "Limpieza y hogar",
             "Cuidado personal e higiene",
             "Bebé y mascotas",
-            "Otros de supermercado"
+            "Otros de supermercado",
+            "Sin clasificar"
           ]
         },
         "sourceType": {
@@ -875,6 +922,145 @@
         }
       },
       "required": ["expenseId", "monthKey", "amount", "concept", "pendingItemIds", "totalItemCount", "isPrivate", "createdBy", "createdAt", "updatedAt"]
+    },
+    "MemberCategoryPreferences": {
+      "title": "MemberCategoryPreferences",
+      "description": "Private per-member visible categories and order for the expense category selector.",
+      "type": "object",
+      "properties": {
+        "selectorVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "visibleCategoryIds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 2, "maxLength": 48 },
+          "maxItems": 60
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["selectorVersion", "visibleCategoryIds", "updatedAt"]
+    },
+    "ShoppingListTemplate": {
+      "title": "ShoppingListTemplate",
+      "description": "Shared reusable household shopping list template.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string", "minLength": 1, "maxLength": 120 },
+              "qty": { "type": "number" },
+              "unit": { "type": "string", "maxLength": 20 },
+              "catalogId": { "type": "string", "maxLength": 48 },
+              "brand": { "type": "string", "maxLength": 60 },
+              "format": { "type": "string", "maxLength": 40 },
+              "section": { "type": "string", "maxLength": 48 },
+              "sourceType": { "type": "string", "enum": ["", "mercadona", "custom", "generic"] }
+            },
+            "required": ["text", "qty"]
+          }
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "items", "createdBy", "createdAt", "updatedAt"]
+    },
+    "ShoppingSectionOverride": {
+      "title": "ShoppingSectionOverride",
+      "description": "Shared household supermarket section override keyed by stable productKey.",
+      "type": "object",
+      "properties": {
+        "productKey": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]{2,64}$"
+        },
+        "section": {
+          "type": "string",
+          "enum": [
+            "Fruta y verdura",
+            "Carne, charcutería y huevos",
+            "Pescado y marisco",
+            "Lácteos, quesos y bebidas vegetales",
+            "Panadería y bollería",
+            "Despensa, arroz, pasta y conservas",
+            "Desayuno, café y dulces",
+            "Congelados",
+            "Platos preparados y refrigerados",
+            "Bebidas",
+            "Limpieza y hogar",
+            "Cuidado personal e higiene",
+            "Bebé y mascotas",
+            "Otros de supermercado",
+            "Sin clasificar"
+          ]
+        },
+        "updatedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["productKey", "section", "updatedBy", "updatedAt"]
+    },
+    "MonthlySavingsPlan": {
+      "title": "MonthlySavingsPlan",
+      "description": "Shared household monthly savings plan keyed by YYYY-MM with manual target amount and ordered goal allocations (no calculated totals persisted).",
+      "type": "object",
+      "properties": {
+        "monthKey": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}$",
+          "minLength": 7,
+          "maxLength": 7
+        },
+        "targetAmount": {
+          "type": "number",
+          "description": "Manual target amount (>= 0) reserved by the couple for the month."
+        },
+        "allocations": {
+          "type": "array",
+          "description": "Ordered allocations by goalId (max 50 items).",
+          "maxItems": 50
+        },
+        "updatedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["monthKey", "targetAmount", "allocations", "updatedBy", "updatedAt"]
     }
   },
   "firestore": {
@@ -942,6 +1128,10 @@
       "schema": { "$ref": "#/entities/GoalMovement" },
       "description": "Deposits and withdrawals on savings goals."
     },
+    "/households/{hid}/savingsPlans/{monthKey}": {
+      "schema": { "$ref": "#/entities/MonthlySavingsPlan" },
+      "description": "Shared monthly savings plans per household keyed by YYYY-MM."
+    },
     "/households/{hid}/shopping/{id}": {
       "schema": { "$ref": "#/entities/ShoppingItem" },
       "description": "Shared household shopping list items."
@@ -953,6 +1143,18 @@
     "/households/{hid}/shoppingCheckouts/{checkoutId}": {
       "schema": { "$ref": "#/entities/PendingShoppingCheckout" },
       "description": "Temporary multi-batch shopping checkout cleanup recovery state (deleted when complete)."
+    },
+    "/households/{hid}/memberPreferences/{uid}": {
+      "schema": { "$ref": "#/entities/MemberCategoryPreferences" },
+      "description": "Per-member private category visibility and order preferences for the expense selector."
+    },
+    "/households/{hid}/shoppingTemplates/{tplId}": {
+      "schema": { "$ref": "#/entities/ShoppingListTemplate" },
+      "description": "Shared reusable household shopping lists."
+    },
+    "/households/{hid}/shoppingSectionOverrides/{overrideId}": {
+      "schema": { "$ref": "#/entities/ShoppingSectionOverride" },
+      "description": "Household-scoped supermarket section overrides for specific products."
     }
   }
 }

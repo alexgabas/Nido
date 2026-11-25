@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowRight,
   Bell,
+  CalendarCheck2,
   CalendarClock,
   CalendarDays,
   CheckCircle2,
@@ -16,6 +17,7 @@ import {
   ShoppingCart,
   Users,
   Wallet,
+  X,
 } from 'lucide-react';
 import { CategoryTag } from '../components/CategoryTag';
 import { DonutChart, MonthlyBarChart } from '../components/Charts';
@@ -47,6 +49,10 @@ import {
   roundCents,
   shiftMonthKey,
 } from '../domain/finance';
+import { computeCommonAccountRadar } from '../domain/commonAccountRadar';
+import { shouldShowPreviousMonthCloseReminder } from '../domain/guidedMonthClose';
+import { computeMonthlyPlanSummary } from '../domain/monthlyPlanning';
+import { isMudanzaCompleted } from '../domain/mudanzaStage';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import type { ExpenseCategory } from '../types/nido';
 
@@ -59,12 +65,14 @@ export const InicioView: React.FC = () => {
     memberB,
     currentMember,
     currentUserProfile,
+    effectiveSplitPctA,
     isDemoMode,
     uiMode,
     setActiveTab,
     selectedMonthKey,
     setSelectedMonthKey,
     openHabitualSetupInAvanzado,
+    openGuidedMonthClose,
     currentMonthBudget,
     recurring,
     currentMonthTransactions,
@@ -96,6 +104,7 @@ export const InicioView: React.FC = () => {
   const [savingIncomes, setSavingIncomes] = useState(false);
   const [incomeError, setIncomeError] = useState<string | null>(null);
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
+  const [dismissedCloseReminderMonth, setDismissedCloseReminderMonth] = useState<string | null>(null);
 
   useEffect(() => {
     if (isDemoMode || !household?.id) return;
@@ -172,20 +181,61 @@ export const InicioView: React.FC = () => {
   const savingsBarPct =
     totalSavingsTarget > 0 ? Math.min(100, Math.round((totalSavings / totalSavingsTarget) * 100)) : 0;
 
-  // Monthly planned budget total (always uses current month's budget)
-  const currentMonthBudgetTotal = useMemo(() => {
-    if (!currentMonthBudget || currentMonthBudget.monthKey !== currentMonthKey) return 0;
-    return roundCents(
-      Object.values(currentMonthBudget.limits ?? {}).reduce<number>(
-        (sum, v) => sum + Math.max(0, Number(v) || 0),
-        0
-      )
-    );
-  }, [currentMonthBudget, currentMonthKey]);
+  // Resumen mensual coherente y previsión de Cuenta común (mismo cálculo en Sencillo y Avanzado)
+  const monthlyPlanSummary = useMemo(
+    () =>
+      computeMonthlyPlanSummary({
+        monthKey: currentMonthKey,
+        transactions: currentMonthTx,
+        recurring,
+        budget:
+          currentMonthBudget && currentMonthBudget.monthKey === currentMonthKey
+            ? currentMonthBudget
+            : null,
+        categoryRegistry,
+      }),
+    [currentMonthKey, currentMonthTx, recurring, currentMonthBudget, categoryRegistry]
+  );
+
+  const commonAccountSummary = useMemo(
+    () =>
+      computeCommonAccountRadar(
+        currentMonthKey,
+        currentMonthTx,
+        recurring,
+        effectiveSplitPctA,
+        {
+          todayISO,
+          manualBalance: household?.commonAccountManualBalance ?? null,
+          budget:
+            currentMonthBudget && currentMonthBudget.monthKey === currentMonthKey
+              ? currentMonthBudget
+              : null,
+          plannedCommonCategoryIds: household?.commonAccountPlannedCategories ?? [],
+          categoryRegistry,
+        }
+      ),
+    [
+      currentMonthKey,
+      currentMonthTx,
+      recurring,
+      effectiveSplitPctA,
+      todayISO,
+      household?.commonAccountManualBalance,
+      household?.commonAccountPlannedCategories,
+      currentMonthBudget,
+      categoryRegistry,
+    ]
+  );
 
   const spendBarPct =
-    currentMonthBudgetTotal > 0
-      ? Math.min(100, Math.round((balance.totalSpent / currentMonthBudgetTotal) * 100))
+    monthlyPlanSummary.estimatedCloseTotal > 0
+      ? Math.min(
+          100,
+          Math.round(
+            (monthlyPlanSummary.registeredTotal / monthlyPlanSummary.estimatedCloseTotal) * 100
+          )
+        )
       : 0;
 
   const upcomingCharges = useMemo(
@@ -201,6 +251,17 @@ export const InicioView: React.FC = () => {
   const upcoming3Days = useMemo(
     () => getUpcomingChargesWithinDays(recurring, todayISO, 3, currentMonthTx),
     [recurring, todayISO, currentMonthTx]
+  );
+
+  const prevMonthCloseReminder = useMemo(
+    () =>
+      shouldShowPreviousMonthCloseReminder({
+        todayISO,
+        monthClosures,
+        recentTransactions,
+        recurring,
+      }),
+    [todayISO, monthClosures, recentTransactions, recurring]
   );
 
   const hasAlerts = budgetAlerts.length > 0 || upcoming3Days.length > 0;
@@ -240,6 +301,7 @@ export const InicioView: React.FC = () => {
         label: categoryRegistry.getLabel(cat),
         value: roundCents(value),
         color: categoryRegistry.getColor(cat),
+        icon: categoryRegistry.getIcon(cat),
       }))
       .sort((a, b) => b.value - a.value);
   }, [currentMonthTx, categoryRegistry]);
@@ -293,6 +355,7 @@ export const InicioView: React.FC = () => {
     () => shoppingItems.filter((item) => !item.done).length,
     [shoppingItems]
   );
+  const mudanzaCompleted = isMudanzaCompleted(household);
 
   const openIncomeModal = () => {
     setDraftIncomeA(household?.settings.incomeA ? String(household.settings.incomeA) : '');
@@ -553,10 +616,54 @@ export const InicioView: React.FC = () => {
     </section>
   );
 
+  const previousMonthCloseBanner =
+    prevMonthCloseReminder.show &&
+    dismissedCloseReminderMonth !== prevMonthCloseReminder.prevMonthKey && (
+      <section
+        aria-label="Recordatorio de cierre del mes anterior"
+        className="rounded-2xl bg-white dark:bg-[#132025] border border-[#0E5A64]/25 dark:border-[#2AA1AE]/30 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+      >
+        <div className="flex items-start gap-3 min-w-0">
+          <span className="w-10 h-10 rounded-xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+            <CalendarCheck2 className="w-5 h-5" />
+          </span>
+          <div className="min-w-0 space-y-0.5">
+            <p className="text-sm font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+              {formatMonthLabelES(prevMonthCloseReminder.prevMonthKey)} aún no está cerrado
+            </p>
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              Revisa pendientes, cuentas entre vosotros y guarda el cierre en pocos pasos.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => openGuidedMonthClose(prevMonthCloseReminder.prevMonthKey)}
+            className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+          >
+            <span>Cerrar {formatMonthLabelES(prevMonthCloseReminder.prevMonthKey)}</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setDismissedCloseReminderMonth(prevMonthCloseReminder.prevMonthKey)}
+            aria-label="Ocultar recordatorio de cierre"
+            className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-800 flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </section>
+    );
+
   // ─── MODO SENCILLO ──────────────────────────────────────────────────────────
   if (uiMode === 'sencillo') {
     const viewerName = currentMember?.displayName?.trim() || memberA?.displayName?.trim() || '';
-    const spendExceeded = currentMonthBudgetTotal > 0 && balance.totalSpent > currentMonthBudgetTotal;
+    const spendExceeded =
+      monthlyPlanSummary.hasAnyBudget &&
+      monthlyPlanSummary.budgetCoverage === 'complete' &&
+      monthlyPlanSummary.registeredTotal > monthlyPlanSummary.configuredBudgetTotal;
 
     return (
       <div className="space-y-5 max-w-2xl mx-auto">
@@ -571,8 +678,55 @@ export const InicioView: React.FC = () => {
 
         {partnerMissingBanner}
         {shoppingCleanupBanner}
+        {previousMonthCloseBanner}
 
-        {/* Hero 1: Natural-language monthly spend */}
+        {/* Primary Quick Accesses: Compra & Mensual right at the top (above the fold on 390x844) */}
+        <section aria-label="Accesos rápidos" className="grid grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={openShoppingList}
+            className="min-h-[78px] rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3.5 sm:p-4 flex items-center gap-3 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
+          >
+            <span className="w-10 h-10 rounded-xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] flex items-center justify-center shrink-0">
+              <ShoppingCart className="w-5 h-5" />
+            </span>
+            <div className="min-w-0">
+              <h2 className="font-display text-sm sm:text-base font-bold leading-tight truncate">
+                Compra
+              </h2>
+              <p className="text-xs text-slate-600 dark:text-slate-400 truncate mt-0.5">
+                {pendingShoppingCount > 0
+                  ? `${pendingShoppingCount} pendiente${pendingShoppingCount === 1 ? '' : 's'}`
+                  : 'Lista vacía'}
+              </p>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
+              setActiveTab('mensual');
+            }}
+            className="min-h-[78px] rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3.5 sm:p-4 flex items-center gap-3 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
+          >
+            <span className="w-10 h-10 rounded-xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+              <CalendarDays className="w-5 h-5" />
+            </span>
+            <div className="min-w-0">
+              <h2 className="font-display text-sm sm:text-base font-bold leading-tight truncate">
+                Mensual
+              </h2>
+              <p className="text-xs text-slate-600 dark:text-slate-400 truncate mt-0.5">
+                {currentMonthExpenseCount > 0
+                  ? `${currentMonthExpenseCount} gasto${currentMonthExpenseCount === 1 ? '' : 's'}`
+                  : 'Ver mes'}
+              </p>
+            </div>
+          </button>
+        </section>
+
+        {/* Hero 1: Natural-language monthly spend & planning summary */}
         <section
           aria-label="Gasto del mes"
           className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-3"
@@ -580,20 +734,39 @@ export const InicioView: React.FC = () => {
           <p className="font-display text-2xl sm:text-3xl font-bold leading-snug text-[#0F1F24] dark:text-[#F0F5F6]">
             Este mes lleváis{' '}
             <span className="tabular-nums text-[#0E5A64] dark:text-[#5EEAD4]">
-              {formatEUR(balance.totalSpent)}
+              {formatEUR(monthlyPlanSummary.registeredTotal)}
             </span>{' '}
-            gastados
+            registrados
           </p>
-          {currentMonthExpenseCount === 0 && (
+          {currentMonthExpenseCount === 0 && monthlyPlanSummary.pendingPlannedTotal === 0 && (
             <p className="text-sm text-slate-600 dark:text-slate-300">
               Todavía no habéis apuntado gastos este mes. Pulsa el botón + de abajo para empezar.
             </p>
           )}
-          {currentMonthBudgetTotal > 0 && (
+          {monthlyPlanSummary.pendingPlannedTotal > 0 && (
+            <p className="text-sm text-slate-700 dark:text-slate-300 tabular-nums">
+              Quedan{' '}
+              <strong className="text-[#0F1F24] dark:text-[#F0F5F6]">
+                {formatEUR(monthlyPlanSummary.pendingPlannedTotal)}
+              </strong>{' '}
+              en cargos previstos este mes.
+            </p>
+          )}
+          {monthlyPlanSummary.estimatedCloseTotal > 0 && (
             <div className="space-y-2">
-              <p className="text-base text-slate-600 dark:text-slate-300 tabular-nums">
-                de {formatEUR(currentMonthBudgetTotal)} previstos
-              </p>
+              <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600 dark:text-slate-300 tabular-nums">
+                <span>
+                  Estimación de cierre:{' '}
+                  <strong className="text-[#0F1F24] dark:text-[#F0F5F6]">
+                    {formatEUR(monthlyPlanSummary.estimatedCloseTotal)}
+                  </strong>
+                </span>
+                {monthlyPlanSummary.budgetCoverage === 'partial' && (
+                  <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200">
+                    Presupuesto parcial
+                  </span>
+                )}
+              </div>
               <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${
@@ -602,6 +775,28 @@ export const InicioView: React.FC = () => {
                   style={{ width: `${spendBarPct}%` }}
                 />
               </div>
+            </div>
+          )}
+          {commonAccountSummary.totalMonthlyNeed > 0 && (
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 tabular-nums">
+                Para la Cuenta común habéis previsto{' '}
+                <strong className="text-[#0E5A64] dark:text-[#5EEAD4]">
+                  {formatEUR(commonAccountSummary.totalMonthlyNeed)}
+                </strong>{' '}
+                este mes.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
+                  setActiveTab('mensual');
+                }}
+                className="min-h-[44px] px-2 -mr-2 text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4] hover:underline inline-flex items-center gap-1"
+              >
+                <span>Ver detalle</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
             </div>
           )}
         </section>
@@ -811,70 +1006,29 @@ export const InicioView: React.FC = () => {
           );
         })()}
 
-        {/* Large Navigation Cards for Shopping, Mudanza and Mensual */}
-        <section aria-label="Accesos rápidos" className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
-          <button
-            type="button"
-            onClick={openShoppingList}
-            className="sm:col-span-2 min-h-[88px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
-          >
-            <div className="flex items-center gap-4 min-w-0">
-              <span className="w-12 h-12 rounded-2xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] flex items-center justify-center shrink-0">
-                <ShoppingCart className="w-6 h-6" />
-              </span>
-              <div className="min-w-0">
-                <h2 className="font-display text-lg font-bold">Lista de la compra</h2>
-                <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400">
-                  {pendingShoppingCount > 0
-                    ? `${pendingShoppingCount} artículo${pendingShoppingCount === 1 ? '' : 's'} por comprar`
-                    : 'Lista vacía · Pulsa para añadir'}
-                </p>
+        {/* Temporary stage card: Mudanza (hidden automatically once marked completed; history stays in Avatar -> Hogar) */}
+        {!mudanzaCompleted && (
+          <section aria-label="Etapa de mudanza" className="pt-1">
+            <button
+              type="button"
+              onClick={() => setActiveTab('mudanza')}
+              className="w-full min-h-[84px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
+            >
+              <div className="flex items-center gap-4 min-w-0">
+                <span className="w-12 h-12 rounded-2xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+                  <Package className="w-6 h-6" />
+                </span>
+                <div className="min-w-0">
+                  <h2 className="font-display text-lg font-bold">Mudanza</h2>
+                  <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400">
+                    {pendingFurnitureCount} muebles por comprar · {pendingChecklistCount} tareas
+                  </p>
+                </div>
               </div>
-            </div>
-            <ArrowRight className="w-5 h-5 text-slate-500 dark:text-slate-400 shrink-0" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('mudanza')}
-            className="min-h-[96px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
-          >
-            <div className="flex items-center gap-4 min-w-0">
-              <span className="w-12 h-12 rounded-2xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
-                <Package className="w-6 h-6" />
-              </span>
-              <div className="min-w-0">
-                <h2 className="font-display text-lg font-bold">Mudanza</h2>
-                <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400">
-                  {pendingFurnitureCount} muebles por comprar · {pendingChecklistCount} tareas
-                </p>
-              </div>
-            </div>
-            <ArrowRight className="w-5 h-5 text-slate-500 dark:text-slate-400 shrink-0" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
-              setActiveTab('mensual');
-            }}
-            className="min-h-[96px] rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 text-left hover:border-[#0E5A64]/40 active:scale-[0.99] transition-all"
-          >
-            <div className="flex items-center gap-4 min-w-0">
-              <span className="w-12 h-12 rounded-2xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
-                <CalendarDays className="w-6 h-6" />
-              </span>
-              <div className="min-w-0">
-                <h2 className="font-display text-lg font-bold">Mensual</h2>
-                <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400">
-                  {currentMonthExpenseCount} gastos apuntados este mes
-                </p>
-              </div>
-            </div>
-            <ArrowRight className="w-5 h-5 text-slate-500 dark:text-slate-400 shrink-0" />
-          </button>
-        </section>
+              <ArrowRight className="w-5 h-5 text-slate-500 dark:text-slate-400 shrink-0" />
+            </button>
+          </section>
+        )}
 
         {incomeModal}
         <OnboardingWalkthrough
@@ -905,29 +1059,40 @@ export const InicioView: React.FC = () => {
 
       {partnerMissingBanner}
       {shoppingCleanupBanner}
+      {previousMonthCloseBanner}
 
       {/* 3 Big KPI Cards */}
       <section aria-label="Cifras principales" className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <button
           type="button"
-          onClick={() => setActiveTab('mensual')}
-          className="text-left rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-3 hover:border-[#0E5A64]/40 transition-colors"
+          onClick={() => {
+            if (selectedMonthKey !== currentMonthKey) setSelectedMonthKey(currentMonthKey);
+            setActiveTab('mensual');
+          }}
+          className="text-left rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-2.5 hover:border-[#0E5A64]/40 transition-colors"
         >
           <div className="flex items-center justify-between text-slate-600 dark:text-slate-400">
-            <span className="text-sm font-medium">Gastado este mes</span>
+            <span className="text-sm font-medium">Gasto registrado este mes</span>
             <Wallet className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
           </div>
           <p className="font-display text-3xl font-bold tabular-nums text-[#0F1F24] dark:text-[#F0F5F6]">
-            {formatEUR(balance.totalSpent)}
+            {formatEUR(monthlyPlanSummary.registeredTotal)}
           </p>
-          <p className="text-xs text-slate-600 dark:text-slate-400 flex items-center gap-1">
+          <p className="text-xs text-slate-600 dark:text-slate-400 flex flex-wrap items-center gap-1 tabular-nums">
             <span>
-              {currentMonthBudgetTotal > 0
-                ? `Presupuesto: ${formatEUR(currentMonthBudgetTotal)}`
-                : 'Ver desglose mensual'}
+              {monthlyPlanSummary.estimatedCloseTotal > 0
+                ? `Est. cierre: ${formatEUR(monthlyPlanSummary.estimatedCloseTotal)}${
+                    monthlyPlanSummary.budgetCoverage === 'partial' ? ' (presup. parcial)' : ''
+                  }`
+                : 'Ver planificación mensual'}
             </span>
-            <ArrowRight className="w-3.5 h-3.5" />
+            <ArrowRight className="w-3.5 h-3.5 shrink-0" />
           </p>
+          {commonAccountSummary.totalMonthlyNeed > 0 && (
+            <p className="text-[11px] text-[#0E5A64] dark:text-[#5EEAD4] font-semibold tabular-nums">
+              Cuenta común prevista: {formatEUR(commonAccountSummary.totalMonthlyNeed)}
+            </p>
+          )}
         </button>
 
         <button
@@ -982,58 +1147,35 @@ export const InicioView: React.FC = () => {
         </button>
       </section>
 
-      {/* Capacidad de ahorro & Lista de la compra (Modo Avanzado) */}
-      <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4">
-          <div className="space-y-1 min-w-0">
-            <p className="text-xs font-semibold text-slate-600 dark:text-slate-400">
-              Capacidad de ahorro mensual
-            </p>
-            <p
-              className={`font-display text-2xl font-bold tabular-nums ${
-                savingsCapacity.capacity >= 0
-                  ? 'text-[#15803D] dark:text-[#4ADE80]'
-                  : 'text-[#B42318] dark:text-[#FCA5A5]'
-              }`}
-            >
-              {savingsCapacity.hasIncomeConfigured ? formatEUR(savingsCapacity.capacity) : 'Sin ingresos'}
-            </p>
-            <p className="text-xs text-slate-600 dark:text-slate-400 tabular-nums">
-              Ingresos {formatEUR(savingsCapacity.totalIncome)} − gasto habitual{' '}
-              {formatEUR(savingsCapacity.habitualSpend)} (fijos{' '}
-              {formatEUR(savingsCapacity.fixedMonthly)} + variables{' '}
-              {formatEUR(savingsCapacity.variableMonthly)})
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={openIncomeModal}
-            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 hover:bg-slate-50 dark:hover:bg-slate-800"
+      {/* Capacidad de ahorro mensual (Compra ya está en la navegación principal sin duplicar tarjetas) */}
+      <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="space-y-1 min-w-0">
+          <p className="text-xs font-semibold text-slate-600 dark:text-slate-400">
+            Capacidad de ahorro mensual
+          </p>
+          <p
+            className={`font-display text-2xl font-bold tabular-nums ${
+              savingsCapacity.capacity >= 0
+                ? 'text-[#15803D] dark:text-[#4ADE80]'
+                : 'text-[#B42318] dark:text-[#FCA5A5]'
+            }`}
           >
-            <Pencil className="w-3.5 h-3.5" />
-            <span>{savingsCapacity.hasIncomeConfigured ? 'Editar ingresos' : 'Añadir ingresos'}</span>
-          </button>
+            {savingsCapacity.hasIncomeConfigured ? formatEUR(savingsCapacity.capacity) : 'Sin ingresos'}
+          </p>
+          <p className="text-xs text-slate-600 dark:text-slate-400 tabular-nums">
+            Ingresos {formatEUR(savingsCapacity.totalIncome)} − gasto habitual{' '}
+            {formatEUR(savingsCapacity.habitualSpend)} (fijos{' '}
+            {formatEUR(savingsCapacity.fixedMonthly)} + variables{' '}
+            {formatEUR(savingsCapacity.variableMonthly)})
+          </p>
         </div>
-
         <button
           type="button"
-          onClick={openShoppingList}
-          className="text-left rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 flex items-center justify-between gap-4 hover:border-[#0E5A64]/40 transition-colors"
+          onClick={openIncomeModal}
+          className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold inline-flex items-center justify-center gap-1.5 shrink-0 hover:bg-slate-50 dark:hover:bg-slate-800 self-start sm:self-auto"
         >
-          <div className="flex items-center gap-3.5 min-w-0">
-            <span className="w-11 h-11 rounded-xl bg-[#15803D]/12 text-[#15803D] dark:text-[#4ADE80] flex items-center justify-center shrink-0">
-              <ShoppingCart className="w-5 h-5" />
-            </span>
-            <div className="min-w-0">
-              <p className="font-display text-base font-bold">Lista de la compra</p>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                {pendingShoppingCount > 0
-                  ? `${pendingShoppingCount} pendiente${pendingShoppingCount === 1 ? '' : 's'} · Convertir en gasto de supermercado`
-                  : 'Sin artículos pendientes · Abrir lista compartida'}
-              </p>
-            </div>
-          </div>
-          <ArrowRight className="w-5 h-5 text-slate-400 shrink-0" />
+          <Pencil className="w-3.5 h-3.5" />
+          <span>{savingsCapacity.hasIncomeConfigured ? 'Editar ingresos' : 'Añadir ingresos'}</span>
         </button>
       </section>
 
@@ -1220,51 +1362,57 @@ export const InicioView: React.FC = () => {
           />
         </section>
 
-        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <PackageCheck className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
-              <h2 className="font-display text-base font-bold">Progreso de mudanza</h2>
-            </div>
-            <button
-              type="button"
-              onClick={() => setActiveTab('mudanza')}
-              className="min-h-[44px] px-2 -mr-2 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:underline inline-flex items-center"
-            >
-              Abrir mudanza
-            </button>
-          </div>
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-slate-600 dark:text-slate-300">
-                Mobiliario completado ({furnitureSummary.boughtCount} de {furnitureSummary.totalCount})
-              </span>
-              <span className="font-bold tabular-nums">{furnitureSummary.boughtPct}%</span>
-            </div>
-            <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
-              <div
-                className="h-full bg-[#0E5A64] dark:bg-[#2AA1AE] rounded-full transition-all duration-500"
-                style={{ width: `${furnitureSummary.boughtPct}%` }}
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-3 pt-2 text-xs">
-              <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
-                <p className="text-slate-500 dark:text-slate-400">Pendiente mobiliario</p>
-                <p className="text-base font-bold tabular-nums mt-0.5">
-                  {formatEUR(furnitureSummary.totalPending)}
-                </p>
+        {!mudanzaCompleted && (
+          <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <PackageCheck className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                <h2 className="font-display text-base font-bold">Progreso de mudanza</h2>
               </div>
-              <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
-                <p className="text-slate-500 dark:text-slate-400">En carrito IKEA</p>
-                <p className="text-base font-bold tabular-nums mt-0.5">
-                  {formatEUR(furnitureSummary.totalCart)}
-                </p>
+              <button
+                type="button"
+                onClick={() => setActiveTab('mudanza')}
+                className="min-h-[44px] px-2 -mr-2 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:underline inline-flex items-center"
+              >
+                Abrir mudanza
+              </button>
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-slate-600 dark:text-slate-300">
+                  Mobiliario completado ({furnitureSummary.boughtCount} de {furnitureSummary.totalCount})
+                </span>
+                <span className="font-bold tabular-nums">{furnitureSummary.boughtPct}%</span>
+              </div>
+              <div className="h-3 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className="h-full bg-[#0E5A64] dark:bg-[#2AA1AE] rounded-full transition-all duration-500"
+                  style={{ width: `${furnitureSummary.boughtPct}%` }}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3 pt-2 text-xs">
+                <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
+                  <p className="text-slate-500 dark:text-slate-400">Pendiente mobiliario</p>
+                  <p className="text-base font-bold tabular-nums mt-0.5">
+                    {formatEUR(furnitureSummary.totalPending)}
+                  </p>
+                </div>
+                <div className="rounded-xl bg-slate-50 dark:bg-slate-900 p-3">
+                  <p className="text-slate-500 dark:text-slate-400">En carrito IKEA</p>
+                  <p className="text-base font-bold tabular-nums mt-0.5">
+                    {formatEUR(furnitureSummary.totalCart)}
+                  </p>
+                </div>
               </div>
             </div>
-          </div>
-        </section>
+          </section>
+        )}
 
-        <section className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+        <section
+          className={`rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4 ${
+            mudanzaCompleted ? 'lg:col-span-2' : ''
+          }`}
+        >
           <div className="flex items-center gap-2">
             <History className="w-5 h-5 text-[#0E5A64] dark:text-[#5EEAD4]" />
             <h2 className="font-display text-base font-bold">Últimos 10 cambios</h2>

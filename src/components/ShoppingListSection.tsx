@@ -1,16 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowLeft,
   Check,
   Layers,
   List,
+  ListChecks,
   Minus,
   Pencil,
   Plus,
   RefreshCw,
+  RotateCcw,
   ShoppingBag,
   ShoppingBasket,
   ShoppingCart,
   Star,
+  Sun,
   Trash2,
   X,
 } from 'lucide-react';
@@ -19,17 +23,21 @@ import { formatEUR, roundCents } from '../domain/finance';
 import {
   findPendingDuplicateMatch,
   formatShoppingQtyUnit,
+  GENERIC_STAPLES_CATALOG,
   groupShoppingItemsBySection,
   inferShoppingSection,
   normalizeShoppingSection,
   normalizeShoppingSourceType,
   normalizeShoppingText,
   normalizeShoppingUnit,
+  resolveEffectiveShoppingSection,
+  resolveShoppingProductKey,
   searchShoppingSuggestionsPaginated,
   SHOPPING_SECTIONS,
   SHOPPING_UNITS,
   type ShoppingSuggestion,
 } from '../domain/shoppingCatalog';
+import { useScreenWakeLock } from '../hooks/useScreenWakeLock';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import {
   getCachedMercadonaCatalogSync,
@@ -49,10 +57,12 @@ import {
 } from '../types/nido';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ShoppingCheckoutPanel } from './ShoppingCheckoutPanel';
+import { ShoppingTemplatesPanel } from './ShoppingTemplatesPanel';
 
 interface ShoppingListSectionProps {
   open: boolean;
   onClose: () => void;
+  variant?: 'modal' | 'page';
 }
 
 interface SelectedProductMeta {
@@ -72,11 +82,17 @@ interface DuplicatePromptState {
   existing: ShoppingItem;
 }
 
-export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, onClose }) => {
+export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({
+  open,
+  onClose,
+  variant = 'modal',
+}) => {
   const {
     householdId,
     shoppingItems,
     shoppingCatalog,
+    shoppingTemplates,
+    shoppingSectionOverridesMap,
     members,
     currentUserProfile,
     uiMode,
@@ -102,6 +118,7 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
   const [checkoutSnapshots, setCheckoutSnapshots] = useState<ShoppingCheckoutItemSnapshot[] | null>(
     null
   );
+  const [templatesViewOpen, setTemplatesViewOpen] = useState(false);
 
   const [mercadonaCatalog, setMercadonaCatalog] = useState<LoadedMercadonaCatalog | null>(() =>
     getCachedMercadonaCatalogSync()
@@ -111,12 +128,14 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
 
   const [groupBySection, setGroupBySection] = useState(true);
   const [shoppingMode, setShoppingMode] = useState(false);
+  const [keepScreenAwake, setKeepScreenAwake] = useState(false);
 
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
   const [editQty, setEditQty] = useState('1');
   const [editUnit, setEditUnit] = useState('');
-  const [editSection, setEditSection] = useState<ShoppingSection>('Otros de supermercado');
+  const [editSection, setEditSection] = useState<ShoppingSection>('Sin clasificar');
+  const [rememberSectionOverride, setRememberSectionOverride] = useState(false);
 
   const [clearCheckedConfirmOpen, setClearCheckedConfirmOpen] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -161,8 +180,8 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
   );
 
   const groupedPending = useMemo(
-    () => groupShoppingItemsBySection(pendingItems),
-    [pendingItems]
+    () => groupShoppingItemsBySection(pendingItems, shoppingSectionOverridesMap),
+    [pendingItems, shoppingSectionOverridesMap]
   );
 
   const quickCatalogItems = useMemo(
@@ -186,10 +205,15 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
         limit: suggestionLimit,
         offset: 0,
         section: catalogSection,
+        sectionOverrides: shoppingSectionOverridesMap,
       }),
-    [newText, shoppingCatalog, mercadonaEntries, suggestionLimit, catalogSection]
+    [newText, shoppingCatalog, mercadonaEntries, suggestionLimit, catalogSection, shoppingSectionOverridesMap]
   );
   const suggestions = paginatedSuggestions.items;
+
+  const wakeLockEnabled =
+    open && shoppingMode && keepScreenAwake && !checkoutSnapshots && !templatesViewOpen;
+  const wakeLock = useScreenWakeLock(wakeLockEnabled);
 
   useEffect(() => {
     setActiveSuggestionIdx(-1);
@@ -200,13 +224,22 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
   }, [newText, catalogSection]);
 
   useEffect(() => {
+    if (!shoppingMode) {
+      setKeepScreenAwake(false);
+    }
+  }, [shoppingMode]);
+
+  useEffect(() => {
     if (!open) {
       setSuggestionsOpen(false);
       setSuggestionLimit(12);
       setCatalogSection('todas');
       setDuplicatePrompt(null);
       setCheckoutSnapshots(null);
+      setTemplatesViewOpen(false);
+      setKeepScreenAwake(false);
       setEditingItemId(null);
+      setRememberSectionOverride(false);
       setError(null);
     }
   }, [open]);
@@ -239,14 +272,31 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
     return roundCents(parsed);
   };
 
+  const resolveCatalogDefaultSection = (item: {
+    text: string;
+    catalogId?: string;
+  }): ShoppingSection => {
+    if (item.catalogId) {
+      const mercEntry = mercadonaEntries.find((e) => e.id === item.catalogId);
+      if (mercEntry) return mercEntry.section;
+      const genEntry = GENERIC_STAPLES_CATALOG.find((g) => g.id === item.catalogId);
+      if (genEntry) return genEntry.section;
+    }
+    return inferShoppingSection(item.text);
+  };
+
   const resolveMetaForText = (cleanText: string): SelectedProductMeta => {
     const norm = normalizeShoppingText(cleanText);
     if (selectedMeta && selectedMeta.baseNormText === norm) {
       return selectedMeta;
     }
+    const productKey = resolveShoppingProductKey({ text: cleanText });
+    const overrideSec = shoppingSectionOverridesMap.get(productKey);
     return {
       baseNormText: norm,
-      section: catalogSection !== 'todas' ? catalogSection : inferShoppingSection(cleanText),
+      section:
+        overrideSec ??
+        (catalogSection !== 'todas' ? catalogSection : inferShoppingSection(cleanText)),
       sourceType: 'custom',
     };
   };
@@ -313,8 +363,13 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
     setSubmitting(true);
     setError(null);
     try {
-      const nextSection =
-        normalizeShoppingSection(existing.section) ?? meta.section ?? inferShoppingSection(existing.text);
+      const nextSection = resolveEffectiveShoppingSection(
+        {
+          ...existing,
+          section: normalizeShoppingSection(existing.section) ?? meta.section,
+        },
+        shoppingSectionOverridesMap
+      );
       const nextSourceType =
         normalizeShoppingSourceType(existing.sourceType) ?? meta.sourceType;
       await repo.upsertShoppingItem(
@@ -427,7 +482,7 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
       ...(catItem.catalogId ? { catalogId: catItem.catalogId } : {}),
       ...(catItem.brand ? { brand: catItem.brand } : {}),
       ...(catItem.format ? { format: catItem.format } : {}),
-      section: normalizeShoppingSection(catItem.section) ?? inferShoppingSection(catItem.text),
+      section: resolveEffectiveShoppingSection(catItem, shoppingSectionOverridesMap),
       sourceType:
         normalizeShoppingSourceType(catItem.sourceType) ??
         (catItem.catalogId ? 'mercadona' : 'custom'),
@@ -564,12 +619,56 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
   };
 
   const startEditItem = (item: ShoppingItem) => {
+    const productKey = resolveShoppingProductKey(item);
     setEditingItemId(item.id);
     setEditText(item.text);
     setEditQty(String(item.qty).replace('.', ','));
     setEditUnit(item.unit || '');
-    setEditSection(normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text));
+    setEditSection(resolveEffectiveShoppingSection(item, shoppingSectionOverridesMap));
+    setRememberSectionOverride(shoppingSectionOverridesMap.has(productKey));
     setError(null);
+  };
+
+  const handleRestoreCatalogSection = async (item: ShoppingItem) => {
+    if (!householdId || !currentUserProfile) return;
+    const productKey = resolveShoppingProductKey({
+      catalogId: item.catalogId,
+      text: editText.trim() || item.text,
+      brand: item.brand,
+      format: item.format,
+    });
+    const defaultSection = resolveCatalogDefaultSection({
+      catalogId: item.catalogId,
+      text: editText.trim() || item.text,
+    });
+    setBusyId(item.id);
+    setError(null);
+    try {
+      await repo.clearShoppingSectionOverride(householdId, productKey);
+      await repo.upsertShoppingItem(
+        householdId,
+        {
+          id: item.id,
+          text: item.text,
+          qty: item.qty,
+          unit: item.unit || '',
+          done: item.done,
+          ...(item.catalogId ? { catalogId: item.catalogId } : {}),
+          ...(item.brand ? { brand: item.brand } : {}),
+          ...(item.format ? { format: item.format } : {}),
+          section: defaultSection,
+          ...(item.sourceType ? { sourceType: item.sourceType } : {}),
+        },
+        currentUserProfile
+      );
+      setEditSection(defaultSection);
+      setRememberSectionOverride(false);
+      showToast(`Sección restaurada a «${defaultSection}»`);
+    } catch (err) {
+      setError(toUserFriendlyErrorMessage(err, 'No se pudo restaurar la sección del catálogo.'));
+    } finally {
+      setBusyId(null);
+    }
   };
 
   const handleSaveEdit = async (e: React.FormEvent, item: ShoppingItem) => {
@@ -586,9 +685,30 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
       return;
     }
     const cleanUnit = normalizeShoppingUnit(editUnit);
+    const productKey = resolveShoppingProductKey({
+      catalogId: item.catalogId,
+      text: cleanText,
+      brand: item.brand,
+      format: item.format,
+    });
+    const hadOverride = shoppingSectionOverridesMap.has(productKey);
+    const catalogDefaultSection = resolveCatalogDefaultSection({
+      catalogId: item.catalogId,
+      text: cleanText,
+    });
     setBusyId(item.id);
     setError(null);
     try {
+      if (rememberSectionOverride) {
+        await repo.setShoppingSectionOverride(
+          householdId,
+          productKey,
+          editSection,
+          currentUserProfile
+        );
+      } else if (hadOverride) {
+        await repo.clearShoppingSectionOverride(householdId, productKey);
+      }
       await repo.upsertShoppingItem(
         householdId,
         {
@@ -613,12 +733,13 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
           ...(item.catalogId ? { catalogId: item.catalogId } : {}),
           ...(item.brand ? { brand: item.brand } : {}),
           ...(item.format ? { format: item.format } : {}),
-          section: editSection,
+          section: rememberSectionOverride ? editSection : catalogDefaultSection,
           ...(item.sourceType ? { sourceType: item.sourceType } : {}),
         },
         currentUserProfile
       );
       setEditingItemId(null);
+      setRememberSectionOverride(false);
     } catch (err) {
       setError(toUserFriendlyErrorMessage(err, 'No se pudo guardar el cambio del producto.'));
     } finally {
@@ -691,6 +812,17 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
     const metaSub = [item.brand, item.format].filter(Boolean).join(' · ');
 
     if (isEditing) {
+      const editProductKey = resolveShoppingProductKey({
+        catalogId: item.catalogId,
+        text: editText.trim() || item.text,
+        brand: item.brand,
+        format: item.format,
+      });
+      const catalogDefaultSection = resolveCatalogDefaultSection({
+        catalogId: item.catalogId,
+        text: editText.trim() || item.text,
+      });
+      const hasSavedOverride = shoppingSectionOverridesMap.has(editProductKey);
       return (
         <li key={item.id} className="py-2.5 first:pt-0 last:pb-0">
           <form
@@ -729,7 +861,13 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
               <select
                 aria-label="Sección de compra"
                 value={editSection}
-                onChange={(e) => setEditSection(e.target.value as ShoppingSection)}
+                onChange={(e) => {
+                  const nextSec = e.target.value as ShoppingSection;
+                  setEditSection(nextSec);
+                  if (nextSec !== catalogDefaultSection) {
+                    setRememberSectionOverride(true);
+                  }
+                }}
                 className="w-full sm:w-auto sm:flex-1 min-h-[44px] px-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-sm"
               >
                 {SHOPPING_SECTIONS.map((sec) => (
@@ -739,10 +877,35 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
                 ))}
               </select>
             </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+              <label className="inline-flex items-center gap-2 min-h-[36px] text-[11px] text-slate-700 dark:text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={rememberSectionOverride}
+                  onChange={(e) => setRememberSectionOverride(e.target.checked)}
+                  className="w-4 h-4 accent-[#0E5A64] rounded"
+                />
+                <span>Recordar sección en futuras compras del hogar</span>
+              </label>
+              {hasSavedOverride && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleRestoreCatalogSection(item)}
+                  className="min-h-[40px] px-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#132025] text-[11px] font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1 hover:border-[#0E5A64]"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Restaurar sección del catálogo</span>
+                </button>
+              )}
+            </div>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setEditingItemId(null)}
+                onClick={() => {
+                  setEditingItemId(null);
+                  setRememberSectionOverride(false);
+                }}
                 className="min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 text-xs font-semibold"
               >
                 Cancelar
@@ -868,15 +1031,27 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
     );
   };
 
+  const isPage = variant === 'page';
+
   return (
     <>
       <div
-        className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4"
-        role="dialog"
-        aria-modal="true"
+        className={
+          isPage
+            ? 'max-w-2xl mx-auto'
+            : 'fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4'
+        }
+        role={isPage ? undefined : 'dialog'}
+        aria-modal={isPage ? undefined : 'true'}
         aria-labelledby="shopping-list-title"
       >
-        <div className="w-full sm:max-w-xl rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-4 sm:p-6 space-y-3.5 max-h-[92vh] flex flex-col">
+        <div
+          className={
+            isPage
+              ? 'w-full rounded-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-4 sm:p-6 space-y-3.5 flex flex-col'
+              : 'w-full sm:max-w-xl rounded-t-3xl sm:rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-4 sm:p-6 space-y-3.5 max-h-[92vh] flex flex-col'
+          }
+        >
           {/* Header */}
           <div className="flex items-center justify-between gap-2 shrink-0">
             <div className="flex items-center gap-2.5 min-w-0">
@@ -884,26 +1059,56 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
                 <ShoppingCart className="w-5 h-5" />
               </span>
               <div className="min-w-0">
-                <h2 id="shopping-list-title" className="font-display text-lg font-bold truncate">
-                  {checkoutSnapshots ? 'Finalizar compra' : 'Lista de la compra'}
-                </h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
+                {isPage ? (
+                  <h1 id="shopping-list-title" className="font-display text-xl sm:text-2xl font-bold truncate">
+                    {checkoutSnapshots
+                      ? 'Finalizar compra'
+                      : templatesViewOpen
+                        ? 'Mis listas'
+                        : 'Lista de la compra'}
+                  </h1>
+                ) : (
+                  <h2 id="shopping-list-title" className="font-display text-lg font-bold truncate">
+                    {checkoutSnapshots
+                      ? 'Finalizar compra'
+                      : templatesViewOpen
+                        ? 'Mis listas'
+                        : 'Lista de la compra'}
+                  </h2>
+                )}
+                <p className="text-xs text-slate-600 dark:text-slate-400">
                   {checkoutSnapshots
                     ? `${checkoutSnapshots.length} ${
                         checkoutSnapshots.length === 1 ? 'producto listo' : 'productos listos'
                       } para pasar a gasto`
-                    : `${pendingItems.length} por comprar · ${checkedItems.length} en el carro`}
+                    : templatesViewOpen
+                      ? 'Listas reutilizables compartidas del hogar'
+                      : `${pendingItems.length} por comprar · ${checkedItems.length} en el carro`}
                 </p>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Cerrar lista de la compra"
-              className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
-            >
-              <X className="w-5 h-5" />
-            </button>
+            {!isPage ? (
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Cerrar lista de la compra"
+                className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            ) : (
+              uiMode === 'sencillo' && (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  aria-label="Volver a Inicio"
+                  className="md:hidden min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1.5 shrink-0 hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  <ArrowLeft className="w-4 h-4" />
+                  <span>Inicio</span>
+                </button>
+              )
+            )}
           </div>
 
           {checkoutSnapshots ? (
@@ -913,13 +1118,18 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
               onCancel={() => setCheckoutSnapshots(null)}
               onCompleted={() => {
                 setCheckoutSnapshots(null);
-                onClose();
+                if (!isPage) onClose();
               }}
+            />
+          ) : templatesViewOpen ? (
+            <ShoppingTemplatesPanel
+              onClose={() => setTemplatesViewOpen(false)}
+              mercadonaEntries={mercadonaEntries}
             />
           ) : (
             <>
 
-          {/* View controls: Por secciones / Lista simple + Modo compra */}
+          {/* View controls: Por secciones / Lista simple + Mis listas + Modo compra */}
           <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
             <div className="inline-flex rounded-xl border border-slate-200 dark:border-slate-700 p-0.5 bg-[#F6F8F8] dark:bg-slate-900">
               <button
@@ -950,34 +1160,77 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
               </button>
             </div>
 
-            <button
-              type="button"
-              aria-pressed={shoppingMode}
-              onClick={() => setShoppingMode((v) => !v)}
-              className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-bold inline-flex items-center gap-1.5 transition-colors ${
-                shoppingMode
-                  ? 'border-[#15803D] bg-[#15803D] text-white'
-                  : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-slate-700 dark:text-slate-200 hover:border-[#0E5A64]/50'
-              }`}
-            >
-              <ShoppingBag className="w-3.5 h-3.5" />
-              <span>Modo compra</span>
-            </button>
+            <div className="flex items-center gap-1.5">
+              {!shoppingMode && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSuggestionsOpen(false);
+                    setEditingItemId(null);
+                    setTemplatesViewOpen(true);
+                  }}
+                  className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-bold text-slate-700 dark:text-slate-200 hover:border-[#0E5A64]/50 inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <ListChecks className="w-3.5 h-3.5 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                  <span>Mis listas{shoppingTemplates.length > 0 ? ` (${shoppingTemplates.length})` : ''}</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                aria-pressed={shoppingMode}
+                onClick={() => setShoppingMode((v) => !v)}
+                className={`min-h-[44px] px-3.5 rounded-xl border text-xs font-bold inline-flex items-center gap-1.5 transition-colors ${
+                  shoppingMode
+                    ? 'border-[#15803D] bg-[#15803D] text-white'
+                    : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-slate-700 dark:text-slate-200 hover:border-[#0E5A64]/50'
+                }`}
+              >
+                <ShoppingBag className="w-3.5 h-3.5" />
+                <span>Modo compra</span>
+              </button>
+            </div>
           </div>
 
           {shoppingMode && (
             <div
               role="status"
-              className="rounded-xl bg-[#0E5A64]/10 dark:bg-[#0E5A64]/25 border border-[#0E5A64]/25 px-3.5 py-2.5 flex items-center justify-between gap-2 shrink-0"
+              className="rounded-xl bg-[#0E5A64]/10 dark:bg-[#0E5A64]/25 border border-[#0E5A64]/25 px-3.5 py-2.5 space-y-2 shrink-0"
             >
-              <span className="text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                {pendingItems.length > 0
-                  ? `Faltan ${pendingItems.length} ${pendingItems.length === 1 ? 'producto' : 'productos'} por echar al carro`
-                  : '¡Todo en el carro! Ya puedes convertir la compra en gasto'}
-              </span>
-              <span className="font-mono-num text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                {checkedItems.length}/{shoppingItems.length}
-              </span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
+                  {pendingItems.length > 0
+                    ? `Faltan ${pendingItems.length} ${pendingItems.length === 1 ? 'producto' : 'productos'} por echar al carro`
+                    : '¡Todo en el carro! Ya puedes convertir la compra en gasto'}
+                </span>
+                <span className="font-mono-num text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
+                  {checkedItems.length}/{shoppingItems.length}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <button
+                  type="button"
+                  aria-pressed={keepScreenAwake}
+                  onClick={() => setKeepScreenAwake((v) => !v)}
+                  className={`min-h-[44px] px-3 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors ${
+                    keepScreenAwake
+                      ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
+                      : 'border-[#0E5A64]/30 bg-white/80 dark:bg-[#132025] text-[#0E5A64] dark:text-[#5EEAD4]'
+                  }`}
+                >
+                  <Sun className="w-3.5 h-3.5" />
+                  <span>
+                    {keepScreenAwake && wakeLock.active
+                      ? 'Pantalla encendida (activa)'
+                      : 'Mantener pantalla encendida'}
+                  </span>
+                </button>
+                {keepScreenAwake && wakeLock.statusMessage && (
+                  <p className="text-[11px] text-amber-800 dark:text-amber-200">
+                    {wakeLock.statusMessage}
+                  </p>
+                )}
+              </div>
             </div>
           )}
 
@@ -1337,6 +1590,14 @@ export const ShoppingListSection: React.FC<ShoppingListSectionProps> = ({ open, 
                                   )}
                                 </div>
                                 <span className="flex items-center gap-1.5 shrink-0">
+                                  {s.hasSectionOverride && (
+                                    <span
+                                      title={`Sección personalizada: ${s.section}`}
+                                      className="px-1.5 py-0.5 rounded bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] text-[10px] font-semibold"
+                                    >
+                                      {s.section}
+                                    </span>
+                                  )}
                                   {s.defaultUnit && (
                                     <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-600 dark:text-slate-300">
                                       {s.defaultUnit}

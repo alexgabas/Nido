@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Archive,
   Bell,
   Check,
   Copy,
@@ -8,8 +9,10 @@ import {
   HelpCircle,
   LogOut,
   Moon,
+  Package,
   Palette,
   RefreshCw,
+  RotateCcw,
   Share2,
   Sun,
   Upload,
@@ -48,6 +51,11 @@ import {
   type LocalNoticeDaysAhead,
   type LocalNoticeSettings,
 } from '../domain/localNotifications';
+import {
+  buildMudanzaCompletionDescription,
+  countPendingMudanzaItems,
+  isMudanzaCompleted,
+} from '../domain/mudanzaStage';
 import { SPLIT_PRESETS } from '../domain/presets';
 import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
@@ -71,6 +79,8 @@ export const AjustesView: React.FC = () => {
     recentTransactions,
     monthClosures,
     currentMonthBudget,
+    checklist,
+    furnitureItems,
     categoryRegistry,
     repo,
     logout,
@@ -93,6 +103,34 @@ export const AjustesView: React.FC = () => {
   const [switchingHousehold, setSwitchingHousehold] = useState(false);
   const [switchConfirm, setSwitchConfirm] = useState<{ code: string; targetName: string } | null>(null);
   const [colorModalOpen, setColorModalOpen] = useState(false);
+  const [completeMudanzaConfirmOpen, setCompleteMudanzaConfirmOpen] = useState(false);
+  const [togglingMudanzaStage, setTogglingMudanzaStage] = useState(false);
+
+  const mudanzaCompleted = isMudanzaCompleted(household);
+  const pendingMudanzaCounts = countPendingMudanzaItems(furnitureItems, checklist);
+  const mudanzaCompletedDateLabel = household?.mudanzaCompletedAt
+    ? formatDateES(household.mudanzaCompletedAt.slice(0, 10))
+    : '';
+
+  const handleSetMudanzaStage = async (completed: boolean) => {
+    if (!householdId || !currentUserProfile || togglingMudanzaStage) return;
+    setTogglingMudanzaStage(true);
+    try {
+      await repo.setMudanzaCompleted(householdId, completed, currentUserProfile);
+      setCompleteMudanzaConfirmOpen(false);
+      showToast(
+        completed
+          ? 'Etapa de mudanza terminada · Histórico conservado'
+          : 'Etapa de mudanza reabierta'
+      );
+    } catch (err) {
+      showToast(
+        toUserFriendlyErrorMessage(err, 'No se pudo actualizar el estado de la mudanza.')
+      );
+    } finally {
+      setTogglingMudanzaStage(false);
+    }
+  };
 
   // Full report date range
   const todayISO = getTodayLocalISO();
@@ -784,6 +822,55 @@ export const AjustesView: React.FC = () => {
               ))}
             </div>
 
+            <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1.5">
+                    {mudanzaCompleted ? (
+                      <Archive className="w-3.5 h-3.5 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                    ) : (
+                      <Package className="w-3.5 h-3.5 text-[#0E5A64] dark:text-[#5EEAD4]" />
+                    )}
+                    <span>Etapa de mudanza</span>
+                  </p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
+                    {mudanzaCompleted
+                      ? `Terminada${mudanzaCompletedDateLabel ? ` el ${mudanzaCompletedDateLabel}` : ''}. Su histórico sigue disponible.`
+                      : 'Activa en Inicio. Cuando os instaléis podéis pasarla a histórico sin borrar nada.'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('mudanza')}
+                  className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
+                >
+                  <span>{mudanzaCompleted ? 'Abrir histórico de mudanza' : 'Abrir mudanza'}</span>
+                </button>
+                {mudanzaCompleted ? (
+                  <button
+                    type="button"
+                    disabled={togglingMudanzaStage}
+                    onClick={() => void handleSetMudanzaStage(false)}
+                    className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/40 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-semibold hover:bg-[#0E5A64]/5 inline-flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>{togglingMudanzaStage ? 'Reabriendo...' : 'Reabrir mudanza'}</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={togglingMudanzaStage}
+                    onClick={() => setCompleteMudanzaConfirmOpen(true)}
+                    className="min-h-[44px] px-3.5 rounded-xl border border-[#0E5A64]/40 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-semibold hover:bg-[#0E5A64]/5 inline-flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <span>Dar por terminada la mudanza</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
             {seedPending && (
               <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-2">
                 <p className="text-xs text-amber-800 dark:text-amber-300">
@@ -1014,6 +1101,16 @@ export const AjustesView: React.FC = () => {
           if (switchConfirm) void runSwitchHousehold(switchConfirm.code, true);
         }}
         onCancel={() => setSwitchConfirm(null)}
+      />
+
+      <ConfirmDialog
+        open={completeMudanzaConfirmOpen}
+        title="¿Dar por terminada la mudanza?"
+        description={buildMudanzaCompletionDescription(pendingMudanzaCounts)}
+        confirmLabel={togglingMudanzaStage ? 'Guardando...' : 'Sí, terminar mudanza'}
+        destructive={false}
+        onConfirm={() => void handleSetMudanzaStage(true)}
+        onCancel={() => setCompleteMudanzaConfirmOpen(false)}
       />
 
       <CategoryColorModal open={colorModalOpen} onClose={() => setColorModalOpen(false)} />

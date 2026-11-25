@@ -1,10 +1,13 @@
 import React from 'react';
+import type { CategoryIconKey } from '../domain/categories';
 import { formatEUR } from '../domain/finance';
+import { CategoryIcon } from './CategoryIcon';
 
 export interface DonutSlice {
   label: string;
   value: number;
   color: string;
+  icon?: CategoryIconKey | 'arrow-left-right';
 }
 
 export const DonutChart: React.FC<{
@@ -75,6 +78,12 @@ export const DonutChart: React.FC<{
                       className="w-2.5 h-2.5 rounded-sm shrink-0"
                       style={{ backgroundColor: s.color }}
                     />
+                    {s.icon && (
+                      <CategoryIcon
+                        icon={s.icon}
+                        className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300 shrink-0"
+                      />
+                    )}
                     <span className="truncate text-slate-700 dark:text-slate-200">{s.label}</span>
                   </div>
                   <div className="flex items-center gap-2 shrink-0 tabular-nums">

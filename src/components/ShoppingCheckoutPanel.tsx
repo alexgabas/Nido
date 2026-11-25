@@ -29,6 +29,7 @@ import {
   type LocalPendingShoppingCheckout,
   type ShoppingCheckoutItemSnapshot,
 } from '../domain/shoppingCheckout';
+import { annualBalanceSessionCache } from '../domain/annualBalance';
 import { globalSearchSessionCache } from '../domain/globalSearch';
 import { formatShoppingQtyUnit } from '../domain/shoppingCatalog';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
@@ -254,6 +255,7 @@ export const ShoppingCheckoutPanel: React.FC<ShoppingCheckoutPanelProps> = ({
       },
       onPhase1Confirmed: (_confirmedExpenseId, pendingIds) => {
         globalSearchSessionCache.invalidateHousehold(householdId);
+        annualBalanceSessionCache.invalidateHousehold(householdId);
         if (pendingIds.length > 0) {
           saveLocalPendingCheckout({
             ...localRecordBase,

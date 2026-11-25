@@ -18,7 +18,7 @@ export const CategoryTag: React.FC<CategoryTagProps> = ({
   customColors,
   size = 'sm',
   labelOverride,
-  showIcon = false,
+  showIcon = true,
   className = '',
 }) => {
   const { categoryRegistry } = useNido();

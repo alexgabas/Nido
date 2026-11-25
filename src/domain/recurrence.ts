@@ -50,14 +50,36 @@ export function isRecurringMissingStartMonth(rec: RecurringExpense): boolean {
   return Boolean(rec.active) && rec.frequency !== 'mensual' && !isValidMonthKey(rec.startMonth);
 }
 
+export const MAX_SKIPPED_MONTHS = 120;
+
+export function sanitizeSkippedMonths(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const valid: string[] = [];
+  for (const item of raw) {
+    if (!isValidMonthKey(item)) continue;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    valid.push(item);
+  }
+  valid.sort();
+  return valid.length > MAX_SKIPPED_MONTHS ? valid.slice(valid.length - MAX_SKIPPED_MONTHS) : valid;
+}
+
+export function isRecurringSkippedInMonth(
+  rec: Pick<RecurringExpense, 'skippedMonths'>,
+  monthKey: string
+): boolean {
+  if (!isValidMonthKey(monthKey)) return false;
+  if (!Array.isArray(rec.skippedMonths) || rec.skippedMonths.length === 0) return false;
+  return rec.skippedMonths.includes(monthKey);
+}
+
 /**
- * Single authoritative recurrence cadence engine.
- * - Inactive or <= 0 € templates are never due.
- * - Monthly templates without `startMonth` stay due every month (legacy support).
- * - Non-monthly templates without a valid `startMonth` return false (flagged via `isRecurringMissingStartMonth`).
- * - Templates with a valid `startMonth` are due iff `targetMonth >= startMonth` and `(monthsDiff % interval) === 0`.
+ * Evaluates whether an active recurring template is due in `monthKey`, ignoring `skippedMonths`.
+ * Used to list templates explicitly marked as "No se ha producido este mes" so the user can undo.
  */
-export function isRecurringDueInMonth(rec: RecurringExpense, monthKey: string): boolean {
+export function isRecurringDueInMonthIgnoringSkip(rec: RecurringExpense, monthKey: string): boolean {
   if (!rec.active || (Number(rec.amount) || 0) <= 0) return false;
   if (!isValidMonthKey(monthKey)) return false;
 
@@ -73,6 +95,18 @@ export function isRecurringDueInMonth(rec: RecurringExpense, monthKey: string): 
   const diff = monthsDiff(rec.startMonth, monthKey);
   if (diff < 0) return false;
   return diff % frequencyIntervalMonths(rec.frequency) === 0;
+}
+
+/**
+ * Single authoritative recurrence cadence engine.
+ * - Inactive, <= 0 €, or explicitly skipped in `monthKey` templates are never due.
+ * - Monthly templates without `startMonth` stay due every month (legacy support).
+ * - Non-monthly templates without a valid `startMonth` return false (flagged via `isRecurringMissingStartMonth`).
+ * - Templates with a valid `startMonth` are due iff `targetMonth >= startMonth` and `(monthsDiff % interval) === 0`.
+ */
+export function isRecurringDueInMonth(rec: RecurringExpense, monthKey: string): boolean {
+  if (isRecurringSkippedInMonth(rec, monthKey)) return false;
+  return isRecurringDueInMonthIgnoringSkip(rec, monthKey);
 }
 
 export function getRecurringDueDateForMonth(rec: RecurringExpense, monthKey: string): string {

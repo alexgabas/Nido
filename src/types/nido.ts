@@ -2,7 +2,7 @@ export type SplitMode = 'income' | 'preset' | 'custom';
 export type UiMode = 'sencillo' | 'avanzado';
 export type MemberRole = 'member_a' | 'member_b';
 export type ThemeMode = 'light' | 'dark';
-export type NavTab = 'inicio' | 'mudanza' | 'mensual' | 'ahorros' | 'ajustes' | 'ayuda';
+export type NavTab = 'inicio' | 'mensual' | 'compra' | 'ahorros' | 'mudanza' | 'ajustes' | 'ayuda';
 
 export const MAX_LENGTHS = {
   householdName: 80,
@@ -26,6 +26,8 @@ export const MAX_LENGTHS = {
   categoryName: 40,
   categoryIcon: 32,
   checkoutId: 48,
+  shoppingTemplateName: 80,
+  shoppingOverrideKey: 64,
 } as const;
 
 export interface HouseholdSettings {
@@ -82,6 +84,20 @@ export interface CategoryBudgetLimit {
   updatedAt: string;
 }
 
+export interface MemberCategoryPreferences {
+  uid: string;
+  selectorVersion: number;
+  visibleCategoryIds: string[];
+  updatedAt: string;
+}
+
+export interface CommonAccountManualBalance {
+  amount: number; // >= 0
+  referenceDate: string; // YYYY-MM-DD (hora local)
+  updatedBy: string; // member uid
+  updatedAt: string; // ISO string
+}
+
 export interface Household {
   id: string;
   name: string;
@@ -90,6 +106,11 @@ export interface Household {
   settings: HouseholdSettings;
   csvKeywords?: CsvCategoryKeywords;
   categoryColors?: CategoryColorMap;
+  commonAccountPlannedCategories?: string[];
+  commonAccountManualBalance?: CommonAccountManualBalance | null;
+  mudanzaCompleted?: boolean;
+  mudanzaCompletedAt?: string | null;
+  mudanzaCompletedBy?: string | null;
   seedPending?: boolean;
   recurringSeedVersion?: number;
   createdAt: string;
@@ -207,6 +228,7 @@ export interface RecurringExpense {
   frequency: RecurrenceFrequency;
   dayOfMonth: number;
   startMonth?: string; // '' or 'YYYY-MM'
+  skippedMonths?: string[]; // Meses 'YYYY-MM' donde esta plantilla no se produjo (sin desactivarla)
   splitOverride: number | null;
   paidByDefault: string; // uid | 'cuenta_comun'
   active: boolean;
@@ -291,6 +313,21 @@ export interface GoalMovement {
   createdAt: string;
 }
 
+export interface SavingsPlanAllocation {
+  goalId: string;
+  plannedAmount: number; // >= 0
+  priority: number; // 0-based order (0..99)
+  goalNameSnapshot?: string;
+}
+
+export interface MonthlySavingsPlan {
+  monthKey: string; // YYYY-MM
+  targetAmount: number; // >= 0, manual amount reserved for the month
+  allocations: SavingsPlanAllocation[];
+  updatedBy: string; // uid
+  updatedAt: string; // ISO string
+}
+
 export const SHOPPING_SECTIONS = [
   'Fruta y verdura',
   'Carne, charcutería y huevos',
@@ -306,6 +343,7 @@ export const SHOPPING_SECTIONS = [
   'Cuidado personal e higiene',
   'Bebé y mascotas',
   'Otros de supermercado',
+  'Sin clasificar',
 ] as const;
 
 export type ShoppingSection = (typeof SHOPPING_SECTIONS)[number];
@@ -358,6 +396,34 @@ export interface PendingShoppingCheckout {
   updatedAt: string;
 }
 
+export interface ShoppingTemplateItem {
+  text: string;
+  qty: number;
+  unit?: string;
+  catalogId?: string;
+  brand?: string;
+  format?: string;
+  section?: ShoppingSection;
+  sourceType?: ShoppingSourceType;
+}
+
+export interface ShoppingListTemplate {
+  id: string;
+  name: string;
+  items: ShoppingTemplateItem[];
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShoppingSectionOverride {
+  id: string;
+  productKey: string;
+  section: ShoppingSection;
+  updatedBy: string;
+  updatedAt: string;
+}
+
 export interface ExpensePrefill {
   amount?: string;
   concept?: string;
@@ -375,8 +441,13 @@ export interface NidoBackupV1 {
   exportedAt: string;
   householdName: string;
   settings: HouseholdSettings;
+  mudanzaCompleted?: boolean;
+  mudanzaCompletedAt?: string | null;
+  mudanzaCompletedBy?: string | null;
   csvKeywords?: CsvCategoryKeywords;
   categoryColors?: CategoryColorMap;
+  commonAccountPlannedCategories?: string[];
+  commonAccountManualBalance?: CommonAccountManualBalance | null;
   customCategories?: Omit<CustomCategory, 'createdAt' | 'updatedAt'>[];
   categoryBudgets?: Omit<CategoryBudgetLimit, 'updatedAt'>[];
   initialCosts: Omit<InitialCost, 'createdAt' | 'updatedAt'>[];
@@ -388,6 +459,9 @@ export interface NidoBackupV1 {
   monthClosures: Omit<MonthClosure, 'closedAt'>[];
   goals: Omit<SavingsGoal, 'createdAt' | 'updatedAt'>[];
   goalMovements: Omit<GoalMovement, 'createdAt'>[];
+  savingsPlans?: Omit<MonthlySavingsPlan, 'updatedAt'>[];
   shopping?: Omit<ShoppingItem, 'createdAt' | 'updatedAt'>[];
   shoppingCatalog?: Omit<ShoppingCatalogItem, 'createdAt' | 'updatedAt'>[];
+  shoppingTemplates?: Omit<ShoppingListTemplate, 'createdAt' | 'updatedAt'>[];
+  shoppingSectionOverrides?: Omit<ShoppingSectionOverride, 'updatedAt'>[];
 }

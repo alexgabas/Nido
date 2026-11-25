@@ -4,6 +4,7 @@ import {
   type ShoppingCatalogItem,
   type ShoppingItem,
   type ShoppingSection,
+  type ShoppingSectionOverride,
   type ShoppingSourceType,
 } from '../types/nido';
 
@@ -34,6 +35,7 @@ export interface StaticMercadonaCatalogEntry {
   sourceRef: string;
   source: string;
   addedAt: string;
+  excludedFromSuggestions?: boolean;
 }
 
 export interface PreindexedMercadonaEntry extends StaticMercadonaCatalogEntry {
@@ -64,6 +66,9 @@ export interface ShoppingSuggestion {
   variant?: string;
   format?: string;
   section: ShoppingSection;
+  defaultSection?: ShoppingSection;
+  productKey?: string;
+  hasSectionOverride?: boolean;
   favorite?: boolean;
   usageCount?: number;
   lastUsedAt?: string;
@@ -141,62 +146,114 @@ export function buildShoppingCatalogId(
   return `prod_${slug || 'item'}_${suffix}`.slice(0, 48);
 }
 
+export function resolveShoppingProductKey(item: {
+  catalogId?: string;
+  text: string;
+  brand?: string;
+  format?: string;
+}): string {
+  const rawCatalogId = String(item.catalogId ?? '').trim();
+  if (rawCatalogId && /^[a-zA-Z0-9_-]{2,64}$/.test(rawCatalogId)) {
+    return rawCatalogId;
+  }
+  return buildShoppingCatalogId(item.text, {
+    brand: item.brand,
+    format: item.format,
+  });
+}
+
+export function buildSectionOverridesMap(
+  overrides: readonly ShoppingSectionOverride[] = []
+): Map<string, ShoppingSection> {
+  const map = new Map<string, ShoppingSection>();
+  for (const ov of overrides) {
+    const key = String(ov.productKey || ov.id || '').trim();
+    const sec = normalizeShoppingSection(ov.section);
+    if (key && sec) {
+      map.set(key, sec);
+    }
+  }
+  return map;
+}
+
+export function resolveEffectiveShoppingSection(
+  item: {
+    text: string;
+    catalogId?: string;
+    brand?: string;
+    format?: string;
+    section?: ShoppingSection | string;
+  },
+  overridesMap?: ReadonlyMap<string, ShoppingSection>
+): ShoppingSection {
+  if (overridesMap && overridesMap.size > 0) {
+    const key = resolveShoppingProductKey(item);
+    const override = overridesMap.get(key);
+    if (override) return override;
+  }
+  return normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text);
+}
+
 export function inferShoppingSection(text: string): ShoppingSection {
   const norm = normalizeShoppingText(text);
-  if (/(pienso|mascota|perro|gato|arena.*gato|panal|bebe|potito|papilla)/.test(norm)) {
+  if (!norm) return 'Sin clasificar';
+
+  if (/\b(pienso|mascota|mascotas|perro|perros|gato|gatos|arena para gato|panal|panales|bebe|potito|potitos|papilla|papillas|chupete|biberon)\b/.test(norm)) {
     return 'Bebé y mascotas';
   }
-  if (/(papel higienico|papel cocina|servilleta|bolsa basura|detergente|suavizante|lavavajillas|lejia|fregasuelos|limpiacristales|estropajo|bayeta|aluminio|film|ambientador)/.test(norm)) {
+  if (/\b(papel higienico|papel cocina|papel de cocina|servilleta|servilletas|bolsa basura|bolsas de basura|detergente|suavizante|lavavajillas|lejia|fregasuelos|limpiacristales|estropajo|bayeta|papel aluminio|papel de aluminio|film transparente|ambientador|quitagrasas|antical|desatascador|insecticida|limpiador)\b/.test(norm)) {
     return 'Limpieza y hogar';
   }
-  if (/(gel de ducha|champu|acondicionador|desodorante|pasta de dientes|cepillo|colutorio|compresa|tampon|crema|protector solar|toallita|algodon|afeitar|hilo dental)/.test(norm)) {
+  if (/\b(gel de ducha|gel bano|champu|acondicionador|mascarilla capilar|desodorante|pasta de dientes|dentifrico|cepillo dental|cepillo de dientes|colutorio|compresa|compresas|tampon|tampones|protector solar|crema hidratante|crema facial|crema corporal|toallita|toallitas|algodon|afeitar|hilo dental|colonia|perfume|maquillaje|jabon de manos|esponja)\b/.test(norm)) {
     return 'Cuidado personal e higiene';
   }
-  if (/(congelad|ultracongelad|helado|edamame|gyoza|hielo)/.test(norm)) {
+  if (/\b(congelad[oa]s?|ultracongelad[oa]s?|helado|helados|polo|polos|sorbete|tarrina helado|edamame|gyoza|gyozas|hielo|cubitos de hielo|croquetas congeladas)\b/.test(norm)) {
     return 'Congelados';
   }
-  if (/(platano|manzana|naranja|mandarina|limon|pera|fresa|aguacate|tomate|patata|cebolla|ajo|zanahoria|calabacin|berenjena|pimiento|pepino|lechuga|espinaca|champinon|brocoli|fruta|verdura)/.test(norm) &&
-      !/(frito|triturado|zumo|mermelada|galleta)/.test(norm)) {
-    return 'Fruta y verdura';
-  }
-  if (/(salmon|merluza|bacalao|langostino|gamba|pescado|marisco|calamar)/.test(norm) &&
-      !/(lata|conserva|aceite|escabeche)/.test(norm)) {
-    return 'Pescado y marisco';
-  }
-  if (/(pollo|pavo|cerdo|ternera|vacuno|jamon|lomo|beicon|bacon|hamburguesa|huevo|carne|chorizo|fuet)/.test(norm) &&
-      !/(caldo|patata)/.test(norm)) {
-    return 'Carne, charcutería y huevos';
-  }
-  if (/(gazpacho|salmorejo|hummus|guacamole|ensaladilla|tortilla|pizza fresca)/.test(norm)) {
+  if (/\b(gazpacho|salmorejo|hummus|guacamole|ensaladilla|tortilla de patata|tortilla espanola|pizza fresca|lasana|canelones|plato preparado|empanadilla|empanada|sushi|poke|wrap|sandwich|bocadillo|tabule|crema refrigerada)\b/.test(norm)) {
     return 'Platos preparados y refrigerados';
   }
-  if (/(leche|yogur|kefir|queso|mozzarella|mantequilla|nata|requeson|cuajada|bebida de avena|bebida de soja|bebida de almendra)/.test(norm)) {
+  if (/\b(leche|yogur|yogurt|kefir|queso|quesos|mozzarella|burrata|ricotta|mascarpone|parmesano|cheddar|gouda|emmental|brie|camembert|manchego|roquefort|entrepinares|mantequilla|margarina|nata|requeson|cuajada|flan|natillas|arroz con leche|petit suisse|bebida de avena|bebida de soja|bebida de almendra|bebida vegetal)\b/.test(norm)) {
     return 'Lácteos, quesos y bebidas vegetales';
   }
-  if (/(pan|croissant|magdalena|brioche|hojaldre|masa de pizza|picos|tortita)/.test(norm)) {
+  if (/\b(huevo|huevos|clara de huevo|claras de huevo|yema|pollo|pavo|cerdo|ternera|vacuno|cordero|conejo|jamon|lomo|lacon|beicon|bacon|panceta|hamburguesa|salchicha|salchichas|carne|chorizo|fuet|salchichon|mortadela|salami|pate|foie|morcilla|butifarra|espinazo|carcasa|alitas|muslo|pechuga|solomillo|chuleta|costilla|entrecot|secreto|presa iberica)\b/.test(norm) &&
+      !/\b(caldo|patatas? fritas?|chips|sabor jamon|aroma|vegano|vegetal)\b/.test(norm)) {
+    return 'Carne, charcutería y huevos';
+  }
+  if (/\b(salmon|merluza|bacalao|lubina|dorada|emperador|pez espada|rape|lenguado|rodaballo|trucha|boqueron|boquerones|sardina|sardinas|caballa|jurel|bonito|atun fresco|langostino|langostinos|gamba|gambas|gambon|mejillon|mejillones|almeja|almejas|berberecho|pulpo|sepia|calamar|calamares|chipiron|chipirones|pescado|marisco|surimi|gulas|anguriñas|cangrejo)\b/.test(norm) &&
+      !/\b(lata|conserva|en aceite|al natural|escabeche|tomate)\b/.test(norm)) {
+    return 'Pescado y marisco';
+  }
+  if (/\b(pan|barra de pan|pan de molde|pan integral|pan rustico|baguette|chapata|croissant|magdalena|magdalenas|brioche|hojaldre|masa de pizza|picos|regañas|biscote|biscotes|tostada|tostadas|rosquilla|ensaimada|napolitana|sobao|sobaos|bizcocho|palmera|donut|berlina|muffin|tortita|tortitas|tortilla de trigo|fajita|fajitas)\b/.test(norm) &&
+      !/\b(panal|panales|panceta|pantalon)\b/.test(norm)) {
     return 'Panadería y bollería';
   }
-  if (/(agua|refresco|cola|tonica|cerveza|vino|kombucha|horchata|zumo|te frio)/.test(norm)) {
+  if (/\b(platano|platanos|banana|manzana|manzanas|naranja|naranjas|mandarina|mandarinas|clementina|limon|limones|lima|pera|peras|fresa|fresas|freson|frambuesa|arandano|arandanos|mora|moras|cereza|cerezas|uva|uvas|melon|sandia|pina|mango|papaya|kiwi|aguacate|aguacates|melocoton|nectarina|albaricoque|ciruela|higo|granada|caqui|chirimoya|tomate|tomates|patata|patatas|boniato|cebolla|cebollas|cebolleta|puerro|ajo|ajos|zanahoria|zanahorias|calabacin|calabaza|berenjena|pimiento|pimientos|pepino|lechuga|escarola|canonigos|rucula|espinaca|espinacas|acelga|champinon|champinones|seta|setas|brocoli|coliflor|repollo|col|lombarda|judia verde|guisante fresco|esparrago|alcachofa|apio|rabano|remolacha|jengibre|fruta|verdura|ensalada bolsa)\b/.test(norm) &&
+      !/\b(frito|triturado|zumo|nectar|mermelada|confitura|galleta|galletas|yogur|helado|caramelo|chicle|infusion|te|refresco|sabor|aroma|aderezo|salsa|vinagre|aceite|patatas fritas|chips|snack|compota|conserva|almibar|deshidratad[oa]|lata)\b/.test(norm)) {
+    return 'Fruta y verdura';
+  }
+  if (/\b(agua|agua mineral|refresco|cola|coca cola|pepsi|fanta|sprite|tonica|gaseosa|casera|cerveza|clara|vino|cava|champan|vermut|sidra|sangria|tinto de verano|ginebra|ron|vodka|whisky|licor|kombucha|horchata|zumo|nectar|batido|bebida energetica|isotonica|aquarius|nestea|fuze tea|te frio)\b/.test(norm)) {
     return 'Bebidas';
   }
-  if (/(cafe|cacao|infusion|manzanilla|te |avena|muesli|galleta|mermelada|miel|crema de cacahuete|azucar|chocolate)/.test(norm)) {
+  if (/\b(cafe|descafeinado|capsulas cafe|cacao|colacao|nesquik|infusion|infusiones|manzanilla|tila|poleo|te|te verde|te negro|te rojo|chai|matcha|cereales|avena|copos de avena|muesli|granola|galleta|galletas|mermelada|confitura|miel|crema de cacahuete|crema de cacao|nocilla|nutella|azucar|edulcorante|sacarina|stevia|chocolate|bombones|turron|caramelo|caramelos|chicle|gominola|golosina|barrita)\b/.test(norm)) {
     return 'Desayuno, café y dulces';
   }
-  if (/(arroz|espagueti|macarron|tallarin|fideo|garbanzo|lenteja|alubia|atun|sardinilla|mejillon|tomate frito|tomate triturado|maiz|aceituna|aceite|vinagre|sal |harina|caldo|mayonesa|nuez|nueces|almendra)/.test(norm)) {
+  if (/\b(arroz|pasta|espagueti|espaguetis|macarron|macarrones|tallarin|tallarines|fideo|fideos|fusilli|penne|cuscus|quinoa|garbanzo|garbanzos|lenteja|lentejas|alubia|alubias|judias|atun en lata|atun claro|sardinilla|sardinillas|caballa lata|mejillon escabeche|conserva|conservas|tomate frito|tomate triturado|maiz dulce|aceituna|aceitunas|pepinillo|encurtido|aceite|aceite de oliva|aceite girasol|vinagre|sal|pimienta|especia|especias|oregano|comino|pimenton|curry|harina|levadura|pan rallado|caldo|sopa|crema de verduras|mayonesa|ketchup|mostaza|salsa|soja|aderezo|nuez|nueces|almendra|almendras|avellana|pistacho|anacardo|cacahuete|pipas|frutos secos|patatas fritas|chips|nachos|palomitas|snack|maiz frito)\b/.test(norm)) {
     return 'Despensa, arroz, pasta y conservas';
   }
-  return 'Otros de supermercado';
+  return 'Sin clasificar';
 }
 
 export function groupShoppingItemsBySection(
-  items: ShoppingItem[]
+  items: ShoppingItem[],
+  sectionOverrides?: ReadonlyMap<string, ShoppingSection>
 ): Array<{ section: ShoppingSection; items: ShoppingItem[] }> {
   const buckets = new Map<ShoppingSection, ShoppingItem[]>();
   for (const sec of SHOPPING_SECTIONS) {
     buckets.set(sec, []);
   }
   for (const item of items) {
-    const sec = normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text);
+    const sec = resolveEffectiveShoppingSection(item, sectionOverrides);
     buckets.get(sec)!.push(item);
   }
   return SHOPPING_SECTIONS.map((section) => ({
@@ -315,7 +372,12 @@ export function searchShoppingSuggestionsPaginated(
   query: string,
   householdCatalog: ShoppingCatalogItem[],
   mercadonaCatalog: readonly (StaticMercadonaCatalogEntry | PreindexedMercadonaEntry)[] = [],
-  options?: { limit?: number; offset?: number; section?: ShoppingSection | 'todas' }
+  options?: {
+    limit?: number;
+    offset?: number;
+    section?: ShoppingSection | 'todas';
+    sectionOverrides?: ReadonlyMap<string, ShoppingSection>;
+  }
 ): PaginatedShoppingSuggestions {
   const limit = Math.max(1, options?.limit ?? 12);
   const offset = Math.max(0, options?.offset ?? 0);
@@ -324,6 +386,7 @@ export function searchShoppingSuggestionsPaginated(
     options?.section && options.section !== 'todas'
       ? normalizeShoppingSection(options.section)
       : undefined;
+  const overrides = options?.sectionOverrides;
 
   if (!normQuery && !activeSection) {
     const sortedQuick = [...householdCatalog].sort(
@@ -336,6 +399,9 @@ export function searchShoppingSuggestionsPaginated(
       const srcType: ShoppingSourceType =
         normalizeShoppingSourceType(item.sourceType) ??
         (item.catalogId ? 'mercadona' : 'custom');
+      const productKey = resolveShoppingProductKey(item);
+      const defaultSection = normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text);
+      const overrideSec = overrides?.get(productKey);
       return {
         key: `hogar:${item.id}`,
         text: item.text,
@@ -345,7 +411,10 @@ export function searchShoppingSuggestionsPaginated(
         ...(item.catalogId ? { catalogId: item.catalogId } : {}),
         ...(item.brand ? { brand: item.brand } : {}),
         ...(item.format ? { format: item.format } : {}),
-        section: normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text),
+        section: overrideSec ?? defaultSection,
+        defaultSection,
+        productKey,
+        hasSectionOverride: Boolean(overrideSec),
         favorite: Boolean(item.favorite),
         usageCount: item.usageCount,
         lastUsedAt: item.lastUsedAt,
@@ -365,7 +434,10 @@ export function searchShoppingSuggestionsPaginated(
 
   // 1) Productos del hogar (favoritos y recientes)
   for (const item of householdCatalog) {
-    const itemSection = normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text);
+    const productKey = resolveShoppingProductKey(item);
+    const defaultSection = normalizeShoppingSection(item.section) ?? inferShoppingSection(item.text);
+    const overrideSec = overrides?.get(productKey);
+    const itemSection = overrideSec ?? defaultSection;
     if (activeSection && itemSection !== activeSection) continue;
 
     const normName = normalizeShoppingText(item.text);
@@ -414,6 +486,9 @@ export function searchShoppingSuggestionsPaginated(
         ...(item.brand ? { brand: item.brand } : {}),
         ...(item.format ? { format: item.format } : {}),
         section: itemSection,
+        defaultSection,
+        productKey,
+        hasSectionOverride: Boolean(overrideSec),
         favorite: Boolean(item.favorite),
         usageCount: item.usageCount,
         lastUsedAt: item.lastUsedAt,
@@ -426,9 +501,12 @@ export function searchShoppingSuggestionsPaginated(
   // 2) Catálogo externo de Mercadona (ODbL)
   for (let i = 0; i < mercadonaCatalog.length; i++) {
     const raw = mercadonaCatalog[i];
+    if (raw.excludedFromSuggestions) continue;
     if (seenCatalogIds.has(raw.id)) continue;
 
-    const entrySection = normalizeShoppingSection(raw.section) ?? inferShoppingSection(raw.name);
+    const defaultSection = normalizeShoppingSection(raw.section) ?? inferShoppingSection(raw.name);
+    const overrideSec = overrides?.get(raw.id);
+    const entrySection = overrideSec ?? defaultSection;
     if (activeSection && entrySection !== activeSection) continue;
 
     const entry = isPreindexed(raw) ? raw : preindexMercadonaCatalog([raw])[0];
@@ -464,6 +542,9 @@ export function searchShoppingSuggestionsPaginated(
         ...(entry.variant ? { variant: entry.variant } : {}),
         ...(entry.format ? { format: entry.format } : {}),
         section: entrySection,
+        defaultSection,
+        productKey: entry.id,
+        hasSectionOverride: Boolean(overrideSec),
       },
       tier,
       boost:
@@ -475,7 +556,9 @@ export function searchShoppingSuggestionsPaginated(
 
   // 3) Básicos genéricos (sin etiqueta Mercadona)
   for (const gen of GENERIC_STAPLES_CATALOG) {
-    if (activeSection && gen.section !== activeSection) continue;
+    const overrideSec = overrides?.get(gen.id);
+    const genSection = overrideSec ?? gen.section;
+    if (activeSection && genSection !== activeSection) continue;
 
     const normName = normalizeShoppingText(gen.name);
     let tier = 1;
@@ -505,7 +588,11 @@ export function searchShoppingSuggestionsPaginated(
         defaultUnit: gen.defaultUnit,
         source: 'generico',
         sourceType: 'generic',
-        section: gen.section,
+        catalogId: gen.id,
+        section: genSection,
+        defaultSection: gen.section,
+        productKey: gen.id,
+        hasSectionOverride: Boolean(overrideSec),
       },
       tier,
       boost: 4,
@@ -532,12 +619,14 @@ export function searchShoppingSuggestions(
   householdCatalog: ShoppingCatalogItem[],
   mercadonaCatalog: readonly (StaticMercadonaCatalogEntry | PreindexedMercadonaEntry)[] = [],
   limit = 12,
-  section?: ShoppingSection | 'todas'
+  section?: ShoppingSection | 'todas',
+  sectionOverrides?: ReadonlyMap<string, ShoppingSection>
 ): ShoppingSuggestion[] {
   return searchShoppingSuggestionsPaginated(query, householdCatalog, mercadonaCatalog, {
     limit,
     offset: 0,
     section,
+    sectionOverrides,
   }).items;
 }
 

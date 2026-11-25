@@ -19,7 +19,7 @@ export interface LoadedMercadonaCatalog {
 }
 
 const CATALOG_ASSET_URL = '/data/mercadona-catalog.v1.json';
-const CACHE_NAME = 'nido-mercadona-catalog-v1';
+const CACHE_NAME = 'nido-mercadona-catalog-v2';
 
 let memoryCache: LoadedMercadonaCatalog | null = null;
 let inFlightLoad: Promise<LoadedMercadonaCatalog> | null = null;
@@ -52,6 +52,7 @@ function parseCatalogPayload(raw: unknown): LoadedMercadonaCatalog {
       sourceRef: typeof rec.sourceRef === 'string' ? rec.sourceRef : id,
       source: typeof rec.source === 'string' ? rec.source : 'openfoodfacts_odbl',
       addedAt: typeof rec.addedAt === 'string' ? rec.addedAt : '',
+      ...(rec.excludedFromSuggestions === true ? { excludedFromSuggestions: true } : {}),
     });
   }
 
