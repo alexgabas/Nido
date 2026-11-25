@@ -61,7 +61,11 @@ import {
   isValidMonthKey,
   sanitizeSkippedMonths,
 } from '../domain/recurrence';
-import { sanitizeSavingsPlanAllocations } from '../domain/savingsPlan';
+import {
+  sanitizeHabitualSavingsPlan,
+  sanitizeSavingsPlanAllocations,
+} from '../domain/savingsPlan';
+import { sanitizeHouseholdIncomeConfig } from '../domain/incomeProfile';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -102,6 +106,7 @@ import {
   type FurnitureStatus,
   type GoalMovement,
   type Household,
+  type HouseholdIncomeConfig,
   type HouseholdMember,
   type HouseholdSettings,
   type InitialCost,
@@ -113,6 +118,7 @@ import {
   type PendingShoppingCheckout,
   type RecurringExpense,
   type SavingsGoal,
+  type SavingsPlanAdjustmentKind,
   type SavingsPlanAllocation,
   type ShoppingCatalogItem,
   type ShoppingItem,
@@ -219,6 +225,21 @@ function mapHousehold(id: string, d: DocumentData): Household {
       : d.commonAccountManualBalance !== undefined
         ? sanitizeCommonAccountManualBalance(d.commonAccountManualBalance)
         : undefined;
+  const incomeConfig =
+    d.incomeConfig === null
+      ? null
+      : d.incomeConfig !== undefined
+        ? sanitizeHouseholdIncomeConfig(d.incomeConfig, {
+            incomeA: Number(d.settings?.incomeA ?? 0),
+            incomeB: Number(d.settings?.incomeB ?? 0),
+          })
+        : undefined;
+  const habitualSavingsPlan =
+    d.habitualSavingsPlan === null
+      ? null
+      : d.habitualSavingsPlan !== undefined
+        ? sanitizeHabitualSavingsPlan(d.habitualSavingsPlan)
+        : undefined;
   return {
     id,
     name: String(d.name ?? 'Mi hogar'),
@@ -232,6 +253,8 @@ function mapHousehold(id: string, d: DocumentData): Household {
       incomeB: Number(d.settings?.incomeB ?? 0),
       currency: 'EUR',
     },
+    ...(incomeConfig !== undefined ? { incomeConfig } : {}),
+    ...(habitualSavingsPlan !== undefined ? { habitualSavingsPlan } : {}),
     ...(csvKeywords ? { csvKeywords } : {}),
     ...(categoryColors ? { categoryColors } : {}),
     ...(commonAccountPlannedCategories !== undefined ? { commonAccountPlannedCategories } : {}),
@@ -389,10 +412,20 @@ function mapGoalMovement(id: string, d: DocumentData): GoalMovement {
 function mapSavingsPlan(id: string, d: DocumentData): MonthlySavingsPlan {
   const monthKey = isValidMonthKey(String(d.monthKey ?? id)) ? String(d.monthKey ?? id) : id;
   const rawAllocs = Array.isArray(d.allocations) ? (d.allocations as SavingsPlanAllocation[]) : [];
+  const adjustmentKind: SavingsPlanAdjustmentKind | undefined =
+    d.adjustmentKind === 'ajuste' || d.adjustmentKind === 'extra'
+      ? d.adjustmentKind
+      : undefined;
+  const extraAmount =
+    typeof d.extraAmount === 'number' && Number.isFinite(d.extraAmount) && d.extraAmount > 0
+      ? roundCents(d.extraAmount)
+      : undefined;
   return {
     monthKey,
     targetAmount: roundCents(Math.max(0, Number(d.targetAmount ?? 0))),
     allocations: sanitizeSavingsPlanAllocations(rawAllocs),
+    ...(adjustmentKind ? { adjustmentKind } : {}),
+    ...(extraAmount !== undefined ? { extraAmount } : {}),
     updatedBy: String(d.updatedBy ?? ''),
     updatedAt: tsToIso(d.updatedAt),
   };
@@ -1764,24 +1797,87 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     householdId: string,
     settings: HouseholdSettings,
     actor: UserProfileInput,
-    summary: string
+    summary: string,
+    options?: { incomeConfig?: HouseholdIncomeConfig | null }
   ): Promise<void> {
     const path = `households/${householdId}`;
     const { presetA, presetB } = normalizeSplitPair(settings.presetA);
+    const cleanIncomeA = roundCents(Math.max(0, Number(settings.incomeA) || 0));
+    const cleanIncomeB = roundCents(Math.max(0, Number(settings.incomeB) || 0));
+    const updatePayload: Record<string, unknown> = {
+      settings: {
+        splitMode: settings.splitMode,
+        presetA,
+        presetB,
+        incomeA: cleanIncomeA,
+        incomeB: cleanIncomeB,
+        currency: 'EUR',
+      },
+      updatedAt: serverTimestamp(),
+    };
+    if (options && Object.prototype.hasOwnProperty.call(options, 'incomeConfig')) {
+      if (options.incomeConfig === null) {
+        updatePayload.incomeConfig = null;
+      } else if (options.incomeConfig) {
+        const cleanCfg = sanitizeHouseholdIncomeConfig(options.incomeConfig, {
+          incomeA: cleanIncomeA,
+          incomeB: cleanIncomeB,
+        });
+        updatePayload.incomeConfig = cleanCfg
+          ? {
+              ...cleanCfg,
+              updatedBy: actor.uid,
+              updatedAt: new Date().toISOString(),
+            }
+          : null;
+      }
+    }
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, 'households', householdId), updatePayload);
+      this.addActivityToBatch(batch, householdId, actor, 'update', 'reparto', householdId, summary);
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+
+  async saveHabitualSavingsPlan(
+    householdId: string,
+    plan: { monthlyAmount: number; priorityGoalIds: string[] } | null,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const path = `households/${householdId}`;
+    const now = new Date().toISOString();
+    let payloadValue: ReturnType<typeof sanitizeHabitualSavingsPlan> = null;
+    if (plan !== null) {
+      payloadValue = sanitizeHabitualSavingsPlan({
+        monthlyAmount: plan.monthlyAmount,
+        priorityGoalIds: plan.priorityGoalIds,
+        updatedBy: actor.uid,
+        updatedAt: now,
+      });
+      if (!payloadValue) {
+        throw new Error('Datos inválidos para el plan de ahorro habitual.');
+      }
+    }
     try {
       const batch = writeBatch(db);
       batch.update(doc(db, 'households', householdId), {
-        settings: {
-          splitMode: settings.splitMode,
-          presetA,
-          presetB,
-          incomeA: Math.max(0, Number(settings.incomeA) || 0),
-          incomeB: Math.max(0, Number(settings.incomeB) || 0),
-          currency: 'EUR',
-        },
+        habitualSavingsPlan: payloadValue,
         updatedAt: serverTimestamp(),
       });
-      this.addActivityToBatch(batch, householdId, actor, 'update', 'reparto', householdId, summary);
+      this.addActivityToBatch(
+        batch,
+        householdId,
+        actor,
+        payloadValue ? 'update' : 'delete',
+        'plan_ahorro',
+        householdId,
+        payloadValue
+          ? `Actualizó el plan de ahorro habitual (${payloadValue.monthlyAmount} €/mes)`
+          : 'Eliminó el plan de ahorro habitual'
+      );
       await batch.commit();
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, path);
@@ -3364,6 +3460,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
       monthKey: string;
       targetAmount: number;
       allocations: SavingsPlanAllocation[];
+      adjustmentKind?: SavingsPlanAdjustmentKind;
+      extraAmount?: number;
     },
     actor: UserProfileInput
   ): Promise<void> {
@@ -3373,6 +3471,14 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     const path = `households/${householdId}/savingsPlans/${plan.monthKey}`;
     const cleanTarget = roundCents(Math.max(0, Number(plan.targetAmount) || 0));
     const cleanAllocations = sanitizeSavingsPlanAllocations(plan.allocations);
+    const cleanKind =
+      plan.adjustmentKind === 'ajuste' || plan.adjustmentKind === 'extra'
+        ? plan.adjustmentKind
+        : undefined;
+    const cleanExtra =
+      typeof plan.extraAmount === 'number' && Number.isFinite(plan.extraAmount) && plan.extraAmount > 0
+        ? roundCents(plan.extraAmount)
+        : undefined;
     const ref = doc(db, 'households', householdId, 'savingsPlans', plan.monthKey);
     try {
       const batch = writeBatch(db);
@@ -3380,6 +3486,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         monthKey: plan.monthKey,
         targetAmount: cleanTarget,
         allocations: cleanAllocations,
+        ...(cleanKind ? { adjustmentKind: cleanKind } : {}),
+        ...(cleanExtra !== undefined ? { extraAmount: cleanExtra } : {}),
         updatedBy: actor.uid,
         updatedAt: serverTimestamp(),
       });
@@ -4134,6 +4242,10 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
           incomeB: 0,
           currency: 'EUR',
         },
+        ...(hData?.incomeConfig !== undefined ? { incomeConfig: hData.incomeConfig } : {}),
+        ...(hData?.habitualSavingsPlan !== undefined
+          ? { habitualSavingsPlan: hData.habitualSavingsPlan }
+          : {}),
         ...(typeof hData?.mudanzaCompleted === 'boolean'
           ? {
               mudanzaCompleted: hData.mudanzaCompleted,
@@ -4306,6 +4418,12 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
 
     const { presetA, presetB } = normalizeSplitPair(backup.settings.presetA);
+    const cleanImportedIncomeCfg =
+      backup.incomeConfig === null
+        ? null
+        : backup.incomeConfig
+          ? sanitizeHouseholdIncomeConfig(backup.incomeConfig, backup.settings)
+          : undefined;
     ops.push({
       path: `households/${householdId}`,
       apply: (b) =>
@@ -4317,6 +4435,18 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
             presetB,
             currency: 'EUR',
           },
+          ...(cleanImportedIncomeCfg !== undefined
+            ? {
+                incomeConfig:
+                  cleanImportedIncomeCfg === null
+                    ? null
+                    : {
+                        ...cleanImportedIncomeCfg,
+                        updatedBy: actor.uid,
+                        updatedAt: new Date().toISOString(),
+                      },
+              }
+            : {}),
           updatedAt: serverTimestamp(),
         }),
     });
@@ -4548,6 +4678,14 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
         const cleanTarget = roundCents(Math.max(0, Number(sp.targetAmount) || 0));
         const cleanAllocations = sanitizeSavingsPlanAllocations(sp.allocations);
         const ref = doc(db, 'households', householdId, 'savingsPlans', sp.monthKey);
+        const cleanKind =
+          sp.adjustmentKind === 'ajuste' || sp.adjustmentKind === 'extra'
+            ? sp.adjustmentKind
+            : undefined;
+        const cleanExtra =
+          typeof sp.extraAmount === 'number' && Number.isFinite(sp.extraAmount) && sp.extraAmount > 0
+            ? roundCents(sp.extraAmount)
+            : undefined;
         ops.push({
           path: `households/${householdId}/savingsPlans/${sp.monthKey}`,
           apply: (b) =>
@@ -4555,6 +4693,8 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
               monthKey: sp.monthKey,
               targetAmount: cleanTarget,
               allocations: cleanAllocations,
+              ...(cleanKind ? { adjustmentKind: cleanKind } : {}),
+              ...(cleanExtra !== undefined ? { extraAmount: cleanExtra } : {}),
               updatedBy: actor.uid,
               updatedAt: serverTimestamp(),
             }),
@@ -4745,6 +4885,18 @@ export class FirestoreHouseholdRepository implements HouseholdRepository {
     }
     if (typeof backup.mudanzaCompleted === 'boolean') {
       await this.setMudanzaCompleted(householdId, backup.mudanzaCompleted, actor);
+    }
+    if (backup.habitualSavingsPlan !== undefined) {
+      await this.saveHabitualSavingsPlan(
+        householdId,
+        backup.habitualSavingsPlan
+          ? {
+              monthlyAmount: backup.habitualSavingsPlan.monthlyAmount,
+              priorityGoalIds: backup.habitualSavingsPlan.priorityGoalIds,
+            }
+          : null,
+        actor
+      );
     }
   }
 }

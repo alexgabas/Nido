@@ -4,43 +4,50 @@
 
 ## 1. Resumen ejecutivo
 
-- **Aplicación**: **Nido** (finanzas compartidas del hogar, etapa de mudanza e histórico, presupuestos, planificación mensual, Cuenta común, cierre de mes guiado, balance anual del hogar, metas y plan de ahorro mensual, y lista de la compra compartida). Idioma: español de España (`es-ES`). Moneda: `EUR`.
+- **Aplicación**: **Nido** (finanzas compartidas del hogar, etapa de mudanza e histórico, presupuestos, planificación mensual, Cuenta común, cierre de mes guiado, balance anual del hogar, metas, plan habitual y mensual de ahorro, reparto por ingresos rápidos/detallados y lista de la compra compartida). Idioma: español de España (`es-ES`). Moneda: `EUR`.
 - **Arquitectura**: SPA React + TypeScript + Vite + Tailwind + PWA offline-first (`vite-plugin-pwa`) + Firebase Auth / Firestore en plan gratuito Spark (coste cero: sin Cloud Functions, Cloud Billing, notificaciones push de pago, SDKs de IA ni APIs bancarias), con paridad funcional en modo demostración local (`DemoHouseholdRepository`).
 - **Proyecto y base de datos objetivo** (verificado en `firebase-applet-config.json`): `projectId = "irontrack-509315"`, `firestoreDatabaseId = "ai-studio-9bf93440-758c-4b3e-8cff-72543716da70"`.
-- **Estado actual**: Iteración de **revisión global de navegación y fin de etapa de Mudanza** **implementada, con reglas desplegadas en Firestore y verificada en local** (`tsc --noEmit`, **66/66 pruebas unitarias**, ESLint de `firestore.rules` 0 errores, despliegue de reglas `DeployRules` OK, build de producción + PWA, **E2E navegación + Mudanza + capturas ANTES/DESPUÉS** y las **6 suites E2E de regresión** en verde). Quedan pendientes la ejecución de los **27 tests del emulador** (`npm run test:rules` en GitHub Actions o máquina con Java 21+) y la verificación manual en cuenta real.
+- **Estado actual**: Iteración de **Ahorros, ingresos netos detallados, aportaciones separadas y plan habitual/excepciones** (Bloques 1–6) **implementada, con reglas desplegadas en Firestore y verificada en local** (`tsc --noEmit`, **70/70 pruebas unitarias**, ESLint de `firestore.rules` 0 errores, despliegue de reglas `DeployRules` OK, build de producción + PWA, nueva E2E integral `verify_savings_income_flow.mjs` y regresiones E2E en verde). Quedan pendientes la ejecución de los **28 tests del emulador** (`npm run test:rules` en GitHub Actions o máquina con Java 21+) y la verificación manual en cuenta real.
 
 ---
 
-## 2. Completado en la última iteración (Reorganización de navegación y fin de etapa de Mudanza)
+## 2. Completado en la última iteración (Bloques 1–6: Ahorros + Ingresos detallados + Aportaciones separadas)
 
-### 1. Reorganización de navegación sin duplicidades (`src/components/AppShell.tsx`, `src/views/InicioView.tsx`, `src/views/CompraView.tsx`, `src/components/ShoppingListSection.tsx`, `src/context/NidoContext.tsx`, `src/App.tsx`)
-- **Modo Sencillo (móvil `390×844`)**:
-  - Se conserva la barra inferior de 3 ranuras (`Inicio`, `+`, `Ahorros`).
-  - **Compra** y **Mensual** pasan a una fila compacta de 2 columnas al principio de `Inicio` (visibles sobre el pliegue a `y = 148 px`, frente a `1103 px` y `1014 px` antes), eliminando los accesos duplicados del final de la pantalla.
-- **Modo Avanzado (móvil `390×844`)**:
-  - Navegación inferior simplificada a 4 pestañas principales: **Inicio**, **Mensual**, **Compra** (con insignia de pendientes) y **Ahorros**.
-  - **+ Gasto** permanece accesible en la cabecera superior.
-  - **Ajustes del hogar**, **Ayuda e instalación** y **Hogar → Mudanza / Histórico de mudanza** pasan al menú avatar sin crear ninguna pestaña principal «Hogar».
-  - Eliminada la tarjeta duplicada de «Lista de la compra» en `Inicio` y el enlace duplicado en el menú avatar.
-- **Escritorio (`1280×800`)**:
-  - Barra superior unificada en ambos modos con las 4 áreas principales (`Inicio`, `Mensual`, `Compra`, `Ahorros`), `+ Añadir gasto` y menú avatar sin duplicar `Ajustes`, `Ayuda` ni `Mudanza`.
-- **Lista de la compra como pantalla dedicada (`CompraView` + `ShoppingListSection variant="page"`)**:
-  - Reutiliza íntegramente el componente existente sin duplicar lógica; mantiene el botón `← Inicio` en Sencillo móvil y evita abrir un modal superpuesto.
-- **Compatibilidad, botón Atrás y cambio de modo (`src/domain/mudanzaStage.ts`, `src/context/NidoContext.tsx`)**:
-  - Conservados todos los atajos PWA (`/?action=add-expense`, `/?tab=inicio&open=shopping`, `/?tab=mensual`) y enlaces anteriores (`/?tab=mudanza`, `/?tab=compra`, `/?tab=ajustes`, `/?tab=ahorros`, `/?tab=ayuda`).
-  - Historial del navegador sincronizado con `history.pushState` / `popstate` para que el botón **Atrás** recorra las pantallas de forma natural.
-  - Cambiar entre Sencillo y Avanzado conserva la sección equivalente (`Compra`, `Mensual`, `Ahorros`, `Mudanza`, `Ayuda`) y redirige `Ajustes → Inicio` al pasar a Sencillo sin cambiar nunca de modo silenciosamente.
-  - **Balance anual** y **cierre guiado** permanecen dentro de `Mensual`; **Plan de ahorro mensual** permanece dentro de `Ahorros`.
+### 1. Corrección de «Planificar el ahorro del mes» y «Proponer reparto» (`src/views/AhorrosView.tsx`, `src/components/ahorros/MonthlySavingsPlanSection.tsx`, `src/context/NidoContext.tsx`)
+- **Causas raíz demostradas**:
+  1. En hogares reales (`DEFAULT_GOALS`), todas las metas nacen con `targetDate: ''` (sin fecha objetivo). La función anterior `proposeMonthlySavingsDistribution` devolvía `0 €` a toda meta sin fecha, dejando todos los campos a `0` sin explicación. Además, si faltaba importe o el reparto ya coincidía, no mostraba ningún mensaje de estado.
+  2. En Avanzado, `#savings-plan-section` estaba por debajo del pliegue (debajo de Donut, reparto, colchón y sugerencias), y el botón superior lanzaba un `scrollIntoView` en un único `requestAnimationFrame` antes de asentarse el layout.
+  3. El `useEffect` de hidratación del borrador omitía `goals`, dejando `draftItems = []` si el editor se abría antes de llegar las metas de Firestore.
+  4. `handleSaveSavingsPlan` silenciaba errores de escritura en vez de propagarlos, cerrando el editor en silencio si fallaba Firestore.
+- **Solución aplicada**:
+  - `MonthlyContributionsCard` y `MonthlySavingsPlanSection` movidos a la parte superior de `Ahorros` (Sencillo y Avanzado), con apertura fiable tanto con plan guardado como sin plan previo.
+  - Sincronización segura de hidratación de `goals` (`goalsLoaded`), `savingsPlansLoading` y `savingsPlansError`.
+  - «Proponer reparto» siempre activo con banner de feedback explícito (resultado aplicado, aviso si falta importe > 0 €, aviso si no hay metas con objetivo, o aviso cuando ya coincide con el borrador actual).
+  - Errores de guardado/carga propagados y mostrados en línea sin cerrar nunca el editor ni perder el borrador.
 
-### 2. Fin de la etapa de Mudanza compartido y reversible (`src/domain/mudanzaStage.ts`, `src/views/MudanzaView.tsx`, `src/views/AjustesView.tsx`, `src/repositories/*`, `firestore.rules`, `src/domain/backup.ts`)
-- **Estado compartido y retrocompatible**: campos opcionales `mudanzaCompleted`, `mudanzaCompletedAt` y `mudanzaCompletedBy` en el documento del hogar. Los hogares existentes sin el campo mantienen Mudanza activa por defecto (`false`).
-- **Acciones «Dar por terminada la mudanza» y «Reabrir mudanza»** disponibles en `MudanzaView` (Sencillo y Avanzado) y en `Ajustes → Hogar compartido` (Avanzado).
-- **Aviso no bloqueante ni destructivo**: al darla por terminada muestra el recuento exacto de muebles pendientes y tareas sin completar sin bloquear la acción ni marcar ningún elemento como hecho o comprado.
-- **Visibilidad al terminar**: oculta el acceso destacado en `Inicio` (Sencillo y Avanzado) y deja el acceso en **menú avatar → Hogar → Histórico de mudanza** y en **Ajustes → Hogar**, conservando intactos la búsqueda global, los gastos iniciales, el mobiliario, el checklist, los informes CSV/PDF y los backups JSON `NidoBackupV1` (con compatibilidad hacia atrás con copias antiguas sin estos campos).
-- **Firestore Rules (`firestore.rules`, `firebase-blueprint.json`, `firestore.rules.test.ts`)**:
-  - Añadida **Acción 9** en `/households/{hid}` (`allow update` restringida a miembros, `affectedKeys().hasOnly(['mudanzaCompleted', 'mudanzaCompletedAt', 'mudanzaCompletedBy', 'updatedAt'])`, anti-suplantación `mudanzaCompletedBy == request.auth.uid`, timestamps validados con `request.time`).
-  - Validada con ESLint (0 errores) y desplegada mediante `DeployRules`. Añadido **Test 27** en `firestore.rules.test.ts`.
-- **Optimización de suscripciones**: `checklist` y `furniture` dejan de suscribirse en `Inicio` cuando `mudanzaCompleted === true`.
+### 2. Ingresos netos en modo Rápido y Detallado (`src/domain/incomeProfile.ts`, `src/components/ajustes/DetailedIncomeEditor.tsx`, `src/views/AjustesView.tsx`)
+- Por persona (`memberA` y `memberB`), selector **Rápida** (neto mensual) o **Detallada** (paga ordinaria neta × nº de pagas/año, pagas extra individuales con mes orientativo opcional 1..12, otros ingresos con frecuencia y tipo `recurrente` vs `puntual_o_incierto` excluido por defecto salvo inclusión explícita).
+- Plantillas rápidas `12 pagas (extras prorrateadas)` y `14 pagas (12 ordinarias + 2 extras)` y aviso automático anti doble conteo si se ponen `> 12` ordinarias junto con pagas extra.
+- Desglose claro: **Neto anual estimado** + **Equivalente mensual (promedio / 12)**, sin cálculo fiscal, sin recalcular repartos históricos y sin registrar importes de salario en logs de actividad ni exportaciones generales.
+
+### 3. Dos cifras mensuales separadas: «Cuánto pone cada uno» (`src/domain/savingsPlan.ts`, `src/components/ahorros/MonthlyContributionsCard.tsx`, `src/components/mensual/CommonAccountRadarCard.tsx`)
+- **A) Aportación prevista para gastos (Cuenta común)**: reutiliza `computeCommonAccountRadar` (`totalMonthlyNeed`, `monthlyShareA`, `monthlyShareB`), etiquetada claramente como previsión de gastos (no como «lo que falta ingresar»; el saldo manual sigue aparte en Mensual).
+- **B) Aportación prevista para ahorro**: usa el plan efectivo del mes (guardado o propuesta habitual) con redondeo al céntimo exacto por persona, separando previsto vs aportado real por persona (`goalMovements.by`), retiradas aparte y sobrante sin asignar. Nunca se fusionan como deuda única ni transferencia obligatoria.
+
+### 4. Plan habitual de ahorro con llenado por prioridad (`src/domain/savingsPlan.ts`, `src/components/ahorros/MonthlySavingsPlanSection.tsx`)
+- Acción «Editar plan habitual» con importe mensual manual (capacidad estimada solo como referencia secundaria) y orden de prioridad (por defecto `Colchón de emergencia` primero, `Ahorro común` segundo, y el resto; respeta el orden guardado).
+- Regla de llenado por prioridad: llena la 1.ª meta hasta `remaining` (`targetAmount - saved`) y pasa el sobrante a la siguiente, sin topar a `monthlyNeeded` (se conserva como referencia informativa). Las metas sin `targetDate` SÍ reciben dinero si tienen `targetAmount > 0`; las de `targetAmount <= 0` quedan manuales con explicación; archivadas y completadas se saltan.
+- Aplicado virtualmente en meses sin plan guardado con distinción visual clara (**«Propuesta del plan habitual»** vs **«Plan guardado para este mes»**), sin crear movimientos ni reescribir meses pasados.
+
+### 5. Excepciones mensuales y ahorro extra (`src/domain/savingsPlan.ts`, `src/components/ahorros/MonthlySavingsPlanSection.tsx`)
+- **«Ajustar este mes»**: guarda un plan específico para el mes seleccionado sin alterar el plan habitual ni otros meses.
+- **«Añadir ahorro extra»**: suma un importe extra explícito sobre el plan base, asignando **solo el extra** a las metas elegidas sin duplicar la base habitual, con previsualización **Antes → Después** (total, por persona y por meta).
+- **«Volver al plan habitual»**: requiere confirmación explícita y nunca borra aportaciones reales registradas.
+
+### 6. Datos, Firestore Rules y copias de seguridad (`src/types/nido.ts`, `src/repositories/*`, `src/domain/backup.ts`, `firestore.rules`, `firebase-blueprint.json`, `firestore.rules.test.ts`)
+- Persistencia opcional y retrocompatible de `incomeConfig` y `habitualSavingsPlan` en `/households/{hid}` y de `adjustmentKind`/`extraAmount` en `/households/{hid}/savingsPlans/{monthKey}` con paridad completa Demo/Firestore.
+- `firestore.rules` ampliadas (Acción 1 endurecida con anti-suplantación en `incomeConfig.updatedBy` cuando está en `affectedKeys()`, nueva **Acción 10** para `habitualSavingsPlan`, y validación de `adjustmentKind`/`extraAmount` en `savingsPlans`), validadas con ESLint (0 errores) y **desplegadas** con `DeployRules`.
+- **Test 28** añadido a `firestore.rules.test.ts`. Round-trip y compatibilidad hacia atrás con backups JSON antiguos cubiertos en pruebas unitarias.
 
 ---
 
@@ -49,32 +56,30 @@
 | Comprobación | Estado | Evidencia real |
 |---|---|---|
 | Comprobación de tipos (`npx tsc --noEmit`) | **Verificado mediante prueba ejecutada** | 0 errores |
-| Pruebas unitarias (`npm run test:unit`) | **Verificado mediante prueba ejecutada** | **66/66 en verde** (`src/domain/finance.test.ts`, incluidas pruebas **65–66** de navegación, equivalencia de modo, atajos PWA, estado compartido reversible de Mudanza, aviso sin mutar pendientes, búsqueda global e import/export de backups antiguos y nuevos) |
+| Pruebas unitarias (`npm run test:unit`) | **Verificado mediante prueba ejecutada** | **70/70 en verde** (`src/domain/finance.test.ts`, incluidas pruebas **53–54** actualizadas al llenado por prioridad y **60–63** nuevas de ingresos detallados, aceptación exacta 1.200 € + 300 € al 60/40, plan habitual, ahorro extra sin doble conteo, Demo y backups antiguos/nuevos) |
 | Lint de Security Rules (`npx eslint firestore.rules`) | **Verificado mediante prueba ejecutada** | 0 errores, 0 advertencias |
 | Despliegue de Security Rules (`DeployRules`) | **Verificado mediante acción ejecutada** | Desplegadas en `irontrack-509315` / `ai-studio-9bf93440-758c-4b3e-8cff-72543716da70` |
 | Build de producción + PWA (`npm run build`) | **Verificado mediante prueba ejecutada** | Build limpio, `dist/sw.js` generado |
-| E2E navegación, enlaces, Atrás, modos y fin de Mudanza (`node scripts/verify_navigation_and_mudanza.mjs`) | **Verificado mediante prueba ejecutada** | Pasado en móvil `390×844` (Sencillo y Avanzado) y escritorio `1280×800`, con inspección visual de capturas **ANTES y DESPUÉS** |
-| E2E general móvil/escritorio (`node scripts/verify_nido_e2e.mjs`) | **Verificado mediante prueba ejecutada** | `E2E_PASS` |
-| E2E planificación mensual y Cuenta común (`node scripts/verify_monthly_planning.mjs`) | **Verificado mediante prueba ejecutada** | `MONTHLY_PLANNING_E2E_PASS` |
-| E2E cierre de mes guiado (`node scripts/verify_guided_close.mjs`) | **Verificado mediante prueba ejecutada** | `verify_guided_close: TODOS LOS RECORRIDOS PASARON` |
-| E2E balance anual del hogar (`node scripts/verify_annual_balance.mjs`) | **Verificado mediante prueba ejecutada** | `verify_annual_balance: TODOS LOS RECORRIDOS PASARON` |
-| E2E plan de ahorro mensual (`node scripts/verify_savings_plan.mjs`) | **Verificado mediante prueba ejecutada** | `verify_savings_plan.mjs completado con éxito` |
-| E2E fiabilidad PWA/offline/chunks (`node scripts/verify_pwa_reliability.mjs`) | **Verificado mediante prueba ejecutada** | `PWA_RELIABILITY_PASS` (8/8) |
-| Tests de Security Rules en emulador (`npm run test:rules`) | **Implementado, pendiente de verificación en emulador** | **27 casos** en `firestore.rules.test.ts` (incluido Test 27 para Acción 9 de `mudanzaCompleted`). No ejecutado aquí porque el contenedor carece de Java; ejecutable vía `.github/workflows/firestore-rules.yml` o en local con Java 21+ |
-| Pruebas manuales en cuenta real y 2 dispositivos | **Pendiente de verificar por el usuario** | Comprobar en cuenta real la nueva barra en móvil/escritorio, «Dar por terminada la mudanza» / «Reabrir mudanza» sincronizado entre los dos miembros y atajos de la PWA instalada |
+| E2E integral Bloques 1–6 (`node scripts/verify_savings_income_flow.mjs`) | **Verificado mediante prueba ejecutada** | Pasado en móvil `390×844` (Sencillo) y escritorio `1280×900` (Avanzado), con y sin plan previo, cero errores de página |
+| E2E regresión plan de ahorro (`node scripts/verify_savings_plan.mjs`) | **Verificado mediante prueba ejecutada** | Pasado (Avanzado + Sencillo, propuesta, aportación previa, retirada aparte, exceso y archivado) |
+| E2E regresión planificación mensual y Cuenta común (`node scripts/verify_monthly_planning.mjs`) | **Verificado mediante prueba ejecutada** | `MONTHLY_PLANNING_E2E_PASS` |
+| E2E regresión navegación y Mudanza (`node scripts/verify_navigation_and_mudanza.mjs`) | **Verificado mediante prueba ejecutada** | Pasado (móvil y escritorio, Sencillo y Avanzado) |
+| Tests de Security Rules en emulador (`npm run test:rules`) | **Implementado, pendiente de verificación en emulador** | **28 casos** en `firestore.rules.test.ts` (incluido Test 28 para `incomeConfig`, `habitualSavingsPlan` y `savingsPlans` con `adjustmentKind`/`extraAmount`). No ejecutado aquí porque el contenedor carece de Java; ejecutable vía `.github/workflows/firestore-rules.yml` o en local con Java 21+ |
+| Pruebas manuales en cuenta real y 2 dispositivos | **Pendiente de verificar por el usuario** | Comprobar en cuenta real abrir «Planificar el ahorro del mes», pulsar «Proponer reparto», configurar ingresos detallados en Ajustes, guardar plan habitual y añadir ahorro extra entre ambos dispositivos |
 
 ---
 
 ## 4. Riesgos conocidos y limitaciones
 
-- **Emulador de reglas pendiente**: ESLint y el despliegue están confirmados, pero los **27 casos** de `firestore.rules.test.ts` siguen pendientes de ejecutarse en un entorno con Java 21+ (local o GitHub Actions `.github/workflows/firestore-rules.yml`).
+- **Emulador de reglas pendiente**: ESLint y el despliegue están confirmados, pero los **28 casos** de `firestore.rules.test.ts` siguen pendientes de ejecutarse en un entorno con Java 21+ (local o GitHub Actions `.github/workflows/firestore-rules.yml`).
+- **Cuenta real con datos propios**: el arreglo de los botones del Bloque 1 está diagnosticado en código y verificado en Demo (móvil/escritorio, Sencillo/Avanzado) con las reglas ya desplegadas, pero queda pendiente de comprobación directa en tu cuenta real de Firestore.
 - **Verificación de facturación GCP/Firebase**: este entorno no tiene acceso a la API de Google Cloud Billing ni a la consola de Firebase, por lo que el plan activo (Spark vs Blaze) debe comprobarse manualmente en Firebase Console → *Uso y facturación*.
-- **Propuestas de mejora e IA (Bloque 4)**: documentadas exclusivamente como propuestas; no se ha instalado ningún SDK de IA ni habilitado ninguna API externa.
 
 ---
 
 ## 5. Siguiente paso exacto
 
-1. Probar en tu cuenta real (móvil y escritorio, Sencillo y Avanzado) la nueva navegación, el botón Atrás y «Dar por terminada la mudanza» / «Reabrir mudanza» entre los dos dispositivos.
-2. Ejecutar `.github/workflows/firestore-rules.yml` (o `npm run test:rules` con Java 21+) para verificar en emulador los **27 casos** de Security Rules.
-3. Si decides priorizar alguna de las propuestas del Bloque 4 (p. ej. pegado rápido de lista o resumen local), indícalo para diseñarla e implementarla en la siguiente iteración.
+1. Probar en tu cuenta real (móvil y escritorio, Sencillo y Avanzado):
+   - En `Ajustes → Ingresos y reparto`: configurar ingresos detallados (p. ej. 14 pagas) y guardar.
+   - En `Ahorros`: abrir «Planificar el ahorro del mes» / «Editar plan habitual», pulsar «Proponer reparto», comprobar las dos cifras separadas en «Cuánto pone cada uno» y probar «Añadir ahorro extra» + «Volver al plan habitual».
+2. Ejecutar `.github/workflows/firestore-rules.yml` (o `npm run test:rules` con Java 21+) para verificar en emulador los **28 casos** de Security Rules.

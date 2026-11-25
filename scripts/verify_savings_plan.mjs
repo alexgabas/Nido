@@ -80,40 +80,39 @@ async function run() {
 
     // 2) Abrir «Planificar el ahorro del mes»
     await page.getByRole('button', { name: /Planificar el ahorro del mes/i }).first().click();
-    const targetInput = page.locator('#savings-plan-target-amount');
+    const targetInput = page.locator('#savings-plan-target');
     await targetInput.waitFor({ state: 'visible', timeout: 5000 });
 
     // Referencia secundaria visible y NO auto-rellenada en el input manual
-    await page.getByText(/Referencia orientativa \(no se aplica sola\)/i).waitFor({ state: 'visible', timeout: 5000 });
+    await page.getByText(/Referencia \(no se aplica sola\): capacidad estimada/i).waitFor({ state: 'visible', timeout: 5000 });
     const initialTargetVal = await targetInput.inputValue();
     if (initialTargetVal !== '') {
       throw new Error(`El importe a apartar no debe auto-rellenarse con la capacidad; valor="${initialTargetVal}"`);
     }
 
-    // 3A) Proponer reparto con importe insuficiente (150 € < ~196,67 € de Viajes)
+    // 3A) Proponer reparto con llenado por orden de prioridad (150 € va a la primera meta: Colchón de emergencia)
     await targetInput.fill('150');
-    await page.getByRole('button', { name: /Proponer reparto/i }).click();
-    const viajesInput = page.locator('#plan-amt-goal_3');
-    const colchonInput = page.locator('#plan-amt-goal_1');
-    if ((await viajesInput.inputValue()) !== '150') {
-      throw new Error(`Esperaba 150 en Viajes con presupuesto insuficiente, obtenido: ${await viajesInput.inputValue()}`);
+    await page.locator('[data-testid="propose-savings-distribution-btn"]').click();
+    const colchonInput = page.getByLabel('Importe mensual para Colchón de emergencia (€)');
+    const viajesInput = page.getByLabel('Importe mensual para Viajes (€)');
+    if ((await colchonInput.inputValue()) !== '150') {
+      throw new Error(`Esperaba 150 en Colchón (primera meta por prioridad), obtenido: ${await colchonInput.inputValue()}`);
     }
-    if ((await colchonInput.inputValue()) !== '0') {
-      throw new Error(`Meta sin fecha debe proponer 0, obtenido: ${await colchonInput.inputValue()}`);
-    }
-    await page.getByText(/Metas por debajo de su cuota recomendada/i).waitFor({ state: 'visible', timeout: 5000 });
+    await page.locator('[data-testid="proposal-feedback-banner"]').waitFor({ state: 'visible', timeout: 5000 });
 
-    // 3B) Proponer reparto con excedente (400 € > ~196,67 € de Viajes) -> deja sobrante "Sin asignar"
-    await targetInput.fill('400');
-    await page.getByRole('button', { name: /Proponer reparto/i }).click();
+    // 3B) Proponer reparto con excedente muy grande (50000 €) -> llena metas y deja sobrante "Sin asignar"
+    await targetInput.fill('50000');
+    await page.locator('[data-testid="propose-savings-distribution-btn"]').click();
     await page.getByText(/sin asignar/i).first().waitFor({ state: 'visible', timeout: 5000 });
 
     // 4) Reordenar prioridad + ajustar manualmente Colchón (100 €) y Viajes (150 €) + guardar
-    await page.getByRole('button', { name: 'Bajar prioridad de Colchón de emergencia' }).click();
-    await page.getByRole('button', { name: 'Subir prioridad de Colchón de emergencia' }).click();
+    await targetInput.fill('250');
+    await page.locator('[data-testid="propose-savings-distribution-btn"]').click();
+    await page.getByRole('button', { name: 'Bajar Colchón de emergencia' }).click();
+    await page.getByRole('button', { name: 'Subir Colchón de emergencia' }).click();
     await colchonInput.fill('100');
     await viajesInput.fill('150');
-    await page.getByRole('button', { name: /Guardar plan/i }).click();
+    await page.locator('[data-testid="save-month-savings-plan-btn"]').click();
 
     // Esperar a que cierre el editor y comprobar que NO creó movimientos
     await targetInput.waitFor({ state: 'hidden', timeout: 5000 });
@@ -122,9 +121,9 @@ async function run() {
       throw new Error(`Guardar plan no debe crear movimientos: antes="${historyHeadingBefore}", después="${historyHeadingAfterSave}"`);
     }
 
-    // 5) Comprobar aportación previa de Viajes (320 € frente a 150 € -> +170,00 € sobre lo planificado, pendiente 0 €)
+    // 5) Comprobar aportación previa de Viajes (320 € frente a 150 € -> +170,00 € sobre el plan, pendiente 0 €)
     const planSection = page.locator('#savings-plan-section');
-    await planSection.getByText(/\+170,00\s*€ sobre lo planificado/i).waitFor({ state: 'visible', timeout: 5000 });
+    await planSection.getByText(/\+170,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
 
     // 6) Aportar pendiente de Colchón de emergencia (100,00 €) reutilizando modal existente
     const colchonPlanRowBtn = planSection.getByRole('button', { name: /Aportar pendiente \(100,00\s*€\)/i });
@@ -142,8 +141,8 @@ async function run() {
     await moveModal.getByRole('button', { name: 'Confirmar' }).click();
     await moveModal.waitFor({ state: 'hidden', timeout: 5000 });
 
-    // Verificar que Colchón pasó a Plan cubierto
-    await planSection.getByText(/Plan cubierto/i).first().waitFor({ state: 'visible', timeout: 5000 });
+    // Verificar que Colchón pasó a Completado
+    await planSection.getByText(/Completado/i).first().waitFor({ state: 'visible', timeout: 5000 });
 
     // 7) Registrar una retirada de 40 € en Colchón y comprobar que se muestra aparte sin restar de Aportado (100,00 €)
     const colchonCard = page.locator('[data-testid="goal-card-goal_1"]');
@@ -153,7 +152,7 @@ async function run() {
     await moveModal.getByRole('button', { name: 'Confirmar' }).click();
     await moveModal.waitFor({ state: 'hidden', timeout: 5000 });
 
-    await planSection.getByText(/Retirado este mes:\s*40,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
+    await planSection.getByText(/Retirado este mes:\s*−?40,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
     // El plan de Colchón sigue cubierto (100 € aportado; retirada 40 € mostrada aparte)
     const colchonCardText = await colchonCard.innerText();
     if (!/Aportado:\s*100,00\s*€/i.test(colchonCardText) || !/Retirado en el mes \(aparte\):\s*40,00\s*€/i.test(colchonCardText)) {
@@ -175,7 +174,6 @@ async function run() {
     await page.keyboard.press('Escape');
 
     await page.locator('#savings-plan-section').waitFor({ state: 'visible', timeout: 5000 });
-    await page.locator('#savings-plan-section').getByRole('button', { name: /Ver detalle del plan/i }).click();
     await page.locator('#savings-plan-section').getByText(/Colchón de emergencia/i).waitFor({ state: 'visible', timeout: 5000 });
 
     // Confirmar que seguimos en Modo Sencillo (el título en Sencillo es "Ahorros", no "Ahorros y metas")

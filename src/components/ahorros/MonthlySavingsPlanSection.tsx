@@ -1,46 +1,52 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
-  Archive,
   ArrowDown,
   ArrowUp,
-  ArrowUpCircle,
   Calendar,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Info,
   Pencil,
+  PiggyBank,
+  Plus,
+  RotateCcw,
   SlidersHorizontal,
   Sparkles,
   Trash2,
-  X,
 } from 'lucide-react';
+import { ConfirmDialog } from '../ConfirmDialog';
 import {
   computeGoalProgress,
   formatEUR,
   formatMonthLabelES,
+  fromCents,
   getCurrentMonthKeyLocal,
   getTodayLocalISO,
   roundCents,
   shiftMonthKey,
-  type SavingsCapacityResult,
+  toCents,
 } from '../../domain/finance';
 import {
+  buildExtraSavingsPlan,
   buildInitialSavingsPlanDraft,
   formatDecimalInputES,
+  getDefaultSelectableSavingsGoals,
   parseNonNegativeAmountInput,
-  proposeMonthlySavingsDistribution,
+  proposeHabitualFillDistribution,
   SAVINGS_PLAN_RULE_ONE_LINER,
+  sortGoalsByHabitualPriority,
   type DraftAllocationItem,
   type MonthlySavingsPlanEvaluation,
-  type SavingsDistributionProposal,
 } from '../../domain/savingsPlan';
-import { usePwaUpdateBlock } from '../../services/pwaUpdateGuard';
+import { toUserFriendlyErrorMessage } from '../../services/firebase';
 import type {
   GoalMovement,
+  HabitualSavingsPlan,
   MonthlySavingsPlan,
   SavingsGoal,
+  SavingsPlanAdjustmentKind,
   SavingsPlanAllocation,
   UiMode,
 } from '../../types/nido';
@@ -48,1020 +54,1447 @@ import type {
 interface MonthlySavingsPlanSectionProps {
   uiMode: UiMode;
   planMonthKey: string;
-  onChangeMonthKey: (nextMonthKey: string) => void;
-  evaluation: MonthlySavingsPlanEvaluation;
-  existingPlan: MonthlySavingsPlan | null;
-  allPlans: MonthlySavingsPlan[];
+  onChangeMonthKey: (mk: string) => void;
   goals: SavingsGoal[];
+  goalsLoaded: boolean;
   goalMovements: GoalMovement[];
-  savingsCapacity: SavingsCapacityResult | null;
+  savingsPlans: MonthlySavingsPlan[];
+  savingsPlansLoading: boolean;
+  savingsPlansError: string | null;
+  habitualPlan: HabitualSavingsPlan | null | undefined;
+  evaluation: MonthlySavingsPlanEvaluation;
+  effectivePlan: MonthlySavingsPlan | null;
+  effectiveSplitPctA: number;
+  shortNameA: string;
+  shortNameB: string;
+  hasPartner: boolean;
+  savingsCapacityRef: number;
+  hasIncomeConfigured: boolean;
   editorOpen: boolean;
   onSetEditorOpen: (open: boolean) => void;
-  saving: boolean;
   onSavePlan: (payload: {
     monthKey: string;
     targetAmount: number;
     allocations: SavingsPlanAllocation[];
+    adjustmentKind?: SavingsPlanAdjustmentKind;
+    extraAmount?: number;
   }) => Promise<void>;
   onDeletePlan: (monthKey: string) => Promise<void>;
-  onContributePending: (goal: SavingsGoal, pendingAmount: number) => void;
+  onSaveHabitualPlan: (
+    plan: { monthlyAmount: number; priorityGoalIds: string[] } | null
+  ) => Promise<void>;
+  onContributePending: (goal: SavingsGoal, pendingAmount: number, monthKey: string) => void;
+}
+
+type ActivePanelMode = 'none' | 'month_editor' | 'extra_editor' | 'habitual_editor';
+
+const STATUS_BADGES: Record<
+  MonthlySavingsPlanEvaluation['rows'][number]['status'],
+  { label: string; className: string }
+> = {
+  sin_asignacion: {
+    label: 'Sin importe',
+    className: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
+  },
+  pendiente: {
+    label: 'Pendiente',
+    className: 'bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300',
+  },
+  en_curso: {
+    label: 'En curso',
+    className: 'bg-[#0E5A64]/12 text-[#0E5A64] dark:bg-[#2AA1AE]/20 dark:text-[#5EEAD4]',
+  },
+  completado: {
+    label: 'Completado',
+    className: 'bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300',
+  },
+  excedido: {
+    label: 'Superado',
+    className: 'bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300',
+  },
+};
+
+function classifyActionError(err: unknown, fallback: string): string {
+  const friendly = toUserFriendlyErrorMessage(err, fallback);
+  const raw = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  if (raw.includes('permission-denied') || raw.includes('missing or insufficient permissions')) {
+    return 'Error de permisos en Firestore: tu cuenta no tiene permisos para guardar este plan o algún campo no cumple las reglas de seguridad.';
+  }
+  return friendly;
 }
 
 export const MonthlySavingsPlanSection: React.FC<MonthlySavingsPlanSectionProps> = ({
   uiMode,
   planMonthKey,
   onChangeMonthKey,
-  evaluation,
-  existingPlan,
-  allPlans,
   goals,
+  goalsLoaded,
   goalMovements,
-  savingsCapacity,
+  savingsPlans,
+  savingsPlansLoading,
+  savingsPlansError,
+  habitualPlan,
+  evaluation,
+  effectivePlan,
+  effectiveSplitPctA,
+  shortNameA,
+  shortNameB,
+  hasPartner,
+  savingsCapacityRef,
+  hasIncomeConfigured,
   editorOpen,
   onSetEditorOpen,
-  saving,
   onSavePlan,
   onDeletePlan,
+  onSaveHabitualPlan,
   onContributePending,
 }) => {
   const todayISO = getTodayLocalISO();
   const currentMonthKey = getCurrentMonthKeyLocal();
-  const monthLabel = formatMonthLabelES(planMonthKey);
+  const nextMonthKey = shiftMonthKey(currentMonthKey, 1);
 
-  // Sencillo detail drawer/panel toggle (independent of editor)
-  const [sencilloDetailOpen, setSencilloDetailOpen] = useState(false);
-
-  // Editor draft state
-  const [targetInput, setTargetInput] = useState('');
-  const [draftItems, setDraftItems] = useState<DraftAllocationItem[]>([]);
-  const [lastProposal, setLastProposal] = useState<SavingsDistributionProposal | null>(null);
-  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
-
-  usePwaUpdateBlock(editorOpen, 'edit');
+  const existingSavedPlan = useMemo(
+    () => savingsPlans.find((p) => p.monthKey === planMonthKey) ?? null,
+    [savingsPlans, planMonthKey]
+  );
 
   const goalsById = useMemo(() => new Map(goals.map((g) => [g.id, g])), [goals]);
 
-  const progressByGoalId = useMemo(() => {
-    const map = new Map<string, ReturnType<typeof computeGoalProgress>>();
-    for (const g of goals) {
-      map.set(g.id, computeGoalProgress(g, goalMovements, todayISO));
-    }
-    return map;
-  }, [goals, goalMovements, todayISO]);
+  // Panel activo dentro de la sección: sincronizamos `editorOpen` externo con `month_editor`
+  const [subPanel, setSubPanel] = useState<'none' | 'extra_editor' | 'habitual_editor'>('none');
+  const activePanel: ActivePanelMode = editorOpen ? 'month_editor' : subPanel;
 
-  // Reset editor draft whenever editor opens or selected month changes
+  const editorHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const draftDirtyRef = useRef(false);
+
+  // ── Estado del editor mensual («Ajustar este mes» / «Planificar ahorro del mes») ──
+  const [targetInput, setTargetInput] = useState('');
+  const [draftItems, setDraftItems] = useState<DraftAllocationItem[]>([]);
+  const [proposalFeedback, setProposalFeedback] = useState<{
+    tone: 'info' | 'warning' | 'success';
+    text: string;
+  } | null>(null);
+  const [monthSaveError, setMonthSaveError] = useState<string | null>(null);
+  const [savingMonth, setSavingMonth] = useState(false);
+
+  // ── Estado de «Añadir ahorro extra» ──
+  const [extraAmountInput, setExtraAmountInput] = useState('');
+  const [extraByGoalInput, setExtraByGoalInput] = useState<Record<string, string>>({});
+  const [extraSaveError, setExtraSaveError] = useState<string | null>(null);
+  const [savingExtra, setSavingExtra] = useState(false);
+
+  // ── Estado de «Editar plan habitual» ──
+  const [habitualAmountInput, setHabitualAmountInput] = useState('');
+  const [habitualGoalOrder, setHabitualGoalOrder] = useState<string[]>([]);
+  const [habitualSaveError, setHabitualSaveError] = useState<string | null>(null);
+  const [savingHabitual, setSavingHabitual] = useState(false);
+
+  // ── Confirmaciones ──
+  const [confirmRevertOpen, setConfirmRevertOpen] = useState(false);
+  const [deletingPlan, setDeletingPlan] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Hidratación robusta del borrador mensual (incluye rehidratación si `goals` llega después de abrir el editor)
   useEffect(() => {
     if (!editorOpen) {
-      setLastProposal(null);
-      setConfirmDeleteOpen(false);
+      draftDirtyRef.current = false;
       return;
     }
-    const initial = buildInitialSavingsPlanDraft({
-      existingPlan,
-      allPlans,
+    if (draftDirtyRef.current && draftItems.length > 0) return;
+
+    const draft = buildInitialSavingsPlanDraft({
+      existingPlan: existingSavedPlan,
+      habitualPlan,
+      allPlans: savingsPlans,
       goals,
       movements: goalMovements,
       refDateISO: todayISO,
     });
-    setTargetInput(initial.targetInput);
-    setDraftItems(initial.items);
-    setLastProposal(null);
-    setConfirmDeleteOpen(false);
-  }, [editorOpen, planMonthKey, existingPlan]); // intentionally only re-init on open or month/saved plan switch
+    setTargetInput(draft.targetInput);
+    setDraftItems(draft.items);
+    setProposalFeedback(null);
+    setMonthSaveError(null);
+  }, [
+    editorOpen,
+    planMonthKey,
+    existingSavedPlan,
+    habitualPlan,
+    goals,
+    goalsLoaded,
+    goalMovements,
+    savingsPlans,
+    todayISO,
+  ]);
 
-  const openEditor = () => {
-    if (uiMode === 'sencillo') {
-      setSencilloDetailOpen(true);
+  // Al cambiar de mes mientras el editor está abierto, resetea el dirty flag para cargar el mes nuevo
+  useEffect(() => {
+    draftDirtyRef.current = false;
+  }, [planMonthKey]);
+
+  // Foco accesible al abrir el editor mensual (evita la sensación de «botón que no hace nada»)
+  useEffect(() => {
+    if (editorOpen && editorHeadingRef.current) {
+      editorHeadingRef.current.focus({ preventScroll: true });
     }
+  }, [editorOpen]);
+
+  const openMonthEditor = () => {
+    setSubPanel('none');
+    setDeleteError(null);
+    draftDirtyRef.current = false;
     onSetEditorOpen(true);
   };
 
-  const handleToggleItem = (goalId: string) => {
+  const closeAllEditors = () => {
+    onSetEditorOpen(false);
+    setSubPanel('none');
+    setMonthSaveError(null);
+    setExtraSaveError(null);
+    setHabitualSaveError(null);
+  };
+
+  const openExtraEditor = () => {
+    onSetEditorOpen(false);
+    setDeleteError(null);
+    setExtraAmountInput('');
+    setExtraByGoalInput({});
+    setExtraSaveError(null);
+    setSubPanel('extra_editor');
+  };
+
+  const openHabitualEditor = () => {
+    onSetEditorOpen(false);
+    setDeleteError(null);
+    const selectable = getDefaultSelectableSavingsGoals(goals, goalMovements, todayISO);
+    const ordered = sortGoalsByHabitualPriority(
+      selectable,
+      habitualPlan?.priorityGoalIds,
+      savingsPlans[0] ?? null
+    );
+    setHabitualAmountInput(
+      habitualPlan && habitualPlan.monthlyAmount > 0
+        ? formatDecimalInputES(habitualPlan.monthlyAmount)
+        : ''
+    );
+    setHabitualGoalOrder(ordered.map((g) => g.id));
+    setHabitualSaveError(null);
+    setSubPanel('habitual_editor');
+  };
+
+  // ── Cálculos en vivo del editor mensual ──
+  const draftTargetAmount = parseNonNegativeAmountInput(targetInput);
+  const selectedDraftItems = useMemo(() => draftItems.filter((it) => it.selected), [draftItems]);
+  const draftTotalAssigned = useMemo(() => {
+    let cents = 0;
+    for (const it of selectedDraftItems) {
+      cents += toCents(parseNonNegativeAmountInput(it.amountInput));
+    }
+    return fromCents(cents);
+  }, [selectedDraftItems]);
+  const draftUnassigned = roundCents(Math.max(0, draftTargetAmount - draftTotalAssigned));
+  const draftOverAllocated = roundCents(Math.max(0, draftTotalAssigned - draftTargetAmount));
+
+  const draftShareACents = Math.round((toCents(draftTargetAmount) * effectiveSplitPctA) / 100);
+  const draftShareA = fromCents(draftShareACents);
+  const draftShareB = fromCents(toCents(draftTargetAmount) - draftShareACents);
+
+  const handleToggleDraftGoal = (goalId: string) => {
+    draftDirtyRef.current = true;
     setDraftItems((prev) =>
-      prev.map((item) =>
-        item.goalId === goalId ? { ...item, selected: !item.selected } : item
+      prev.map((it) =>
+        it.goalId === goalId
+          ? { ...it, selected: !it.selected, amountInput: !it.selected ? it.amountInput : '0' }
+          : it
       )
     );
-    setLastProposal(null);
+    setProposalFeedback(null);
   };
 
-  const handleAmountChange = (goalId: string, value: string) => {
-    setDraftItems((prev) =>
-      prev.map((item) => (item.goalId === goalId ? { ...item, amountInput: value } : item))
-    );
-  };
-
-  const handleMovePriority = (index: number, direction: -1 | 1) => {
+  const handleMoveDraftGoal = (index: number, direction: -1 | 1) => {
+    const nextIndex = index + direction;
+    if (nextIndex < 0 || nextIndex >= draftItems.length) return;
+    draftDirtyRef.current = true;
     setDraftItems((prev) => {
-      const nextIndex = index + direction;
-      if (nextIndex < 0 || nextIndex >= prev.length) return prev;
       const copy = [...prev];
       const [moved] = copy.splice(index, 1);
       copy.splice(nextIndex, 0, moved);
       return copy;
     });
-    setLastProposal(null);
+    setProposalFeedback(null);
   };
 
-  const draftTargetAmount = useMemo(
-    () => parseNonNegativeAmountInput(targetInput),
-    [targetInput]
-  );
-
-  const selectedDraftItems = useMemo(
-    () => draftItems.filter((item) => item.selected),
-    [draftItems]
-  );
-
-  const draftTotals = useMemo(() => {
-    let assignedCents = 0;
-    const underfunded: Array<{ goalId: string; goalName: string; recommended: number; planned: number; missing: number }> = [];
-
-    for (const item of selectedDraftItems) {
-      const planned = parseNonNegativeAmountInput(item.amountInput);
-      const plannedCents = Math.round(planned * 100);
-      assignedCents += plannedCents;
-
-      const goal = goalsById.get(item.goalId);
-      const prog = progressByGoalId.get(item.goalId);
-      if (
-        goal &&
-        !goal.archived &&
-        prog &&
-        !prog.isCompleted &&
-        goal.targetDate &&
-        prog.monthlyNeeded !== null
-      ) {
-        const desired = roundCents(Math.min(prog.monthlyNeeded, prog.remaining));
-        const missing = roundCents(desired - planned);
-        if (missing > 0) {
-          underfunded.push({
-            goalId: goal.id,
-            goalName: goal.name,
-            recommended: desired,
-            planned,
-            missing,
-          });
-        }
-      }
-    }
-
-    const targetCents = Math.round(draftTargetAmount * 100);
-    const unassignedCents = Math.max(0, targetCents - assignedCents);
-    const overAllocatedCents = Math.max(0, assignedCents - targetCents);
-
-    return {
-      totalAssigned: assignedCents / 100,
-      unassigned: unassignedCents / 100,
-      overAllocated: overAllocatedCents / 100,
-      underfunded,
-    };
-  }, [selectedDraftItems, draftTargetAmount, goalsById, progressByGoalId]);
+  const handleChangeDraftAmount = (goalId: string, val: string) => {
+    draftDirtyRef.current = true;
+    setDraftItems((prev) =>
+      prev.map((it) => (it.goalId === goalId ? { ...it, amountInput: val } : it))
+    );
+    setProposalFeedback(null);
+  };
 
   const handleProposeDistribution = () => {
-    const orderedIds = selectedDraftItems.map((i) => i.goalId);
-    const proposal = proposeMonthlySavingsDistribution({
+    setMonthSaveError(null);
+    const orderedIds = draftItems.filter((it) => it.selected).map((it) => it.goalId);
+    const proposal = proposeHabitualFillDistribution({
       targetAmount: draftTargetAmount,
       orderedGoalIds: orderedIds,
       goals,
       movements: goalMovements,
       refDateISO: todayISO,
     });
-    const proposedMap = new Map(proposal.allocations.map((a) => [a.goalId, a.proposedAmount]));
-    setDraftItems((prev) =>
-      prev.map((item) => {
-        if (!item.selected) return item;
-        if (!proposedMap.has(item.goalId)) return item;
-        const val = proposedMap.get(item.goalId) ?? 0;
-        return { ...item, amountInput: formatDecimalInputES(val) };
-      })
-    );
-    setLastProposal(proposal);
+
+    if (proposal.status === 'missing_target_amount' || proposal.status === 'no_selected_goals') {
+      setProposalFeedback({ tone: 'warning', text: proposal.feedbackMessage });
+      return;
+    }
+
+    if (proposal.status === 'all_manual_or_completed') {
+      setProposalFeedback({ tone: 'warning', text: proposal.feedbackMessage });
+      return;
+    }
+
+    const byId = new Map(proposal.allocations.map((a) => [a.goalId, a.proposedAmount]));
+    let anyChanged = false;
+    const nextItems = draftItems.map((it) => {
+      if (!it.selected) return it;
+      const proposed = byId.get(it.goalId) ?? 0;
+      const current = parseNonNegativeAmountInput(it.amountInput);
+      if (toCents(proposed) !== toCents(current)) {
+        anyChanged = true;
+      }
+      return { ...it, amountInput: formatDecimalInputES(proposed) };
+    });
+
+    draftDirtyRef.current = true;
+    setDraftItems(nextItems);
+
+    if (!anyChanged) {
+      setProposalFeedback({
+        tone: 'info',
+        text: `La propuesta por prioridad ya coincide con los importes actuales del borrador (${proposal.feedbackMessage})`,
+      });
+    } else {
+      setProposalFeedback({
+        tone: 'success',
+        text: proposal.feedbackMessage,
+      });
+    }
   };
 
-  const handleSubmitPlan = async (e: React.FormEvent) => {
+  const handleSubmitMonthPlan = async (e: React.FormEvent) => {
     e.preventDefault();
-    const allocations: SavingsPlanAllocation[] = selectedDraftItems.map((item, idx) => {
-      const goal = goalsById.get(item.goalId);
-      return {
-        goalId: item.goalId,
-        plannedAmount: parseNonNegativeAmountInput(item.amountInput),
-        priority: idx,
-        ...(goal?.name || item.goalNameSnapshot
-          ? { goalNameSnapshot: (goal?.name || item.goalNameSnapshot || '').slice(0, 80) }
-          : {}),
-      };
-    });
-    await onSavePlan({
-      monthKey: planMonthKey,
-      targetAmount: draftTargetAmount,
-      allocations,
-    });
-    onSetEditorOpen(false);
+    setMonthSaveError(null);
+    if (draftTargetAmount <= 0 && draftTotalAssigned > 0) {
+      setMonthSaveError(
+        'Indica primero un importe mensual total mayor o igual que la suma asignada a tus metas.'
+      );
+      return;
+    }
+    if (draftOverAllocated > 0) {
+      setMonthSaveError(
+        `Has asignado ${formatEUR(draftTotalAssigned)}, que supera en ${formatEUR(draftOverAllocated)} el total a apartar (${formatEUR(draftTargetAmount)}). Ajusta el total o los importes.`
+      );
+      return;
+    }
+    const allocations: SavingsPlanAllocation[] = selectedDraftItems.map((it, idx) => ({
+      goalId: it.goalId,
+      plannedAmount: parseNonNegativeAmountInput(it.amountInput),
+      priority: idx,
+      goalNameSnapshot: goalsById.get(it.goalId)?.name || it.goalNameSnapshot || 'Meta',
+    }));
+
+    setSavingMonth(true);
+    try {
+      await onSavePlan({
+        monthKey: planMonthKey,
+        targetAmount: draftTargetAmount,
+        allocations,
+        adjustmentKind: 'ajuste',
+      });
+      draftDirtyRef.current = false;
+      onSetEditorOpen(false);
+    } catch (err) {
+      // NUNCA cerramos el editor si falla el guardado: conservamos el borrador y mostramos el motivo exacto.
+      setMonthSaveError(
+        classifyActionError(err, 'No se pudo guardar el plan de ahorro de este mes.')
+      );
+    } finally {
+      setSavingMonth(false);
+    }
   };
 
-  const handleConfirmDelete = async () => {
-    await onDeletePlan(planMonthKey);
-    setConfirmDeleteOpen(false);
-    onSetEditorOpen(false);
+  // ── Cálculos en vivo de «Añadir ahorro extra» ──
+  const extraGoalsList = useMemo(() => {
+    const selectable = getDefaultSelectableSavingsGoals(goals, goalMovements, todayISO);
+    return sortGoalsByHabitualPriority(
+      selectable,
+      habitualPlan?.priorityGoalIds,
+      existingSavedPlan ?? savingsPlans[0] ?? null
+    );
+  }, [goals, goalMovements, todayISO, habitualPlan, existingSavedPlan, savingsPlans]);
+
+  const parsedExtraAmount = parseNonNegativeAmountInput(extraAmountInput);
+  const parsedExtraMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const [gid, raw] of Object.entries(extraByGoalInput)) {
+      const val = parseNonNegativeAmountInput(raw);
+      if (val > 0) map[gid] = val;
+    }
+    return map;
+  }, [extraByGoalInput]);
+
+  const extraPreview = useMemo(
+    () =>
+      buildExtraSavingsPlan({
+        basePlan: effectivePlan,
+        extraAmount: parsedExtraAmount,
+        extraAllocationsByGoalId: parsedExtraMap,
+        goals,
+      }),
+    [effectivePlan, parsedExtraAmount, parsedExtraMap, goals]
+  );
+
+  const beforeShareACents = Math.round((toCents(extraPreview.beforeTarget) * effectiveSplitPctA) / 100);
+  const beforeShareA = fromCents(beforeShareACents);
+  const beforeShareB = fromCents(toCents(extraPreview.beforeTarget) - beforeShareACents);
+  const afterShareACents = Math.round((toCents(extraPreview.afterTarget) * effectiveSplitPctA) / 100);
+  const afterShareA = fromCents(afterShareACents);
+  const afterShareB = fromCents(toCents(extraPreview.afterTarget) - afterShareACents);
+
+  const handleAssignExtraToSingleGoal = (goalId: string) => {
+    if (parsedExtraAmount <= 0) return;
+    setExtraByGoalInput({ [goalId]: formatDecimalInputES(parsedExtraAmount) });
+    setExtraSaveError(null);
   };
 
-  const historicalMonths = useMemo(
-    () => allPlans.map((p) => p.monthKey).sort((a, b) => b.localeCompare(a)),
-    [allPlans]
+  const handleSubmitExtraPlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setExtraSaveError(null);
+    if (parsedExtraAmount <= 0) {
+      setExtraSaveError('Indica un importe extra mayor que 0 €.');
+      return;
+    }
+    if (extraPreview.extraOverAllocated > 0) {
+      setExtraSaveError(
+        `Has repartido ${formatEUR(extraPreview.extraAssigned)} de extra, que supera el importe extra de ${formatEUR(parsedExtraAmount)}.`
+      );
+      return;
+    }
+    setSavingExtra(true);
+    try {
+      const prevExtra =
+        existingSavedPlan?.adjustmentKind === 'extra' && existingSavedPlan.extraAmount
+          ? existingSavedPlan.extraAmount
+          : 0;
+      await onSavePlan({
+        monthKey: planMonthKey,
+        targetAmount: extraPreview.afterTarget,
+        allocations: extraPreview.mergedAllocations,
+        adjustmentKind: 'extra',
+        extraAmount: roundCents(prevExtra + parsedExtraAmount),
+      });
+      setSubPanel('none');
+    } catch (err) {
+      setExtraSaveError(
+        classifyActionError(err, 'No se pudo guardar el ahorro extra de este mes.')
+      );
+    } finally {
+      setSavingExtra(false);
+    }
+  };
+
+  // ── Cálculos en vivo de «Editar plan habitual» ──
+  const habitualTargetAmount = parseNonNegativeAmountInput(habitualAmountInput);
+  const habitualPreviewProposal = useMemo(
+    () =>
+      proposeHabitualFillDistribution({
+        targetAmount: habitualTargetAmount,
+        orderedGoalIds: habitualGoalOrder,
+        goals,
+        movements: goalMovements,
+        refDateISO: todayISO,
+      }),
+    [habitualTargetAmount, habitualGoalOrder, goals, goalMovements, todayISO]
   );
 
-  // Shared month navigation header
-  const monthNavigator = (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <div className="inline-flex items-center rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-900/50">
-        <button
-          type="button"
-          aria-label="Mes anterior del plan de ahorro"
-          onClick={() => onChangeMonthKey(shiftMonthKey(planMonthKey, -1))}
-          className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-l-xl hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300"
-        >
-          <ChevronLeft className="w-4 h-4" />
-        </button>
-        <span className="px-2.5 text-xs sm:text-sm font-semibold capitalize whitespace-nowrap flex items-center gap-1.5">
-          <Calendar className="w-3.5 h-3.5 text-[#0E5A64] dark:text-[#5EEAD4]" />
-          <span>{monthLabel}</span>
-        </span>
-        <button
-          type="button"
-          aria-label="Mes siguiente del plan de ahorro"
-          onClick={() => onChangeMonthKey(shiftMonthKey(planMonthKey, 1))}
-          className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-r-xl hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300"
-        >
-          <ChevronRight className="w-4 h-4" />
-        </button>
-      </div>
-      {planMonthKey !== currentMonthKey && (
-        <button
-          type="button"
-          onClick={() => onChangeMonthKey(currentMonthKey)}
-          className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-slate-50 dark:hover:bg-slate-800"
-        >
-          Mes actual
-        </button>
-      )}
-    </div>
-  );
+  const handleMoveHabitualGoal = (index: number, direction: -1 | 1) => {
+    const nextIdx = index + direction;
+    if (nextIdx < 0 || nextIdx >= habitualGoalOrder.length) return;
+    setHabitualGoalOrder((prev) => {
+      const copy = [...prev];
+      const [moved] = copy.splice(index, 1);
+      copy.splice(nextIdx, 0, moved);
+      return copy;
+    });
+  };
 
-  // Shared editor form (used in Avanzado and inside Sencillo detail panel)
-  const editorForm = (
-    <form
-      onSubmit={(e) => void handleSubmitPlan(e)}
-      aria-label={`Editor del plan de ahorro de ${monthLabel}`}
-      className="rounded-2xl border border-[#0E5A64]/30 dark:border-[#5EEAD4]/25 bg-slate-50/70 dark:bg-slate-900/40 p-4 sm:p-5 space-y-4"
+  const handleSubmitHabitualPlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setHabitualSaveError(null);
+    setSavingHabitual(true);
+    try {
+      await onSaveHabitualPlan({
+        monthlyAmount: habitualTargetAmount,
+        priorityGoalIds: habitualGoalOrder,
+      });
+      setSubPanel('none');
+    } catch (err) {
+      setHabitualSaveError(
+        classifyActionError(err, 'No se pudo guardar el plan de ahorro habitual.')
+      );
+    } finally {
+      setSavingHabitual(false);
+    }
+  };
+
+  const handleConfirmDeleteMonthPlan = async () => {
+    setDeletingPlan(true);
+    setDeleteError(null);
+    try {
+      await onDeletePlan(planMonthKey);
+      setConfirmRevertOpen(false);
+      onSetEditorOpen(false);
+      setSubPanel('none');
+    } catch (err) {
+      setDeleteError(classifyActionError(err, 'No se pudo eliminar el plan guardado de este mes.'));
+      setConfirmRevertOpen(false);
+    } finally {
+      setDeletingPlan(false);
+    }
+  };
+
+  const monthLabel = formatMonthLabelES(planMonthKey);
+  const hasHabitualConfigured = Boolean(habitualPlan && habitualPlan.monthlyAmount > 0);
+  const hasSavedMonthOverride = Boolean(existingSavedPlan);
+
+  return (
+    <section
+      id="savings-plan-section"
+      aria-label="Plan de ahorro mensual"
+      data-testid="monthly-savings-plan-section"
+      className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
     >
-      <div className="flex items-start justify-between gap-2">
-        <div>
-          <h3 className="font-display text-base font-bold">
-            Planificar el ahorro de {monthLabel}
-          </h3>
-          <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
-            Indica cuánto queréis apartar, ordena prioridades y ajusta cada meta.
-          </p>
-        </div>
-        <button
-          type="button"
-          aria-label="Cerrar editor del plan de ahorro"
-          onClick={() => onSetEditorOpen(false)}
-          className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-200/70 dark:hover:bg-slate-800"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-
-      {/* Manual reserve amount + secondary capacity reference */}
-      <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-start">
-        <div className="md:col-span-6 space-y-1">
-          <label
-            htmlFor="savings-plan-target-amount"
-            className="block text-xs font-semibold text-slate-700 dark:text-slate-200"
-          >
-            ¿Cuánto queremos apartar este mes? (€)
-          </label>
-          <input
-            id="savings-plan-target-amount"
-            type="text"
-            inputMode="decimal"
-            value={targetInput}
-            onChange={(e) => setTargetInput(e.target.value)}
-            placeholder="Ej. 250,00"
-            className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-lg font-bold"
-          />
-          <p className="text-[11px] text-slate-500 dark:text-slate-400">
-            Importe manual (0 € es válido). No te obliga a repartirlo todo.
-          </p>
-        </div>
-
-        <div className="md:col-span-6 rounded-xl border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-[#132025] p-3 text-xs space-y-1">
-          <div className="flex items-center gap-1.5 font-semibold text-slate-600 dark:text-slate-300">
-            <Info className="w-3.5 h-3.5 text-[#0E5A64] dark:text-[#5EEAD4] shrink-0" />
-            <span>Referencia orientativa (no se aplica sola)</span>
+      {/* Cabecera + selector de mes */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-2.5 min-w-0">
+          <span className="w-10 h-10 rounded-2xl bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4] flex items-center justify-center shrink-0">
+            <PiggyBank className="w-5 h-5" />
+          </span>
+          <div className="min-w-0 space-y-0.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="font-display text-base sm:text-lg font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+                A qué metas va · {monthLabel}
+              </h2>
+              {evaluation.planSource === 'saved' && (
+                <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#0E5A64]/12 text-[#0E5A64] dark:bg-[#2AA1AE]/20 dark:text-[#5EEAD4]">
+                  {evaluation.adjustmentKind === 'extra' && evaluation.extraAmount
+                    ? `Plan guardado (+${formatEUR(evaluation.extraAmount)} extra)`
+                    : 'Plan guardado para este mes'}
+                </span>
+              )}
+              {evaluation.planSource === 'habitual' && (
+                <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300">
+                  Propuesta del plan habitual
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {evaluation.planSource === 'habitual'
+                ? 'Aplicado automáticamente desde vuestro plan habitual (llenado por prioridad) sin crear movimientos.'
+                : evaluation.planSource === 'saved'
+                  ? 'Ajuste específico guardado para este mes. El plan habitual y otros meses no cambian.'
+                  : 'Decide cuánto apartar y a qué metas va. Guardar el plan nunca mueve dinero real.'}
+            </p>
           </div>
-          {savingsCapacity?.hasIncomeConfigured ? (
-            <p className="text-slate-600 dark:text-slate-300 tabular-nums">
-              Capacidad de ahorro estimada por Nido:{' '}
-              <strong className="text-slate-900 dark:text-slate-100">
-                {formatEUR(savingsCapacity.capacity)}/mes
-              </strong>
-              . Es solo una referencia según ingresos y gasto habitual, no dinero disponible en cuenta.
-            </p>
-          ) : (
-            <p className="text-slate-500 dark:text-slate-400">
-              Configura vuestros ingresos en Ajustes si quieres ver una referencia orientativa de capacidad mensual.
-            </p>
+        </div>
+
+        {/* Selector de mes */}
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <div className="inline-flex items-center rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-0.5">
+            <button
+              type="button"
+              onClick={() => onChangeMonthKey(shiftMonthKey(planMonthKey, -1))}
+              aria-label="Mes anterior del plan de ahorro"
+              className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-800"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <span className="px-2.5 text-xs font-bold tabular-nums capitalize">
+              {monthLabel}
+            </span>
+            <button
+              type="button"
+              onClick={() => onChangeMonthKey(shiftMonthKey(planMonthKey, 1))}
+              aria-label="Mes siguiente del plan de ahorro"
+              className="min-h-[40px] min-w-[40px] rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-800"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+
+          {planMonthKey !== currentMonthKey && (
+            <button
+              type="button"
+              onClick={() => onChangeMonthKey(currentMonthKey)}
+              className="min-h-[40px] px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              Este mes
+            </button>
+          )}
+          {planMonthKey !== nextMonthKey && (
+            <button
+              type="button"
+              onClick={() => onChangeMonthKey(nextMonthKey)}
+              className="min-h-[40px] px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-[#0E5A64]/5 inline-flex items-center gap-1"
+            >
+              <Calendar className="w-3.5 h-3.5" />
+              <span>Próximo mes</span>
+            </button>
           )}
         </div>
       </div>
 
-      {/* Proponer reparto action + 1-line rule */}
-      <div className="rounded-xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3.5 space-y-2">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs text-slate-600 dark:text-slate-300 max-w-2xl">
-            {SAVINGS_PLAN_RULE_ONE_LINER}
-          </p>
+      {/* Estado de carga o error de carga/permisos en savingsPlans (sin bloquear abrir el editor) */}
+      {savingsPlansLoading && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Sincronizando planes de ahorro...
+        </p>
+      )}
+      {savingsPlansError && (
+        <div
+          role="alert"
+          className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3.5 py-2.5 text-xs text-[#B42318] dark:text-[#FCA5A5] flex items-start gap-2"
+        >
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>
+            No se pudieron leer los planes guardados ({savingsPlansError}). Puedes seguir abriendo el
+            editor o reintentar al guardar.
+          </span>
+        </div>
+      )}
+      {deleteError && (
+        <div
+          role="alert"
+          className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3.5 py-2.5 text-xs text-[#B42318] dark:text-[#FCA5A5] flex items-start gap-2"
+        >
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{deleteError}</span>
+        </div>
+      )}
+
+      {/* Barra de acciones principales (Sencillo + Avanzado) */}
+      {activePanel === 'none' && (
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            disabled={selectedDraftItems.length === 0}
-            onClick={handleProposeDistribution}
-            className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64]/10 hover:bg-[#0E5A64]/18 text-[#0E5A64] dark:text-[#5EEAD4] border border-[#0E5A64]/30 dark:border-[#5EEAD4]/30 text-xs sm:text-sm font-bold inline-flex items-center gap-1.5 disabled:opacity-50"
+            onClick={openMonthEditor}
+            data-testid="open-month-savings-editor-btn"
+            className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5"
           >
-            <Sparkles className="w-4 h-4" />
-            <span>Proponer reparto</span>
-          </button>
-        </div>
-        {lastProposal && (
-          <p role="status" className="text-xs font-medium text-[#0E5A64] dark:text-[#5EEAD4] tabular-nums">
-            Propuesta aplicada al borrador: {formatEUR(lastProposal.totalAssigned)} repartidos
-            {lastProposal.unassignedAmount > 0
-              ? ` · ${formatEUR(lastProposal.unassignedAmount)} sin asignar.`
-              : '.'}{' '}
-            Puedes modificar cualquier importe antes de guardar.
-          </p>
-        )}
-      </div>
-
-      {/* Goal selection, priority order & manual amounts */}
-      {draftItems.length === 0 ? (
-        <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] p-4 text-xs text-slate-500 dark:text-slate-400">
-          No hay metas activas pendientes de completar para incluir en este plan.
-        </div>
-      ) : (
-        <div className="space-y-2">
-          <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 px-1">
-            <span>Metas y orden de prioridad (las archivadas y completadas no se incluyen por defecto)</span>
-            <span className="tabular-nums font-semibold">
-              {selectedDraftItems.length} seleccionada{selectedDraftItems.length === 1 ? '' : 's'}
+            <Pencil className="w-4 h-4" />
+            <span>
+              {evaluation.hasPlan ? 'Ajustar este mes' : 'Planificar ahorro del mes'}
             </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={openExtraEditor}
+            data-testid="open-extra-savings-btn"
+            className="min-h-[44px] px-4 rounded-xl border border-[#0E5A64]/35 bg-[#0E5A64]/6 hover:bg-[#0E5A64]/12 text-[#0E5A64] dark:text-[#5EEAD4] text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Añadir ahorro extra</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={openHabitualEditor}
+            data-testid="open-habitual-plan-btn"
+            className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#132025] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5"
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span>
+              {hasHabitualConfigured
+                ? `Editar plan habitual (${formatEUR(habitualPlan!.monthlyAmount)}/mes)`
+                : 'Editar plan habitual'}
+            </span>
+          </button>
+
+          {hasSavedMonthOverride && (
+            <button
+              type="button"
+              onClick={() => setConfirmRevertOpen(true)}
+              data-testid="revert-month-plan-btn"
+              className="min-h-[44px] px-3.5 rounded-xl border border-red-200 dark:border-red-900/60 text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5] hover:bg-red-50 dark:hover:bg-red-950/30 inline-flex items-center gap-1.5"
+            >
+              {hasHabitualConfigured ? (
+                <>
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Volver al plan habitual</span>
+                </>
+              ) : (
+                <>
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Eliminar plan del mes</span>
+                </>
+              )}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ─── PANEL 1: EDITOR DE PLAN HABITUAL (Bloque 4) ────────────────────── */}
+      {activePanel === 'habitual_editor' && (
+        <form
+          onSubmit={(e) => void handleSubmitHabitualPlan(e)}
+          data-testid="habitual-plan-editor"
+          className="rounded-2xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 p-4 space-y-4"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h3 className="font-display text-sm sm:text-base font-bold">
+                Plan de ahorro habitual (todos los meses)
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Configúralo una sola vez: Nido aplica esta propuesta a cada mes sin plan guardado
+                (llenando por orden de prioridad) sin tocar meses pasados ni crear movimientos.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={closeAllEditors}
+              className="min-h-[40px] px-3 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-800"
+            >
+              Cerrar
+            </button>
           </div>
 
-          <ul className="space-y-2">
-            {draftItems.map((item, idx) => {
-              const goal = goalsById.get(item.goalId);
-              const prog = progressByGoalId.get(item.goalId);
-              const goalName = goal?.name || item.goalNameSnapshot || 'Meta eliminada';
-              const hasDate = Boolean(goal?.targetDate && goal.targetDate.trim());
-              const recommended =
-                goal && !goal.archived && prog && !prog.isCompleted && hasDate && prog.monthlyNeeded !== null
-                  ? roundCents(Math.min(prog.monthlyNeeded, prog.remaining))
-                  : null;
-              const currentManual = parseNonNegativeAmountInput(item.amountInput);
-              const shortBy =
-                item.selected && recommended !== null && currentManual < recommended
-                  ? roundCents(recommended - currentManual)
-                  : 0;
+          <div className="space-y-1.5">
+            <label htmlFor="habitual-savings-amount" className="block text-xs font-semibold">
+              Importe mensual habitual para ahorrar (€)
+            </label>
+            <input
+              id="habitual-savings-amount"
+              type="text"
+              inputMode="decimal"
+              value={habitualAmountInput}
+              onChange={(e) => setHabitualAmountInput(e.target.value)}
+              placeholder="Ej. 300"
+              className="w-full sm:w-64 min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1417] text-base font-bold tabular-nums"
+            />
+            {hasIncomeConfigured && (
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                Referencia informativa (no automática): capacidad de ahorro estimada{' '}
+                <strong>{formatEUR(savingsCapacityRef)}/mes</strong>.
+              </p>
+            )}
+          </div>
 
-              return (
-                <li
-                  key={item.goalId}
-                  className={`rounded-xl border p-3 transition-colors ${
-                    item.selected
-                      ? 'bg-white dark:bg-[#132025] border-slate-200 dark:border-slate-700'
-                      : 'bg-slate-100/70 dark:bg-slate-900/30 border-slate-200/70 dark:border-slate-800 opacity-75'
-                  }`}
-                >
-                  <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-                    <div className="flex items-start sm:items-center gap-2.5 flex-1 min-w-0">
-                      <label className="min-h-[44px] min-w-[44px] -ml-1 flex items-center justify-center cursor-pointer shrink-0">
-                        <input
-                          type="checkbox"
-                          checked={item.selected}
-                          onChange={() => handleToggleItem(item.goalId)}
-                          aria-label={`Incluir ${goalName} en el plan`}
-                          className="w-5 h-5 rounded accent-[#0E5A64]"
-                        />
-                      </label>
+          <div className="space-y-2">
+            <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
+              Orden de prioridad de metas (llenado secuencial)
+            </p>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400">
+              {SAVINGS_PLAN_RULE_ONE_LINER} Las metas sin fecha objetivo también reciben dinero si
+              tienen un objetivo en euros.
+            </p>
 
-                      <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-bold tabular-nums shrink-0">
-                        {idx + 1}.º
-                      </span>
-
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="font-semibold text-sm truncate">{goalName}</span>
-                          {goal?.archived && (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-200 dark:bg-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200">
-                              <Archive className="w-3 h-3" />
-                              Archivada
-                            </span>
-                          )}
-                          {!goal && (
-                            <span className="px-2 py-0.5 rounded-md bg-slate-200 dark:bg-slate-700 text-[11px] font-semibold">
-                              Eliminada
-                            </span>
-                          )}
-                          {prog?.isCompleted && (
-                            <span className="px-2 py-0.5 rounded-md bg-[#15803D]/15 text-[#15803D] dark:text-[#4ADE80] text-[11px] font-semibold">
-                              Completada
-                            </span>
-                          )}
+            {habitualGoalOrder.length === 0 ? (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                No hay metas activas pendientes de completar.
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {habitualGoalOrder.map((gid, idx) => {
+                  const goal = goalsById.get(gid);
+                  if (!goal) return null;
+                  const allocPreview = habitualPreviewProposal.allocations.find(
+                    (a) => a.goalId === gid
+                  );
+                  return (
+                    <div
+                      key={gid}
+                      className="rounded-xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 px-3 py-2.5 flex items-center justify-between gap-2"
+                    >
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-bold text-slate-400 tabular-nums">
+                            #{idx + 1}
+                          </span>
+                          <span
+                            className="w-2.5 h-2.5 rounded-full shrink-0"
+                            style={{ backgroundColor: goal.color || '#0E5A64' }}
+                          />
+                          <span className="text-sm font-bold truncate">{goal.name}</span>
                         </div>
-                        <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums mt-0.5">
-                          {recommended !== null ? (
-                            <>
-                              Cuota recomendada: <strong>{formatEUR(recommended)}/mes</strong>
-                              {prog ? ` · Faltan ${formatEUR(prog.remaining)}` : ''}
-                            </>
-                          ) : !hasDate && goal && !goal.archived && !prog?.isCompleted ? (
-                            <>
-                              Sin fecha objetivo · importe manual
-                              {prog && prog.remaining > 0 ? ` · Faltan ${formatEUR(prog.remaining)}` : ''}
-                            </>
-                          ) : prog ? (
-                            <>Acumulado: {formatEUR(prog.savedAmount)}</>
-                          ) : (
-                            <>Asignación histórica conservada</>
-                          )}
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums pl-5">
+                          {allocPreview?.needsManualAmount
+                            ? 'Sin importe objetivo · requiere asignación manual en cada mes'
+                            : `Faltan ${formatEUR(allocPreview?.remainingToTarget ?? 0)} para el objetivo · Propuesta: ${formatEUR(allocPreview?.proposedAmount ?? 0)}`}
                         </p>
-                        {shortBy > 0 && (
-                          <p className="text-[11px] font-medium text-amber-800 dark:text-amber-300 tabular-nums mt-0.5">
-                            Por debajo de lo recomendado en {formatEUR(shortBy)}
-                          </p>
-                        )}
                       </div>
-                    </div>
-
-                    <div className="flex items-center justify-between sm:justify-end gap-2 pl-10 sm:pl-0">
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1 shrink-0">
                         <button
                           type="button"
                           disabled={idx === 0}
-                          aria-label={`Subir prioridad de ${goalName}`}
-                          onClick={() => handleMovePriority(idx, -1)}
-                          className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-35"
+                          onClick={() => handleMoveHabitualGoal(idx, -1)}
+                          aria-label={`Subir prioridad de ${goal.name}`}
+                          className="min-h-[40px] min-w-[40px] rounded-lg border border-slate-200 dark:border-slate-700 flex items-center justify-center disabled:opacity-30"
                         >
                           <ArrowUp className="w-4 h-4" />
                         </button>
                         <button
                           type="button"
-                          disabled={idx === draftItems.length - 1}
-                          aria-label={`Bajar prioridad de ${goalName}`}
-                          onClick={() => handleMovePriority(idx, 1)}
-                          className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-35"
+                          disabled={idx === habitualGoalOrder.length - 1}
+                          onClick={() => handleMoveHabitualGoal(idx, 1)}
+                          aria-label={`Bajar prioridad de ${goal.name}`}
+                          className="min-h-[40px] min-w-[40px] rounded-lg border border-slate-200 dark:border-slate-700 flex items-center justify-center disabled:opacity-30"
                         >
                           <ArrowDown className="w-4 h-4" />
                         </button>
                       </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
-                      <div className="w-32">
-                        <label className="sr-only" htmlFor={`plan-amt-${item.goalId}`}>
-                          Importe planificado para {goalName} (€)
-                        </label>
-                        <input
-                          id={`plan-amt-${item.goalId}`}
-                          type="text"
-                          inputMode="decimal"
-                          disabled={!item.selected}
-                          value={item.amountInput}
-                          onChange={(e) => handleAmountChange(item.goalId, e.target.value)}
-                          placeholder="0,00"
-                          className="w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-sm font-bold text-right disabled:opacity-50"
-                        />
-                      </div>
+          {habitualTargetAmount > 0 && (
+            <div className="rounded-xl bg-white dark:bg-[#132025] border border-[#0E5A64]/20 p-3 text-xs space-y-1 tabular-nums">
+              <p className="font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
+                Vista previa de llenado con {formatEUR(habitualTargetAmount)}/mes:
+              </p>
+              <p className="text-slate-700 dark:text-slate-200">
+                {habitualPreviewProposal.feedbackMessage}
+              </p>
+            </div>
+          )}
+
+          {habitualSaveError && (
+            <div
+              role="alert"
+              className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3 py-2.5 text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5]"
+            >
+              {habitualSaveError}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="submit"
+              disabled={savingHabitual}
+              className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-semibold disabled:opacity-50"
+            >
+              {savingHabitual ? 'Guardando...' : 'Guardar plan habitual'}
+            </button>
+            <button
+              type="button"
+              onClick={closeAllEditors}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* ─── PANEL 2: AÑADIR AHORRO EXTRA (Bloque 5) ────────────────────────── */}
+      {activePanel === 'extra_editor' && (
+        <form
+          onSubmit={(e) => void handleSubmitExtraPlan(e)}
+          data-testid="extra-savings-editor"
+          className="rounded-2xl bg-[#0E5A64]/5 dark:bg-[#2AA1AE]/10 border border-[#0E5A64]/25 p-4 space-y-4"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h3 className="font-display text-sm sm:text-base font-bold">
+                Añadir ahorro extra en {monthLabel}
+              </h3>
+              <p className="text-xs text-slate-600 dark:text-slate-300">
+                Se suma encima de la base de este mes ({formatEUR(extraPreview.beforeTarget)}) sin
+                modificar vuestro plan habitual ni duplicar la base.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={closeAllEditors}
+              className="min-h-[40px] px-3 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-800"
+            >
+              Cerrar
+            </button>
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="extra-savings-amount" className="block text-xs font-semibold">
+              Importe extra a añadir solo en {monthLabel} (€)
+            </label>
+            <input
+              id="extra-savings-amount"
+              type="text"
+              inputMode="decimal"
+              value={extraAmountInput}
+              onChange={(e) => {
+                setExtraAmountInput(e.target.value);
+                setExtraSaveError(null);
+              }}
+              placeholder="Ej. 200"
+              className="w-full sm:w-64 min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1417] text-base font-bold tabular-nums"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
+              ¿A qué metas va ÚNICAMENTE este extra?
+            </p>
+            <div className="space-y-2">
+              {extraGoalsList.map((goal) => {
+                const baseAlloc = extraPreview.goalDiffs.find((d) => d.goalId === goal.id);
+                return (
+                  <div
+                    key={goal.id}
+                    className="rounded-xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3 flex flex-wrap items-center justify-between gap-2"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-bold truncate">{goal.name}</p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                        Base actual: {formatEUR(baseAlloc?.beforePlanned ?? 0)}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {parsedExtraAmount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => handleAssignExtraToSingleGoal(goal.id)}
+                          className="min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-[#0E5A64] dark:text-[#5EEAD4] hover:bg-[#0E5A64]/10"
+                        >
+                          Todo el extra
+                        </button>
+                      )}
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        aria-label={`Extra para ${goal.name} (€)`}
+                        value={extraByGoalInput[goal.id] ?? ''}
+                        onChange={(e) => {
+                          setExtraByGoalInput((prev) => ({ ...prev, [goal.id]: e.target.value }));
+                          setExtraSaveError(null);
+                        }}
+                        placeholder="0"
+                        className="w-28 min-h-[40px] px-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1417] text-sm font-bold text-right tabular-nums"
+                      />
                     </div>
                   </div>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      )}
-
-      {/* Live distribution totals */}
-      <div className="rounded-xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3.5 space-y-2">
-        <div className="grid grid-cols-3 gap-2 text-xs sm:text-sm tabular-nums">
-          <div>
-            <span className="block text-[11px] text-slate-500 dark:text-slate-400">A apartar</span>
-            <strong className="font-mono-num">{formatEUR(draftTargetAmount)}</strong>
-          </div>
-          <div>
-            <span className="block text-[11px] text-slate-500 dark:text-slate-400">Total asignado</span>
-            <strong className="font-mono-num text-[#0E5A64] dark:text-[#5EEAD4]">
-              {formatEUR(draftTotals.totalAssigned)}
-            </strong>
-          </div>
-          <div>
-            <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-              {draftTotals.overAllocated > 0 ? 'Exceso asignado' : 'Sin asignar'}
-            </span>
-            <strong
-              className={`font-mono-num ${
-                draftTotals.overAllocated > 0
-                  ? 'text-[#B42318] dark:text-[#FCA5A5]'
-                  : 'text-slate-800 dark:text-slate-100'
-              }`}
-            >
-              {draftTotals.overAllocated > 0
-                ? `+${formatEUR(draftTotals.overAllocated)}`
-                : formatEUR(draftTotals.unassigned)}
-            </strong>
-          </div>
-        </div>
-
-        {draftTotals.overAllocated > 0 && (
-          <p className="text-xs text-[#B42318] dark:text-[#FCA5A5] flex items-start gap-1.5">
-            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-            <span>
-              Has asignado {formatEUR(draftTotals.overAllocated)} más que el importe indicado a apartar. Puedes subir «¿Cuánto queremos apartar?» o ajustar alguna meta.
-            </span>
-          </p>
-        )}
-
-        {draftTotals.underfunded.length > 0 && (
-          <div className="rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 p-2.5 text-xs text-amber-900 dark:text-amber-200 space-y-1">
-            <p className="font-semibold flex items-center gap-1.5">
-              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-              <span>Metas por debajo de su cuota recomendada:</span>
-            </p>
-            <ul className="list-disc pl-5 space-y-0.5 tabular-nums">
-              {draftTotals.underfunded.map((u) => (
-                <li key={u.goalId}>
-                  <strong>{u.goalName}</strong>: {formatEUR(u.planned)} de {formatEUR(u.recommended)} (faltan {formatEUR(u.missing)})
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        <p className="text-[11px] text-slate-500 dark:text-slate-400">
-          Guardar el plan no crea movimientos, transferencias ni deudas ni cambia tu ahorro real.
-        </p>
-      </div>
-
-      {/* Actions */}
-      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-        <div>
-          {existingPlan && !confirmDeleteOpen && (
-            <button
-              type="button"
-              disabled={saving}
-              onClick={() => setConfirmDeleteOpen(true)}
-              className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5] inline-flex items-center gap-1.5 hover:bg-red-50 dark:hover:bg-red-950/30"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Eliminar plan de este mes</span>
-            </button>
-          )}
-          {existingPlan && confirmDeleteOpen && (
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5]">
-                ¿Eliminar solo el plan? (No borra aportaciones)
-              </span>
-              <button
-                type="button"
-                disabled={saving}
-                onClick={() => void handleConfirmDelete()}
-                className="min-h-[44px] px-3 rounded-xl bg-[#B42318] text-white text-xs font-semibold"
-              >
-                Sí, eliminar plan
-              </button>
-              <button
-                type="button"
-                disabled={saving}
-                onClick={() => setConfirmDeleteOpen(false)}
-                className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-medium"
-              >
-                No
-              </button>
+                );
+              })}
             </div>
-          )}
-        </div>
+          </div>
 
-        <div className="flex items-center gap-2 ml-auto">
-          <button
-            type="button"
-            disabled={saving}
-            onClick={() => onSetEditorOpen(false)}
-            className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium"
-          >
-            Cancelar
-          </button>
-          <button
-            type="submit"
-            disabled={saving}
-            className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-50 text-white text-sm font-semibold"
-          >
-            {saving ? 'Guardando...' : 'Guardar plan'}
-          </button>
-        </div>
-      </div>
-    </form>
-  );
-
-  // Per-goal evaluation rows list (shared between Avanzado and Sencillo detail panel)
-  const evaluationRowsList = (
-    <div className="space-y-2.5">
-      {evaluation.rows.map((row) => {
-        const liveGoal = goalsById.get(row.goalId) ?? null;
-        const canContribute = Boolean(liveGoal && !liveGoal.archived && row.pendingAmount > 0);
-        return (
+          {/* Vista previa Antes -> Después */}
           <div
-            key={row.goalId}
-            className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-900/40 p-3.5 space-y-2"
+            data-testid="extra-before-after-preview"
+            className="rounded-xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3.5 space-y-2 text-xs tabular-nums"
           >
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="inline-flex items-center justify-center px-1.5 py-0.5 rounded-md bg-slate-200/80 dark:bg-slate-800 text-[11px] font-bold tabular-nums">
-                    {row.priority + 1}.º
+            <p className="font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
+              Comparativa Antes → Después ({monthLabel})
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div className="rounded-lg bg-slate-50 dark:bg-slate-900/60 p-2.5 space-y-0.5">
+                <p className="text-[11px] text-slate-500">Total ahorro del mes</p>
+                <p className="font-bold text-sm">
+                  {formatEUR(extraPreview.beforeTarget)} →{' '}
+                  <span className="text-[#0E5A64] dark:text-[#5EEAD4]">
+                    {formatEUR(extraPreview.afterTarget)}
                   </span>
-                  <span className="font-semibold text-sm">{row.goalName}</span>
-                  {row.isArchived && (
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-200 dark:bg-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200">
-                      <Archive className="w-3 h-3" />
-                      Archivada
-                    </span>
-                  )}
-                  {row.isMissingGoal && (
-                    <span className="px-2 py-0.5 rounded-md bg-slate-200 dark:bg-slate-700 text-[11px] font-semibold">
-                      Meta eliminada
-                    </span>
-                  )}
-                  {row.status === 'completado' && (
-                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#15803D] dark:text-[#4ADE80]">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      Plan cubierto
-                    </span>
-                  )}
-                  {row.status === 'excedido' && (
-                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#15803D] dark:text-[#4ADE80]">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      +{formatEUR(row.excessAmount)} sobre lo planificado
-                    </span>
-                  )}
-                </div>
-                {uiMode === 'avanzado' && row.belowRecommendedBy > 0 && (
-                  <p className="text-[11px] font-medium text-amber-800 dark:text-amber-300 tabular-nums mt-0.5">
-                    Por debajo de la cuota recomendada ({formatEUR(row.recommendedAmount ?? 0)}) en{' '}
-                    {formatEUR(row.belowRecommendedBy)}
-                  </p>
-                )}
+                </p>
               </div>
-
-              {canContribute && liveGoal && (
-                <button
-                  type="button"
-                  onClick={() => onContributePending(liveGoal, row.pendingAmount)}
-                  className="min-h-[44px] px-3.5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0"
-                >
-                  <ArrowUpCircle className="w-4 h-4" />
-                  <span>Aportar pendiente ({formatEUR(row.pendingAmount)})</span>
-                </button>
+              {hasPartner && (
+                <div className="rounded-lg bg-slate-50 dark:bg-slate-900/60 p-2.5 space-y-0.5">
+                  <p className="text-[11px] text-slate-500">Aportación prevista por persona</p>
+                  <p className="font-semibold">
+                    {shortNameA}: {formatEUR(beforeShareA)} →{' '}
+                    <strong>{formatEUR(afterShareA)}</strong>
+                  </p>
+                  <p className="font-semibold">
+                    {shortNameB}: {formatEUR(beforeShareB)} →{' '}
+                    <strong>{formatEUR(afterShareB)}</strong>
+                  </p>
+                </div>
               )}
             </div>
 
-            <div className="grid grid-cols-3 gap-2 text-xs tabular-nums">
-              <div>
-                <span className="block text-[11px] text-slate-500 dark:text-slate-400">Planificado</span>
-                <strong className="font-mono-num">{formatEUR(row.plannedAmount)}</strong>
-              </div>
-              <div>
-                <span className="block text-[11px] text-slate-500 dark:text-slate-400">Aportado</span>
-                <strong className="font-mono-num text-[#15803D] dark:text-[#4ADE80]">
-                  {formatEUR(row.contributedAmount)}
-                </strong>
-              </div>
-              <div>
-                <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                  Pendiente de aportar
-                </span>
-                <strong className="font-mono-num">{formatEUR(row.pendingAmount)}</strong>
-              </div>
-            </div>
-
-            {row.plannedAmount > 0 && (
-              <div className="h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
-                <div
-                  className="h-full rounded-full transition-all duration-500"
-                  style={{
-                    width: `${row.progressPct}%`,
-                    backgroundColor:
-                      row.status === 'completado' || row.status === 'excedido'
-                        ? '#15803D'
-                        : row.goalColor || '#0E5A64',
-                  }}
-                />
-              </div>
+            {extraPreview.goalDiffs.some((d) => d.afterPlanned > 0) && (
+              <ul className="space-y-1 pt-1 border-t border-slate-100 dark:border-slate-800">
+                {extraPreview.goalDiffs
+                  .filter((d) => d.afterPlanned > 0)
+                  .map((d) => (
+                    <li key={d.goalId} className="flex justify-between gap-2">
+                      <span className="truncate">{d.goalName}</span>
+                      <span>
+                        {formatEUR(d.beforePlanned)}
+                        {d.extraAdded > 0 ? (
+                          <strong className="text-[#0E5A64] dark:text-[#5EEAD4]">
+                            {' '}
+                            +{formatEUR(d.extraAdded)} = {formatEUR(d.afterPlanned)}
+                          </strong>
+                        ) : (
+                          ` (sin cambio)`
+                        )}
+                      </span>
+                    </li>
+                  ))}
+              </ul>
             )}
 
-            {row.withdrawnAmount > 0 && (
-              <p className="text-xs font-medium text-[#B42318] dark:text-[#FCA5A5] tabular-nums">
-                Retirado este mes: {formatEUR(row.withdrawnAmount)} (mostrado aparte; no resta de lo aportado al evaluar el plan)
+            {extraPreview.extraUnassigned > 0 && parsedExtraAmount > 0 && (
+              <p className="text-[11px] text-amber-800 dark:text-amber-300">
+                Quedan {formatEUR(extraPreview.extraUnassigned)} del extra sin asignar a una meta.
               </p>
             )}
           </div>
-        );
-      })}
 
-      {evaluation.unplannedActivity.length > 0 && (
-        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#132025] p-3 text-xs space-y-1">
-          <p className="font-semibold text-slate-600 dark:text-slate-300">
-            Movimientos reales del mes en metas fuera de este plan
-          </p>
-          <ul className="space-y-0.5 text-slate-600 dark:text-slate-300 tabular-nums">
-            {evaluation.unplannedActivity.map((item) => (
-              <li key={item.goalId} className="flex flex-wrap items-center justify-between gap-2">
-                <span>
-                  {item.goalName}
-                  {item.isArchived ? ' (archivada)' : ''}
-                </span>
-                <span className="font-mono-num">
-                  {item.contributedAmount > 0 ? `Aportado: ${formatEUR(item.contributedAmount)}` : ''}
-                  {item.contributedAmount > 0 && item.withdrawnAmount > 0 ? ' · ' : ''}
-                  {item.withdrawnAmount > 0 ? `Retirado: ${formatEUR(item.withdrawnAmount)}` : ''}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-
-  // ─── MODO SENCILLO: TARJETA RESUMEN + ACCESO AL DETALLE ────────────────────
-  if (uiMode === 'sencillo') {
-    return (
-      <section
-        id="savings-plan-section"
-        aria-label="Plan de ahorro del mes"
-        className="rounded-3xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h2 className="font-display text-base font-bold">Plan de ahorro del mes</h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Decide cuánto apartar y sigue lo que ya habéis aportado.
-            </p>
-          </div>
-          {monthNavigator}
-        </div>
-
-        {evaluation.hasPlan ? (
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 rounded-2xl bg-slate-50 dark:bg-slate-900/50 p-3.5 tabular-nums">
-              <div>
-                <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                  Planificado
-                </span>
-                <strong className="font-display text-xl font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
-                  {formatEUR(evaluation.totalAssigned)}
-                </strong>
-                {evaluation.unassignedAmount > 0 && (
-                  <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                    +{formatEUR(evaluation.unassignedAmount)} sin asignar
-                  </span>
-                )}
-              </div>
-              <div>
-                <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                  Aportado este mes
-                </span>
-                <strong className="font-display text-xl font-bold text-[#15803D] dark:text-[#4ADE80]">
-                  {formatEUR(evaluation.totalContributedPlanned)}
-                </strong>
-              </div>
-              <div className="col-span-2 sm:col-span-1">
-                <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                  Pendiente de aportar
-                </span>
-                <strong className="font-display text-xl font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                  {formatEUR(evaluation.totalPending)}
-                </strong>
-              </div>
+          {extraSaveError && (
+            <div
+              role="alert"
+              className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3 py-2.5 text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5]"
+            >
+              {extraSaveError}
             </div>
+          )}
 
-            {evaluation.totalWithdrawnAll > 0 && (
-              <p className="text-xs font-medium text-[#B42318] dark:text-[#FCA5A5] tabular-nums">
-                Retirado este mes: {formatEUR(evaluation.totalWithdrawnAll)} (se muestra aparte de lo aportado).
-              </p>
-            )}
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setSencilloDetailOpen((prev) => !prev)}
-                className="flex-1 min-h-[46px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold inline-flex items-center justify-center gap-1.5"
-              >
-                <SlidersHorizontal className="w-4 h-4" />
-                <span>{sencilloDetailOpen ? 'Ocultar detalle' : 'Ver detalle del plan'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={openEditor}
-                className="min-h-[46px] px-4 rounded-2xl border border-slate-200 dark:border-slate-700 text-sm font-semibold inline-flex items-center justify-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
-              >
-                <Pencil className="w-4 h-4" />
-                <span>Ajustar plan</span>
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-3">
-            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 tabular-nums">
-              Aún no hay plan guardado para <span className="capitalize font-semibold">{monthLabel}</span>.
-              {evaluation.totalContributedAll > 0
-                ? ` Ya lleváis ${formatEUR(evaluation.totalContributedAll)} aportados este mes; contarán automáticamente si creáis el plan.`
-                : ''}
-            </p>
-            {evaluation.totalWithdrawnAll > 0 && (
-              <p className="text-xs font-medium text-[#B42318] dark:text-[#FCA5A5] tabular-nums">
-                Retirado este mes: {formatEUR(evaluation.totalWithdrawnAll)}.
-              </p>
-            )}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="submit"
+              disabled={savingExtra}
+              className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-semibold disabled:opacity-50"
+            >
+              {savingExtra ? 'Guardando...' : 'Guardar ahorro extra'}
+            </button>
             <button
               type="button"
-              onClick={openEditor}
-              className="w-full min-h-[48px] px-4 rounded-2xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-bold inline-flex items-center justify-center gap-2"
+              onClick={closeAllEditors}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* ─── PANEL 3: EDITOR MENSUAL («Planificar / Ajustar este mes») ─────── */}
+      {activePanel === 'month_editor' && (
+        <form
+          onSubmit={(e) => void handleSubmitMonthPlan(e)}
+          data-testid="month-savings-plan-editor"
+          className="rounded-2xl bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 p-4 space-y-4"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h3
+                ref={editorHeadingRef}
+                tabIndex={-1}
+                className="font-display text-sm sm:text-base font-bold focus:outline-none"
+              >
+                {hasSavedMonthOverride
+                  ? `Ajustar ahorro de ${monthLabel}`
+                  : `Planificar ahorro de ${monthLabel}`}
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Solo modifica este mes ({monthLabel}). No altera tu plan habitual ni meses
+                anteriores, y no registra movimientos bancarios.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={closeAllEditors}
+              className="min-h-[40px] px-3 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-800"
+            >
+              Cerrar
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-start">
+            <div className="space-y-1">
+              <label htmlFor="savings-plan-target" className="block text-xs font-semibold">
+                Cuánto apartar en {monthLabel} (€)
+              </label>
+              <input
+                id="savings-plan-target"
+                type="text"
+                inputMode="decimal"
+                value={targetInput}
+                onChange={(e) => {
+                  draftDirtyRef.current = true;
+                  setTargetInput(e.target.value);
+                  setMonthSaveError(null);
+                }}
+                placeholder="Ej. 300"
+                className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1417] text-base font-bold tabular-nums"
+              />
+              {hasIncomeConfigured && (
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                  Referencia (no se aplica sola): capacidad estimada{' '}
+                  <strong>{formatEUR(savingsCapacityRef)}/mes</strong>.
+                </p>
+              )}
+            </div>
+
+            <div className="rounded-xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-3 space-y-1 text-xs tabular-nums">
+              <div className="flex justify-between">
+                <span className="text-slate-500">Asignado a metas</span>
+                <strong className={draftOverAllocated > 0 ? 'text-[#B42318]' : ''}>
+                  {formatEUR(draftTotalAssigned)}
+                </strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Sin asignar</span>
+                <strong>{formatEUR(draftUnassigned)}</strong>
+              </div>
+              {hasPartner && draftTargetAmount > 0 && (
+                <div className="pt-1 border-t border-slate-100 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-300">
+                  Aportación prevista ahorro: {shortNameA}{' '}
+                  <strong>{formatEUR(draftShareA)}</strong> · {shortNameB}{' '}
+                  <strong>{formatEUR(draftShareB)}</strong>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Botón «Proponer reparto» — siempre habilitado con diagnóstico claro si falta algún dato */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <p className="text-xs text-slate-600 dark:text-slate-300 max-w-xl">
+              {SAVINGS_PLAN_RULE_ONE_LINER}
+            </p>
+            <button
+              type="button"
+              onClick={handleProposeDistribution}
+              data-testid="propose-savings-distribution-btn"
+              className="min-h-[44px] px-4 rounded-xl border border-[#0E5A64] bg-[#0E5A64]/10 hover:bg-[#0E5A64]/18 text-[#0E5A64] dark:text-[#5EEAD4] text-xs font-bold inline-flex items-center gap-1.5 shrink-0"
             >
               <Sparkles className="w-4 h-4" />
-              <span>Planificar el ahorro del mes</span>
+              <span>Proponer reparto</span>
             </button>
           </div>
-        )}
 
-        {sencilloDetailOpen && !editorOpen && evaluation.hasPlan && (
-          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-3">
-            {evaluationRowsList}
-          </div>
-        )}
-
-        {editorOpen && editorForm}
-      </section>
-    );
-  }
-
-  // ─── MODO AVANZADO: EDITOR COMPLETO, PRIORIDADES Y DESVIACIONES ────────────
-  return (
-    <section
-      id="savings-plan-section"
-      aria-label="Plan de ahorro mensual"
-      className="rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4"
-    >
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div>
-          <h2 className="font-display text-base sm:text-lg font-bold">Plan de ahorro del mes</h2>
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            Organiza prioridades y compara lo planificado frente a las aportaciones reales del mes.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {monthNavigator}
-          {!editorOpen && (
-            <button
-              type="button"
-              onClick={openEditor}
-              className="min-h-[44px] px-4 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-1.5"
-            >
-              {existingPlan ? <Pencil className="w-4 h-4" /> : <Sparkles className="w-4 h-4" />}
-              <span>{existingPlan ? 'Editar plan' : 'Planificar el ahorro del mes'}</span>
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Quick switch to saved historical months when > 1 */}
-      {historicalMonths.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 text-xs">
-          <span className="text-slate-500 dark:text-slate-400">Planes guardados:</span>
-          {historicalMonths.slice(0, 6).map((mk) => (
-            <button
-              key={mk}
-              type="button"
-              onClick={() => onChangeMonthKey(mk)}
-              className={`min-h-[36px] px-2.5 rounded-lg border text-xs font-semibold capitalize ${
-                mk === planMonthKey
-                  ? 'border-[#0E5A64] bg-[#0E5A64]/10 text-[#0E5A64] dark:text-[#5EEAD4]'
-                  : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+          {/* Feedback explícito y siempre visible de «Proponer reparto» */}
+          {proposalFeedback && (
+            <div
+              role="status"
+              data-testid="proposal-feedback-banner"
+              className={`rounded-xl px-3.5 py-2.5 text-xs flex items-start gap-2 border ${
+                proposalFeedback.tone === 'warning'
+                  ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-950 dark:text-amber-200'
+                  : proposalFeedback.tone === 'success'
+                    ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-950 dark:text-emerald-200'
+                    : 'bg-sky-50 dark:bg-sky-950/30 border-sky-200 dark:border-sky-800 text-sky-950 dark:text-sky-200'
               }`}
             >
-              {formatMonthLabelES(mk)}
+              <Info className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{proposalFeedback.text}</span>
+            </div>
+          )}
+
+          {/* Lista editable de metas en orden de prioridad */}
+          <div className="space-y-2">
+            {!goalsLoaded && draftItems.length === 0 ? (
+              <p className="text-xs text-slate-500 dark:text-slate-400">Cargando metas...</p>
+            ) : draftItems.length === 0 ? (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                No tienes metas activas pendientes de completar. Crea una meta en esta pantalla para
+                asignarle ahorro.
+              </p>
+            ) : (
+              draftItems.map((it, idx) => {
+                const goal = goalsById.get(it.goalId);
+                const progress = goal ? computeGoalProgress(goal, goalMovements, todayISO) : null;
+                const hasTargetAmount = goal ? goal.targetAmount > 0 : false;
+                const label = goal?.name || it.goalNameSnapshot || 'Meta';
+                return (
+                  <div
+                    key={it.goalId}
+                    className={`rounded-xl border p-3 flex flex-wrap items-center justify-between gap-2.5 transition-colors ${
+                      it.selected
+                        ? 'bg-white dark:bg-[#132025] border-slate-200 dark:border-slate-700'
+                        : 'bg-slate-100/60 dark:bg-slate-900/40 border-slate-200/60 dark:border-slate-800 opacity-75'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                      <input
+                        type="checkbox"
+                        aria-label={`Incluir ${label} en el plan`}
+                        checked={it.selected}
+                        onChange={() => handleToggleDraftGoal(it.goalId)}
+                        className="w-5 h-5 mt-0.5 accent-[#0E5A64] shrink-0"
+                      />
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-[11px] font-bold text-slate-400 tabular-nums">
+                            #{idx + 1}
+                          </span>
+                          <span className="text-sm font-bold truncate">{label}</span>
+                          {it.isHistoricalExtra && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                              Histórica
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                          {!goal
+                            ? 'Meta eliminada'
+                            : !hasTargetAmount
+                              ? 'Sin importe objetivo · asignación manual'
+                              : progress?.isCompleted
+                                ? 'Meta completada'
+                                : `Faltan ${formatEUR(progress?.remaining ?? 0)}${
+                                    progress?.monthlyNeeded
+                                      ? ` · Ref. fecha: ${formatEUR(progress.monthlyNeeded)}/mes`
+                                      : ' · Sin fecha límite'
+                                  }`}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        disabled={idx === 0}
+                        onClick={() => handleMoveDraftGoal(idx, -1)}
+                        aria-label={`Subir ${label}`}
+                        className="min-h-[40px] min-w-[40px] rounded-lg border border-slate-200 dark:border-slate-700 flex items-center justify-center disabled:opacity-30"
+                      >
+                        <ArrowUp className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={idx === draftItems.length - 1}
+                        onClick={() => handleMoveDraftGoal(idx, 1)}
+                        aria-label={`Bajar ${label}`}
+                        className="min-h-[40px] min-w-[40px] rounded-lg border border-slate-200 dark:border-slate-700 flex items-center justify-center disabled:opacity-30"
+                      >
+                        <ArrowDown className="w-4 h-4" />
+                      </button>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        disabled={!it.selected}
+                        aria-label={`Importe mensual para ${label} (€)`}
+                        value={it.amountInput}
+                        onChange={(e) => handleChangeDraftAmount(it.goalId, e.target.value)}
+                        className="w-24 min-h-[40px] px-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1417] text-sm font-bold text-right tabular-nums disabled:opacity-40"
+                      />
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {monthSaveError && (
+            <div
+              role="alert"
+              data-testid="month-plan-save-error"
+              className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 px-3.5 py-2.5 text-xs font-semibold text-[#B42318] dark:text-[#FCA5A5] flex items-start gap-2"
+            >
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{monthSaveError}</span>
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              type="submit"
+              disabled={savingMonth}
+              data-testid="save-month-savings-plan-btn"
+              className="min-h-[44px] px-5 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-semibold disabled:opacity-50"
+            >
+              {savingMonth ? 'Guardando...' : `Guardar plan de ${monthLabel}`}
             </button>
-          ))}
-        </div>
+            <button
+              type="button"
+              onClick={closeAllEditors}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
       )}
 
-      {editorOpen && editorForm}
-
-      {!editorOpen && evaluation.hasPlan && (
-        <div className="space-y-4">
-          {/* Summary metrics */}
-          <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 tabular-nums">
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 p-3">
-              <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                Reservado para el mes
-              </span>
-              <strong className="font-mono-num text-lg font-bold">
+      {/* ─── VISTA RESUMEN Y SEGUIMIENTO DE METAS DEL MES ───────────────────── */}
+      {evaluation.hasPlan ? (
+        <div className="space-y-3">
+          {/* Métricas rápidas */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs tabular-nums">
+            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 p-3">
+              <p className="text-[11px] text-slate-500">Previsto este mes</p>
+              <p className="font-display text-base font-bold text-[#0F1F24] dark:text-[#F0F5F6]">
                 {formatEUR(evaluation.targetAmount)}
-              </strong>
+              </p>
             </div>
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 p-3">
-              <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                Planificado en metas
-              </span>
-              <strong className="font-mono-num text-lg font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                {formatEUR(evaluation.totalAssigned)}
-              </strong>
+            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 p-3">
+              <p className="text-[11px] text-slate-500">Aportado este mes</p>
+              <p className="font-display text-base font-bold text-[#15803D] dark:text-[#4ADE80]">
+                {formatEUR(evaluation.totalContributedAll)}
+              </p>
             </div>
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 p-3">
-              <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                {evaluation.overAllocatedAmount > 0 ? 'Exceso asignado' : 'Sin asignar'}
-              </span>
-              <strong
-                className={`font-mono-num text-lg font-bold ${
-                  evaluation.overAllocatedAmount > 0 ? 'text-[#B42318] dark:text-[#FCA5A5]' : ''
-                }`}
-              >
-                {evaluation.overAllocatedAmount > 0
-                  ? `+${formatEUR(evaluation.overAllocatedAmount)}`
-                  : formatEUR(evaluation.unassignedAmount)}
-              </strong>
-            </div>
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 p-3">
-              <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                Aportado real
-              </span>
-              <strong className="font-mono-num text-lg font-bold text-[#15803D] dark:text-[#4ADE80]">
-                {formatEUR(evaluation.totalContributedPlanned)}
-              </strong>
-              {evaluation.totalExcess > 0 && (
-                <span className="block text-[11px] font-medium text-[#15803D] dark:text-[#4ADE80]">
-                  +{formatEUR(evaluation.totalExcess)} sobre plan
-                </span>
-              )}
-            </div>
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200/80 dark:border-slate-800 p-3 col-span-2 lg:col-span-1">
-              <span className="block text-[11px] text-slate-500 dark:text-slate-400">
-                Pendiente de aportar
-              </span>
-              <strong className="font-mono-num text-lg font-bold">
+            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 p-3">
+              <p className="text-[11px] text-slate-500">Pendiente en metas</p>
+              <p className="font-display text-base font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
                 {formatEUR(evaluation.totalPending)}
-              </strong>
+              </p>
+            </div>
+            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/80 dark:border-slate-800 p-3">
+              <p className="text-[11px] text-slate-500">Sin asignar</p>
+              <p className="font-display text-base font-bold text-slate-700 dark:text-slate-200">
+                {formatEUR(evaluation.unassignedAmount)}
+              </p>
             </div>
           </div>
 
-          {evaluation.totalWithdrawnAll > 0 && (
-            <div className="rounded-xl bg-red-50/70 dark:bg-red-950/25 border border-red-200 dark:border-red-900/60 px-3.5 py-2.5 text-xs text-[#B42318] dark:text-[#FCA5A5] tabular-nums">
-              <strong>Retirado en {monthLabel}: {formatEUR(evaluation.totalWithdrawnAll)}</strong>. Las retiradas se muestran aparte para no distorsionar lo aportado frente al plan.
+          {/* Filas por meta */}
+          {evaluation.rows.length > 0 && (
+            <div className="space-y-2">
+              {evaluation.rows.map((row) => {
+                const badge = STATUS_BADGES[row.status];
+                const goalObj = goalsById.get(row.goalId);
+                return (
+                  <div
+                    key={row.goalId}
+                    className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0E191D] p-3.5 space-y-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span
+                          className="w-3 h-3 rounded-full shrink-0"
+                          style={{ backgroundColor: row.goalColor }}
+                        />
+                        <span className="font-semibold text-sm truncate">{row.goalName}</span>
+                        {row.isArchived && (
+                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                            Archivada
+                          </span>
+                        )}
+                        <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${badge.className}`}>
+                          {badge.label}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="text-xs font-bold tabular-nums">
+                          {formatEUR(row.contributedAmount)} / {formatEUR(row.plannedAmount)}
+                        </span>
+                        {goalObj && !goalObj.archived && row.pendingAmount > 0 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onContributePending(goalObj, row.pendingAmount, planMonthKey)
+                            }
+                            className="min-h-[40px] px-3 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-xs font-semibold"
+                          >
+                            Aportar pendiente ({formatEUR(row.pendingAmount)})
+                          </button>
+                        )}
+                        {row.pendingAmount === 0 && row.plannedAmount > 0 && (
+                          <CheckCircle2 className="w-4 h-4 text-[#15803D] dark:text-[#4ADE80]" />
+                        )}
+                      </div>
+                    </div>
+
+                    {row.plannedAmount > 0 && (
+                      <div className="h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all"
+                          style={{
+                            width: `${Math.min(100, row.progressPct)}%`,
+                            backgroundColor: row.goalColor,
+                          }}
+                        />
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                      <span>
+                        {row.excessAmount > 0
+                          ? `Superado en +${formatEUR(row.excessAmount)}`
+                          : row.pendingAmount > 0
+                            ? `Faltan ${formatEUR(row.pendingAmount)}`
+                            : row.plannedAmount > 0
+                              ? 'Objetivo mensual cumplido'
+                              : 'Sin asignación este mes'}
+                        {uiMode === 'avanzado' && row.recommendedAmount !== null
+                          ? ` · Ref. por fecha: ${formatEUR(row.recommendedAmount)}/mes`
+                          : ''}
+                      </span>
+                      {row.withdrawnAmount > 0 && (
+                        <span className="text-[#B42318] dark:text-[#FCA5A5]">
+                          Retirado este mes: −{formatEUR(row.withdrawnAmount)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
 
-          {evaluation.underfundedRows.length > 0 && (
-            <div className="rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 px-3.5 py-2.5 text-xs text-amber-900 dark:text-amber-200 tabular-nums">
-              <span className="font-semibold">Desviación frente a cuotas recomendadas: </span>
-              {evaluation.underfundedRows
-                .map((r) => `${r.goalName} (-${formatEUR(r.belowRecommendedBy)})`)
-                .join(' · ')}
+          {/* Actividad no planificada en el mes */}
+          {evaluation.unplannedActivity.length > 0 && (
+            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 p-3 text-xs space-y-1">
+              <p className="font-semibold text-slate-700 dark:text-slate-200">
+                Otras aportaciones en {monthLabel} fuera del plan:
+              </p>
+              <ul className="space-y-0.5 text-slate-600 dark:text-slate-300 tabular-nums">
+                {evaluation.unplannedActivity.map((u) => (
+                  <li key={u.goalId} className="flex justify-between gap-2">
+                    <span>{u.goalName}</span>
+                    <span>
+                      +{formatEUR(u.contributedAmount)}
+                      {u.withdrawnAmount > 0 ? ` · −${formatEUR(u.withdrawnAmount)}` : ''}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
-
-          {evaluationRowsList}
         </div>
+      ) : (
+        activePanel === 'none' && (
+          <div className="rounded-2xl bg-slate-50 dark:bg-slate-900/50 border border-dashed border-slate-300 dark:border-slate-700 p-4 text-xs text-slate-600 dark:text-slate-300 space-y-1.5">
+            <p className="font-semibold text-[#0F1F24] dark:text-[#F0F5F6]">
+              Todavía no hay un plan de ahorro para {monthLabel}.
+            </p>
+            <p>
+              Puedes crear un <strong>plan habitual</strong> (se aplica automáticamente cada mes por
+              orden de prioridad) o pulsar <strong>«Planificar ahorro del mes»</strong> para decidir
+              cuánto apartar solo en {monthLabel}.
+            </p>
+          </div>
+        )
       )}
 
-      {!editorOpen && !evaluation.hasPlan && (
-        <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 p-4 text-xs sm:text-sm text-slate-600 dark:text-slate-300 space-y-1.5">
-          <p>
-            No hay ningún plan de ahorro guardado para{' '}
-            <span className="capitalize font-semibold">{monthLabel}</span>. Pulsa{' '}
-            <strong>«Planificar el ahorro del mes»</strong> para decidir cuánto apartar, priorizar metas y proponer un reparto.
-          </p>
-          {evaluation.totalContributedAll > 0 && (
-            <p className="text-xs text-[#15803D] dark:text-[#4ADE80] font-medium tabular-nums">
-              Aportaciones reales ya registradas en {monthLabel}: {formatEUR(evaluation.totalContributedAll)} (contarán automáticamente en cuanto guardes el plan).
-            </p>
-          )}
-          {evaluation.totalWithdrawnAll > 0 && (
-            <p className="text-xs text-[#B42318] dark:text-[#FCA5A5] font-medium tabular-nums">
-              Retiradas registradas en {monthLabel}: {formatEUR(evaluation.totalWithdrawnAll)}.
-            </p>
-          )}
-        </div>
-      )}
+      {/* Diálogo de confirmación para «Volver al plan habitual» / «Eliminar plan del mes» */}
+      <ConfirmDialog
+        open={confirmRevertOpen}
+        title={
+          hasHabitualConfigured
+            ? `¿Volver al plan habitual en ${monthLabel}?`
+            : `¿Eliminar el plan guardado de ${monthLabel}?`
+        }
+        description={
+          hasHabitualConfigured
+            ? `Se quitará el ajuste específico de ${monthLabel} y volverá a aplicarse la propuesta de vuestro plan habitual (${formatEUR(habitualPlan!.monthlyAmount)}/mes). Las aportaciones reales registradas en vuestras huchas nunca se borran.`
+            : `Se eliminará la planificación de ${monthLabel}. Las aportaciones reales registradas en vuestras huchas nunca se borran.`
+        }
+        confirmLabel={
+          deletingPlan
+            ? 'Quitando...'
+            : hasHabitualConfigured
+              ? 'Volver al plan habitual'
+              : 'Eliminar plan'
+        }
+        destructive
+        onConfirm={() => void handleConfirmDeleteMonthPlan()}
+        onCancel={() => setConfirmRevertOpen(false)}
+      />
     </section>
   );
 };

@@ -73,6 +73,34 @@
           "type": "object",
           "description": "Split configuration and currency settings."
         },
+        "incomeConfig": {
+          "type": ["object", "null"],
+          "description": "Optional detailed net income configuration (quick vs detailed with ordinary paychecks, extra paychecks, and other incomes) per member.",
+          "properties": {
+            "memberA": { "type": "object" },
+            "memberB": { "type": "object" },
+            "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "updatedAt": { "type": "string", "minLength": 1, "maxLength": 64 }
+          },
+          "required": ["memberA", "memberB", "updatedBy", "updatedAt"],
+          "additionalProperties": false
+        },
+        "habitualSavingsPlan": {
+          "type": ["object", "null"],
+          "description": "Optional recurring household habitual savings plan with manual monthly target and goal priority order.",
+          "properties": {
+            "monthlyAmount": { "type": "number", "minimum": 0 },
+            "priorityGoalIds": {
+              "type": "array",
+              "maxItems": 50,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "updatedAt": { "type": "string", "minLength": 1, "maxLength": 64 }
+          },
+          "required": ["monthlyAmount", "priorityGoalIds", "updatedBy", "updatedAt"],
+          "additionalProperties": false
+        },
         "csvKeywords": {
           "type": "object",
           "description": "Optional comma-separated keyword rules keyed by the 13 ExpenseCategory keys for bank CSV auto-categorization.",
@@ -1049,6 +1077,16 @@
           "type": "array",
           "description": "Ordered allocations by goalId (max 50 items).",
           "maxItems": 50
+        },
+        "adjustmentKind": {
+          "type": "string",
+          "enum": ["ajuste", "extra"],
+          "description": "Optional indicator distinguishing a monthly adjustment from an explicit extra savings addition."
+        },
+        "extraAmount": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Optional explicit extra savings amount added on top of the month base plan."
         },
         "updatedBy": {
           "type": "string",

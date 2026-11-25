@@ -119,6 +119,16 @@ export function roundCents(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+export function toCents(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round((value + Number.EPSILON) * 100);
+}
+
+export function fromCents(cents: number): number {
+  if (!Number.isFinite(cents)) return 0;
+  return Math.round(cents) / 100;
+}
+
 // ─── Split Formula ───────────────────────────────────────────────────────────
 
 export function clampSplitPct(value: unknown, fallback = 50): number {

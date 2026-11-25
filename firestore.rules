@@ -231,10 +231,76 @@ service cloud.firestore {
         );
     }
 
+    function isValidMemberIncomeProfile(p) {
+      return p is map
+        && p.keys().hasAll(['mode', 'quickMonthlyNet', 'ordinaryPayAmount', 'ordinaryPayCount', 'extraPaychecks', 'otherIncomes'])
+        && p.keys().hasOnly(['mode', 'quickMonthlyNet', 'ordinaryPayAmount', 'ordinaryPayCount', 'extraPaychecks', 'otherIncomes'])
+        && (p.mode in ['rapida', 'detallada'])
+        && isNonNegNumber(p.quickMonthlyNet)
+        && isNonNegNumber(p.ordinaryPayAmount)
+        && p.ordinaryPayCount is int && p.ordinaryPayCount >= 0 && p.ordinaryPayCount <= 24
+        && p.extraPaychecks is list && p.extraPaychecks.size() <= 12
+        && (
+          p.extraPaychecks.size() == 0
+          || (
+            p.extraPaychecks[0] is map
+            && p.extraPaychecks[0].keys().hasAll(['id', 'label', 'amount'])
+            && p.extraPaychecks[0].keys().hasOnly(['id', 'label', 'amount', 'expectedMonth'])
+            && p.extraPaychecks[0].id is string && p.extraPaychecks[0].id.size() >= 1 && p.extraPaychecks[0].id.size() <= 48
+            && p.extraPaychecks[0].label is string && p.extraPaychecks[0].label.size() >= 1 && p.extraPaychecks[0].label.size() <= 60
+            && isNonNegNumber(p.extraPaychecks[0].amount)
+            && (!('expectedMonth' in p.extraPaychecks[0]) || p.extraPaychecks[0].expectedMonth == null || (p.extraPaychecks[0].expectedMonth is int && p.extraPaychecks[0].expectedMonth >= 1 && p.extraPaychecks[0].expectedMonth <= 12))
+          )
+        )
+        && p.otherIncomes is list && p.otherIncomes.size() <= 20
+        && (
+          p.otherIncomes.size() == 0
+          || (
+            p.otherIncomes[0] is map
+            && p.otherIncomes[0].keys().hasAll(['id', 'concept', 'amount', 'frequency', 'kind', 'includeInAnnualEstimate'])
+            && p.otherIncomes[0].keys().hasOnly(['id', 'concept', 'amount', 'frequency', 'kind', 'includeInAnnualEstimate'])
+            && p.otherIncomes[0].id is string && p.otherIncomes[0].id.size() >= 1 && p.otherIncomes[0].id.size() <= 48
+            && p.otherIncomes[0].concept is string && p.otherIncomes[0].concept.size() >= 1 && p.otherIncomes[0].concept.size() <= 80
+            && isNonNegNumber(p.otherIncomes[0].amount)
+            && (p.otherIncomes[0].frequency in ['mensual', 'trimestral', 'semestral', 'anual', 'puntual'])
+            && (p.otherIncomes[0].kind in ['recurrente', 'puntual_o_incierto'])
+            && p.otherIncomes[0].includeInAnnualEstimate is bool
+          )
+        );
+    }
+
+    function isValidIncomeConfig(cfg) {
+      return cfg == null
+        || (
+          cfg is map
+          && cfg.keys().hasAll(['memberA', 'memberB', 'updatedBy', 'updatedAt'])
+          && cfg.keys().hasOnly(['memberA', 'memberB', 'updatedBy', 'updatedAt'])
+          && isValidMemberIncomeProfile(cfg.memberA)
+          && isValidMemberIncomeProfile(cfg.memberB)
+          && cfg.updatedBy is string && cfg.updatedBy.size() >= 1 && cfg.updatedBy.size() <= 128
+          && cfg.updatedAt is string && cfg.updatedAt.size() >= 1 && cfg.updatedAt.size() <= 64
+        );
+    }
+
+    function isValidHabitualSavingsPlan(plan) {
+      return plan == null
+        || (
+          plan is map
+          && plan.keys().hasAll(['monthlyAmount', 'priorityGoalIds', 'updatedBy', 'updatedAt'])
+          && plan.keys().hasOnly(['monthlyAmount', 'priorityGoalIds', 'updatedBy', 'updatedAt'])
+          && isNonNegNumber(plan.monthlyAmount)
+          && plan.priorityGoalIds is list && plan.priorityGoalIds.size() <= 50
+          && (plan.priorityGoalIds.size() == 0 || isValidId(plan.priorityGoalIds[0]))
+          && plan.updatedBy is string && plan.updatedBy.size() >= 1 && plan.updatedBy.size() <= 128
+          && plan.updatedAt is string && plan.updatedAt.size() >= 1 && plan.updatedAt.size() <= 64
+        );
+    }
+
     function isValidHousehold(data) {
       return data.keys().hasAll(['name', 'memberUids', 'inviteCode', 'settings', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly([
-          'name', 'memberUids', 'inviteCode', 'settings', 'csvKeywords', 'categoryColors',
+          'name', 'memberUids', 'inviteCode', 'settings', 'incomeConfig', 'habitualSavingsPlan',
+          'csvKeywords', 'categoryColors',
           'commonAccountPlannedCategories', 'commonAccountManualBalance',
           'mudanzaCompleted', 'mudanzaCompletedAt', 'mudanzaCompletedBy',
           'seedPending', 'recurringSeedVersion', 'createdAt', 'updatedAt'
@@ -246,6 +312,8 @@ service cloud.firestore {
         && (data.memberUids.size() == 1 || (data.memberUids[1] is string && data.memberUids[1].size() >= 1 && data.memberUids[1].size() <= 128 && data.memberUids[1] != data.memberUids[0]))
         && isValidInviteCode(data.inviteCode)
         && isValidSettings(data.settings)
+        && (!('incomeConfig' in data) || isValidIncomeConfig(data.incomeConfig))
+        && (!('habitualSavingsPlan' in data) || isValidHabitualSavingsPlan(data.habitualSavingsPlan))
         && (!('csvKeywords' in data) || isValidCsvKeywords(data.csvKeywords))
         && (!('categoryColors' in data) || isValidCategoryColors(data.categoryColors))
         && (!('commonAccountPlannedCategories' in data) || isValidCommonAccountPlannedCategories(data.commonAccountPlannedCategories))
@@ -456,10 +524,12 @@ service cloud.firestore {
 
     function isValidSavingsPlan(data, monthKey) {
       return data.keys().hasAll(['monthKey', 'targetAmount', 'allocations', 'updatedBy', 'updatedAt'])
-        && data.keys().hasOnly(['monthKey', 'targetAmount', 'allocations', 'updatedBy', 'updatedAt'])
+        && data.keys().hasOnly(['monthKey', 'targetAmount', 'allocations', 'adjustmentKind', 'extraAmount', 'updatedBy', 'updatedAt'])
         && data.monthKey == monthKey
         && isValidMonthKey(data.monthKey)
         && isNonNegNumber(data.targetAmount)
+        && (!('adjustmentKind' in data) || (data.adjustmentKind in ['ajuste', 'extra']))
+        && (!('extraAmount' in data) || isNonNegNumber(data.extraAmount))
         && data.allocations is list && data.allocations.size() <= 50
         && (
           data.allocations.size() == 0
@@ -678,7 +748,12 @@ service cloud.firestore {
           // Action 1: Update household settings or name by existing member
           (
             (request.auth.uid in existing().memberUids)
-            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'settings', 'updatedAt'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'settings', 'incomeConfig', 'updatedAt'])
+            && (
+              !('incomeConfig' in incoming().diff(existing()).affectedKeys())
+              || incoming().incomeConfig == null
+              || incoming().incomeConfig.updatedBy == request.auth.uid
+            )
           )
           ||
           // Action 2: Rotate invite code by existing member
@@ -757,6 +832,16 @@ service cloud.firestore {
                 && (!('mudanzaCompletedAt' in incoming()) || incoming().mudanzaCompletedAt == null)
                 && (!('mudanzaCompletedBy' in incoming()) || incoming().mudanzaCompletedBy == null)
               )
+            )
+          )
+          ||
+          // Action 10: Update or clear shared habitual savings plan by existing member
+          (
+            (request.auth.uid in existing().memberUids)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['habitualSavingsPlan', 'updatedAt'])
+            && (
+              incoming().habitualSavingsPlan == null
+              || incoming().habitualSavingsPlan.updatedBy == request.auth.uid
             )
           )
         );
@@ -985,7 +1070,7 @@ service cloud.firestore {
           && isValidSavingsPlan(incoming(), monthKey)
           && isHouseholdMember(hid)
           && incoming().monthKey == existing().monthKey
-          && incoming().diff(existing()).affectedKeys().hasOnly(['targetAmount', 'allocations', 'updatedBy', 'updatedAt']);
+          && incoming().diff(existing()).affectedKeys().hasOnly(['targetAmount', 'allocations', 'adjustmentKind', 'extraAmount', 'updatedBy', 'updatedAt']);
         allow delete: if isValidId(hid) && isValidMonthKey(monthKey) && isHouseholdMember(hid);
       }
 

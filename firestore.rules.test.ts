@@ -2761,6 +2761,210 @@ test('27. Fin de etapa de mudanza (Acción 9): completar/reabrir compartido, ant
   );
 });
 
+// ─── 28. incomeConfig, habitualSavingsPlan y savingsPlans con extra ─────────
+test('28. incomeConfig, habitualSavingsPlan y savingsPlans (ajuste/extra): validación estricta y anti-suplantación', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'INC28A');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+
+  const joinBatch = dbMarta.batch();
+  joinBatch.set(dbMarta.doc('users/uid_marta'), {
+    householdId: 'h1',
+    displayName: 'Marta',
+    photoURL: '',
+    updatedAt: ts,
+  });
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: ['uid_alex', 'uid_marta'],
+    updatedAt: ts,
+  });
+  await assertSucceeds(joinBatch.commit());
+
+  const validIncomeConfig = {
+    memberA: {
+      mode: 'detallada',
+      quickMonthlyNet: 1500,
+      ordinaryPayAmount: 1500,
+      ordinaryPayCount: 12,
+      extraPaychecks: [
+        { id: 'ex_1', label: 'Verano', amount: 1400, expectedMonth: 6 },
+        { id: 'ex_2', label: 'Navidad', amount: 1600, expectedMonth: 12 },
+      ],
+      otherIncomes: [
+        {
+          id: 'oth_1',
+          concept: 'Bonus anual',
+          amount: 600,
+          frequency: 'anual',
+          kind: 'puntual_o_incierto',
+          includeInAnnualEstimate: false,
+        },
+      ],
+    },
+    memberB: {
+      mode: 'rapida',
+      quickMonthlyNet: 1500,
+      ordinaryPayAmount: 1500,
+      ordinaryPayCount: 12,
+      extraPaychecks: [],
+      otherIncomes: [],
+    },
+    updatedBy: 'uid_alex',
+    updatedAt: '2026-11-25T12:00:00.000Z',
+  };
+
+  // Miembro puede guardar settings + incomeConfig atómicamente
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      settings: {
+        splitMode: 'income',
+        presetA: 50,
+        presetB: 50,
+        incomeA: 1750,
+        incomeB: 1500,
+        currency: 'EUR',
+      },
+      incomeConfig: validIncomeConfig,
+      updatedAt: ts,
+    })
+  );
+
+  // Marta puede actualizar solo settings sin que falle por incomeConfig.updatedBy del compañero
+  await assertSucceeds(
+    dbMarta.doc('households/h1').update({
+      settings: {
+        splitMode: 'preset',
+        presetA: 60,
+        presetB: 40,
+        incomeA: 1750,
+        incomeB: 1500,
+        currency: 'EUR',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza suplantar updatedBy en incomeConfig
+  await assertFails(
+    dbMarta.doc('households/h1').update({
+      incomeConfig: { ...validIncomeConfig, updatedBy: 'uid_alex' },
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza ordinaryPayCount fuera de rango (> 24) o frequency desconocida
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      incomeConfig: {
+        ...validIncomeConfig,
+        memberA: { ...validIncomeConfig.memberA, ordinaryPayCount: 30 },
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Miembro puede guardar habitualSavingsPlan válido
+  await assertSucceeds(
+    dbAlex.doc('households/h1').update({
+      habitualSavingsPlan: {
+        monthlyAmount: 300,
+        priorityGoalIds: ['g_colchon', 'g_comun'],
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-25T12:05:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza suplantar updatedBy o mezclar inviteCode en habitualSavingsPlan
+  await assertFails(
+    dbMarta.doc('households/h1').update({
+      habitualSavingsPlan: {
+        monthlyAmount: 400,
+        priorityGoalIds: ['g_colchon'],
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-25T12:06:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      habitualSavingsPlan: {
+        monthlyAmount: 300,
+        priorityGoalIds: ['g_colchon'],
+        updatedBy: 'uid_alex',
+        updatedAt: '2026-11-25T12:06:00.000Z',
+      },
+      inviteCode: 'HACK28',
+      updatedAt: ts,
+    })
+  );
+
+  // savingsPlans/{monthKey} con adjustmentKind='extra' y extraAmount válido -> permitido crear y actualizar
+  await assertSucceeds(
+    dbAlex.doc('households/h1/savingsPlans/2026-12').set({
+      monthKey: '2026-12',
+      targetAmount: 500,
+      allocations: [
+        { goalId: 'g_colchon', plannedAmount: 120, priority: 0, goalNameSnapshot: 'Colchón' },
+        { goalId: 'g_comun', plannedAmount: 380, priority: 1, goalNameSnapshot: 'Ahorro común' },
+      ],
+      adjustmentKind: 'extra',
+      extraAmount: 200,
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertSucceeds(
+    dbMarta.doc('households/h1/savingsPlans/2026-12').set({
+      monthKey: '2026-12',
+      targetAmount: 350,
+      allocations: [
+        { goalId: 'g_colchon', plannedAmount: 150, priority: 0, goalNameSnapshot: 'Colchón' },
+        { goalId: 'g_comun', plannedAmount: 200, priority: 1, goalNameSnapshot: 'Ahorro común' },
+      ],
+      adjustmentKind: 'ajuste',
+      updatedBy: 'uid_marta',
+      updatedAt: ts,
+    })
+  );
+
+  // Rechaza adjustmentKind inválido o intruso
+  await assertFails(
+    dbAlex.doc('households/h1/savingsPlans/2026-12').set({
+      monthKey: '2026-12',
+      targetAmount: 350,
+      allocations: [],
+      adjustmentKind: 'inventado',
+      updatedBy: 'uid_alex',
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      habitualSavingsPlan: {
+        monthlyAmount: 100,
+        priorityGoalIds: [],
+        updatedBy: 'uid_intruder',
+        updatedAt: '2026-11-25T12:10:00.000Z',
+      },
+      updatedAt: ts,
+    })
+  );
+});
+
+
 
 
 

@@ -20,6 +20,7 @@ import {
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import { CategoryManagerSection } from '../components/ajustes/CategoryManagerSection';
+import { DetailedIncomeEditor } from '../components/ajustes/DetailedIncomeEditor';
 import { CategoryColorModal } from '../components/mensual/CategoryColorModal';
 import { useNido } from '../context/NidoContext';
 import {
@@ -56,11 +57,22 @@ import {
   countPendingMudanzaItems,
   isMudanzaCompleted,
 } from '../domain/mudanzaStage';
+import {
+  computeMemberIncomeSummary,
+  createDefaultHouseholdIncomeConfig,
+  sanitizeHouseholdIncomeConfig,
+} from '../domain/incomeProfile';
 import { SPLIT_PRESETS } from '../domain/presets';
 import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
-import type { HouseholdSettings, NidoBackupV1, SplitMode } from '../types/nido';
+import type {
+  HouseholdIncomeConfig,
+  HouseholdSettings,
+  MemberIncomeProfile,
+  NidoBackupV1,
+  SplitMode,
+} from '../types/nido';
 
 export const AjustesView: React.FC = () => {
   const {
@@ -94,8 +106,12 @@ export const AjustesView: React.FC = () => {
 
   const [splitMode, setSplitMode] = useState<SplitMode>('preset');
   const [presetA, setPresetA] = useState(50);
-  const [incomeA, setIncomeA] = useState('2000');
-  const [incomeB, setIncomeB] = useState('2000');
+  const [incomeProfileA, setIncomeProfileA] = useState<MemberIncomeProfile>(() =>
+    createDefaultHouseholdIncomeConfig({ incomeA: 2000, incomeB: 2000 }).memberA
+  );
+  const [incomeProfileB, setIncomeProfileB] = useState<MemberIncomeProfile>(() =>
+    createDefaultHouseholdIncomeConfig({ incomeA: 2000, incomeB: 2000 }).memberB
+  );
   const [householdName, setHouseholdName] = useState('');
   const [copied, setCopied] = useState(false);
   const [switchInviteCode, setSwitchInviteCode] = useState('');
@@ -181,17 +197,23 @@ export const AjustesView: React.FC = () => {
     if (!household) return;
     setSplitMode(household.settings.splitMode);
     setPresetA(household.settings.presetA);
-    setIncomeA(String(household.settings.incomeA || ''));
-    setIncomeB(String(household.settings.incomeB || ''));
+    const resolvedConfig =
+      sanitizeHouseholdIncomeConfig(household.incomeConfig, household.settings) ??
+      createDefaultHouseholdIncomeConfig(household.settings);
+    setIncomeProfileA(resolvedConfig.memberA);
+    setIncomeProfileB(resolvedConfig.memberB);
     setHouseholdName(household.name);
   }, [household]);
+
+  const incomeSummaryA = computeMemberIncomeSummary(incomeProfileA, incomeProfileA.quickMonthlyNet);
+  const incomeSummaryB = computeMemberIncomeSummary(incomeProfileB, incomeProfileB.quickMonthlyNet);
 
   const draftSettings: HouseholdSettings = {
     splitMode,
     presetA,
     presetB: Math.round((100 - presetA) * 10) / 10,
-    incomeA: Math.max(0, Number(incomeA.replace(',', '.')) || 0),
-    incomeB: Math.max(0, Number(incomeB.replace(',', '.')) || 0),
+    incomeA: incomeSummaryA.monthlyAverageEquivalent,
+    incomeB: incomeSummaryB.monthlyAverageEquivalent,
     currency: 'EUR',
   };
 
@@ -211,9 +233,18 @@ export const AjustesView: React.FC = () => {
   const handleSaveSplit = async () => {
     if (!householdId || !currentUserProfile) return;
     try {
-      const summary = `Actualizó el reparto a ${previewPctA}% / ${previewPctB}% (${splitMode === 'income' ? 'proporcional al salario' : splitMode === 'preset' ? 'predefinido' : 'personalizado'})`;
-      await repo.updateSettings(householdId, draftSettings, currentUserProfile, summary);
-      showToast('Reparto guardado y sincronizado');
+      const nextIncomeConfig: HouseholdIncomeConfig = {
+        memberA: incomeProfileA,
+        memberB: incomeProfileB,
+        updatedBy: currentUserProfile.uid,
+        updatedAt: new Date().toISOString(),
+      };
+      // Privacidad: nunca registrar cifras ni desglose de ingresos en el log de actividad
+      const summary = `Actualizó el reparto a ${previewPctA}% / ${previewPctB}% (${splitMode === 'income' ? 'proporcional a ingresos' : splitMode === 'preset' ? 'predefinido' : 'personalizado'})`;
+      await repo.updateSettings(householdId, draftSettings, currentUserProfile, summary, {
+        incomeConfig: nextIncomeConfig,
+      });
+      showToast('Ingresos y reparto guardados y sincronizados');
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el reparto. Inténtalo de nuevo.'));
     }
@@ -523,46 +554,43 @@ export const AjustesView: React.FC = () => {
             </div>
           )}
 
-          {/* Ingresos netos mensuales (siempre editables para capacidad de ahorro) */}
+          {/* Ingresos netos (Rápida o Detallada por persona) */}
           <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-3">
             <div>
               <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                Ingresos netos mensuales
+                Ingresos netos (rápida o detallada)
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Se usan para calcular la capacidad de ahorro mensual y el reparto proporcional por salario.
+                Se usan para el reparto proporcional (gastos y ahorro comparten el mismo porcentaje por
+                defecto) y como referencia de capacidad de ahorro. Cambiar los ingresos no recalcula
+                gastos ni saldos históricos.
               </p>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="income-a" className="block text-xs font-medium mb-1">
-                  Salario neto mensual · {nameA} (€)
-                </label>
-                <input
-                  id="income-a"
-                  type="text"
-                  inputMode="decimal"
-                  value={incomeA}
-                  onChange={(e) => setIncomeA(e.target.value)}
-                  className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-base font-semibold"
-                />
-              </div>
-              <div>
-                <label htmlFor="income-b" className="block text-xs font-medium mb-1">
-                  Salario neto mensual · {nameB} (€)
-                </label>
-                <input
-                  id="income-b"
-                  type="text"
-                  inputMode="decimal"
-                  value={incomeB}
-                  onChange={(e) => setIncomeB(e.target.value)}
-                  className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-base font-semibold"
-                />
-              </div>
+            <div className="space-y-3">
+              <DetailedIncomeEditor
+                memberKey="a"
+                memberName={nameA}
+                profile={incomeProfileA}
+                onChange={setIncomeProfileA}
+              />
+              <DetailedIncomeEditor
+                memberKey="b"
+                memberName={nameB}
+                profile={incomeProfileB}
+                onChange={setIncomeProfileB}
+              />
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
-              Capacidad de ahorro estimada:{' '}
+              Equivalente mensual combinado (promedio):{' '}
+              <strong>
+                {formatEUR(incomeSummaryA.monthlyAverageEquivalent + incomeSummaryB.monthlyAverageEquivalent)}
+                /mes
+              </strong>{' '}
+              ({nameA} {formatEUR(incomeSummaryA.monthlyAverageEquivalent)} · {nameB}{' '}
+              {formatEUR(incomeSummaryB.monthlyAverageEquivalent)})
+            </p>
+            <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
+              Capacidad de ahorro estimada (solo referencia):{' '}
               <strong
                 className={
                   capacityPreview.capacity >= 0
@@ -572,7 +600,7 @@ export const AjustesView: React.FC = () => {
               >
                 {formatEUR(capacityPreview.capacity)}/mes
               </strong>{' '}
-              (Ingresos {formatEUR(capacityPreview.totalIncome)} − gasto habitual{' '}
+              (Ingresos promedio {formatEUR(capacityPreview.totalIncome)} − gasto habitual{' '}
               {formatEUR(capacityPreview.habitualSpend)} (fijos{' '}
               {formatEUR(capacityPreview.fixedMonthly)} + variables{' '}
               {formatEUR(capacityPreview.variableMonthly)}))
@@ -581,7 +609,9 @@ export const AjustesView: React.FC = () => {
 
           {/* Live Preview */}
           <div className="rounded-xl bg-[#F6F8F8] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-1">
-            <p className="text-xs text-slate-500 dark:text-slate-400">Vista previa del reparto</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Vista previa del reparto (gastos y ahorro)
+            </p>
             <p className="font-display text-base sm:text-lg font-bold tabular-nums">
               De cada 100 €, {previewPctA.toLocaleString('es-ES')} € {nameA} / {previewPctB.toLocaleString('es-ES')} € {nameB}
             </p>

@@ -91,14 +91,27 @@ import {
 } from './annualBalance';
 import { computeMonthlyPlanSummary } from './monthlyPlanning';
 import {
+  buildExtraSavingsPlan,
   buildInitialSavingsPlanDraft,
+  buildVirtualPlanFromHabitual,
+  computeMonthlyHouseholdContributions,
   evaluateMonthlySavingsPlan,
   formatDecimalInputES,
   getDefaultSelectableSavingsGoals,
   parseNonNegativeAmountInput,
+  proposeHabitualFillDistribution,
   proposeMonthlySavingsDistribution,
+  resolveEffectiveMonthSavingsPlan,
   sanitizeSavingsPlanAllocations,
+  sortGoalsByHabitualPriority,
 } from './savingsPlan';
+import {
+  applyPaycheckPreset,
+  computeMemberIncomeSummary,
+  createDefaultMemberIncomeProfile,
+  resolveEffectiveMonthlyIncomes,
+  sanitizeHouseholdIncomeConfig,
+} from './incomeProfile';
 import { buildRecurringIcsCalendar } from './icsExport';
 import { getDueNotificationsForDevice } from './localNotifications';
 import {
@@ -178,6 +191,7 @@ import {
   type CustomCategory,
   type FurnitureItem,
   type GoalMovement,
+  type HabitualSavingsPlan,
   type Household,
   type HouseholdMember,
   type HouseholdSettings,
@@ -6618,12 +6632,8 @@ test('52. Balance anual — DemoHouseholdRepository.fetchAnnualBalanceData (priv
   assert.equal(cache.get('hogar_1', 'uid_a'), null);
 });
 
-test('53. Plan de ahorro mensual — importe insuficiente, orden de prioridad, excedente sin asignar y tope por restante', () => {
+test('53. Plan de ahorro mensual — llenado por orden de prioridad, sobrante a la siguiente meta, excedente sin asignar y tope por restante', () => {
   const refDateISO = '2026-11-10';
-  // 10 meses exactos desde 2026-11-10 hasta 2027-09-10:
-  // g_a: faltan 1.500 € -> 150 €/mes
-  // g_b: faltan 1.300 € -> 130 €/mes
-  // g_c: faltan 600 €   -> 60 €/mes
   const mkGoal = (over: Partial<SavingsGoal> & { id: string; name: string }): SavingsGoal => ({
     icon: 'piggy-bank',
     color: '#0E5A64',
@@ -6637,39 +6647,38 @@ test('53. Plan de ahorro mensual — importe insuficiente, orden de prioridad, e
   });
 
   const goals: SavingsGoal[] = [
-    mkGoal({ id: 'g_a', name: 'Viaje verano', targetAmount: 1500 }),
-    mkGoal({ id: 'g_b', name: 'Coche', targetAmount: 1300 }),
+    mkGoal({ id: 'g_a', name: 'Colchón', targetAmount: 120, type: 'emergencia' }),
+    mkGoal({ id: 'g_b', name: 'Ahorro común', targetAmount: 1000, type: 'ahorro_comun' }),
     mkGoal({ id: 'g_c', name: 'Escapada', targetAmount: 600 }),
   ];
 
-  // A) Importe insuficiente: 250 € con cuotas 150 €, 130 €, 60 € -> propone 150 €, 100 €, 0 €
-  const shortProp = proposeMonthlySavingsDistribution({
-    targetAmount: 250,
+  // A) Llenado por orden de prioridad: 300 € con g_a restante 120 € y g_b restante 1.000 € -> 120 €, 180 €, 0 €
+  const fillProp = proposeMonthlySavingsDistribution({
+    targetAmount: 300,
     orderedGoalIds: ['g_a', 'g_b', 'g_c'],
     goals,
     movements: [],
     refDateISO,
   });
-  assert.equal(shortProp.totalAssigned, 250);
-  assert.equal(shortProp.unassignedAmount, 0);
+  assert.equal(fillProp.status, 'ok');
+  assert.equal(fillProp.totalAssigned, 300);
+  assert.equal(fillProp.unassignedAmount, 0);
   assert.deepEqual(
-    shortProp.allocations.map((a) => ({
+    fillProp.allocations.map((a) => ({
       goalId: a.goalId,
       proposed: a.proposedAmount,
-      recommended: a.recommendedAmount,
       shortfall: a.shortfallAmount,
     })),
     [
-      { goalId: 'g_a', proposed: 150, recommended: 150, shortfall: 0 },
-      { goalId: 'g_b', proposed: 100, recommended: 130, shortfall: 30 },
-      { goalId: 'g_c', proposed: 0, recommended: 60, shortfall: 60 },
+      { goalId: 'g_a', proposed: 120, shortfall: 0 },
+      { goalId: 'g_b', proposed: 180, shortfall: 820 },
+      { goalId: 'g_c', proposed: 0, shortfall: 600 },
     ]
   );
-  assert.equal(shortProp.underfunded.length, 2);
 
-  // B) Cambiar el orden de prioridad (g_c, g_a, g_b) cambia el reparto determinísticamente
+  // B) Cambiar el orden de prioridad (g_c, g_a, g_b) llena primero g_c hasta lo que le falta
   const reorderedProp = proposeMonthlySavingsDistribution({
-    targetAmount: 250,
+    targetAmount: 700,
     orderedGoalIds: ['g_c', 'g_a', 'g_b'],
     goals,
     movements: [],
@@ -6678,26 +6687,26 @@ test('53. Plan de ahorro mensual — importe insuficiente, orden de prioridad, e
   assert.deepEqual(
     reorderedProp.allocations.map((a) => [a.goalId, a.proposedAmount]),
     [
-      ['g_c', 60],
-      ['g_a', 150],
-      ['g_b', 40],
+      ['g_c', 600],
+      ['g_a', 100],
+      ['g_b', 0],
     ]
   );
   assert.equal(reorderedProp.unassignedAmount, 0);
 
-  // C) Excedente sin asignar: 400 € frente a 340 € sugeridos -> 60 € quedan "Sin asignar", no se mueven a ninguna meta
+  // C) Excedente sin asignar: 2.000 € frente a 1.720 € totales restantes -> 280 € quedan "Sin asignar"
   const surplusProp = proposeMonthlySavingsDistribution({
-    targetAmount: 400,
+    targetAmount: 2000,
     orderedGoalIds: ['g_a', 'g_b', 'g_c'],
     goals,
     movements: [],
     refDateISO,
   });
-  assert.equal(surplusProp.totalAssigned, 340);
-  assert.equal(surplusProp.unassignedAmount, 60);
+  assert.equal(surplusProp.totalAssigned, 1720);
+  assert.equal(surplusProp.unassignedAmount, 280);
   assert.equal(surplusProp.underfunded.length, 0);
 
-  // D) Tope por restante: si a una meta que vence este mes solo le faltan 25 € para completarse,
+  // D) Tope por restante: si a una meta solo le faltan 25 € para completarse,
   // propone 25 € aunque el pool disponible sea 100 € (deja 75 € sin asignar)
   const nearDueGoal = mkGoal({
     id: 'g_near',
@@ -6727,7 +6736,7 @@ test('53. Plan de ahorro mensual — importe insuficiente, orden de prioridad, e
   assert.equal(cappedProp.unassignedAmount, 75);
 });
 
-test('54. Plan de ahorro mensual — metas sin fecha objetivo (0 € en propuesta), asignación manual y objetivo 0 €', () => {
+test('54. Plan de ahorro mensual — metas sin fecha objetivo SÍ reciben si tienen targetAmount > 0; sin targetAmount quedan manuales', () => {
   const refDateISO = '2026-11-10';
   const goals: SavingsGoal[] = [
     {
@@ -6743,12 +6752,24 @@ test('54. Plan de ahorro mensual — metas sin fecha objetivo (0 € en propuest
       updatedAt: '2026-01-01T00:00:00.000Z',
     },
     {
+      id: 'g_notarget',
+      name: 'Hucha abierta sin objetivo',
+      icon: 'piggy-bank',
+      color: '#B45309',
+      targetAmount: 0,
+      targetDate: '',
+      type: 'custom',
+      archived: false,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+    {
       id: 'g_dated',
       name: 'Viajes',
       icon: 'plane',
       color: '#0E5A64',
       targetAmount: 1000,
-      targetDate: '2027-09-10', // 10 meses -> 100 €/mes
+      targetDate: '2027-09-10', // 10 meses -> 100 €/mes referencia informativa
       type: 'viajes',
       archived: false,
       createdAt: '2026-01-01T00:00:00.000Z',
@@ -6756,21 +6777,42 @@ test('54. Plan de ahorro mensual — metas sin fecha objetivo (0 € en propuest
     },
   ];
 
-  // Propuesta: NO inventa cuota para meta sin fecha (propone 0 € y marca needsManualAmount)
+  // Propuesta: g_nodate (sin fecha pero con targetAmount=3000) recibe los 300 € por ser primera;
+  // g_notarget (targetAmount=0) queda en 0 € marcada como manual ('sin_objetivo');
+  // g_dated conserva recommendedAmount=100 como referencia informativa.
   const prop = proposeMonthlySavingsDistribution({
     targetAmount: 300,
-    orderedGoalIds: ['g_nodate', 'g_dated'],
+    orderedGoalIds: ['g_nodate', 'g_notarget', 'g_dated'],
     goals,
     movements: [],
     refDateISO,
   });
+  assert.equal(prop.status, 'ok');
   assert.equal(prop.allocations[0].goalId, 'g_nodate');
-  assert.equal(prop.allocations[0].proposedAmount, 0);
+  assert.equal(prop.allocations[0].proposedAmount, 300);
   assert.equal(prop.allocations[0].recommendedAmount, null);
-  assert.equal(prop.allocations[0].needsManualAmount, true);
-  assert.equal(prop.allocations[1].goalId, 'g_dated');
-  assert.equal(prop.allocations[1].proposedAmount, 100);
-  assert.equal(prop.unassignedAmount, 200);
+  assert.equal(prop.allocations[0].needsManualAmount, false);
+  assert.equal(prop.allocations[1].goalId, 'g_notarget');
+  assert.equal(prop.allocations[1].proposedAmount, 0);
+  assert.equal(prop.allocations[1].needsManualAmount, true);
+  assert.equal(prop.allocations[1].manualReason, 'sin_objetivo');
+  assert.equal(prop.allocations[2].goalId, 'g_dated');
+  assert.equal(prop.allocations[2].proposedAmount, 0);
+  assert.equal(prop.allocations[2].recommendedAmount, 100);
+  assert.equal(prop.unassignedAmount, 0);
+
+  // Si solo se selecciona la meta sin objetivo, explica claramente por qué no asigna automáticamente
+  const onlyNoTarget = proposeMonthlySavingsDistribution({
+    targetAmount: 300,
+    orderedGoalIds: ['g_notarget'],
+    goals,
+    movements: [],
+    refDateISO,
+  });
+  assert.equal(onlyNoTarget.status, 'all_manual_or_completed');
+  assert.equal(onlyNoTarget.totalAssigned, 0);
+  assert.equal(onlyNoTarget.unassignedAmount, 300);
+  assert.ok(onlyNoTarget.feedbackMessage.includes('importe objetivo'));
 
   // Asignación manual en la meta sin fecha y evaluación con parte sin asignar
   const manualPlan: MonthlySavingsPlan = {
@@ -7297,6 +7339,510 @@ test('Fin de etapa de mudanza: estado compartido reversible, aviso sin mutar pen
   unsubC();
   unsubI();
 });
+
+test('60. Ingresos netos rápidos y detallados: 12 prorrateadas, 14 pagas (12+2), aviso doble conteo y otros ingresos inciertos excluidos por defecto', () => {
+  // 1) Modo rápido
+  const quickA = createDefaultMemberIncomeProfile(2100);
+  const quickSummary = computeMemberIncomeSummary(quickA);
+  assert.equal(quickSummary.mode, 'rapida');
+  assert.equal(quickSummary.estimatedAnnualNet, 25200);
+  assert.equal(quickSummary.monthlyAverageEquivalent, 2100);
+  assert.equal(quickSummary.warnings.length, 0);
+
+  // 2) Modo detallado con 14 pagas (12 ordinarias de 1.500 € + 2 extras de 1.400 € y 1.600 €)
+  // Anual = 18.000 + 3.000 = 21.000 € -> Equivalente mensual = 1.750,00 €/mes
+  const detailedA = applyPaycheckPreset(createDefaultMemberIncomeProfile(1500), '14_pagas');
+  detailedA.ordinaryPayAmount = 1500;
+  detailedA.extraPaychecks = [
+    { id: 'ex_verano', label: 'Extra verano', amount: 1400, expectedMonth: 6 },
+    { id: 'ex_navidad', label: 'Extra Navidad', amount: 1600, expectedMonth: 12 },
+  ];
+  // Añadir un ingreso recurrente (100 €/mes) y un bonus incierto (1.200 €/año excluido por defecto)
+  detailedA.otherIncomes = [
+    {
+      id: 'oth_rec',
+      concept: 'Ticket restaurante',
+      amount: 100,
+      frequency: 'mensual',
+      kind: 'recurrente',
+      includeInAnnualEstimate: true,
+    },
+    {
+      id: 'oth_bonus',
+      concept: 'Bonus variable',
+      amount: 1200,
+      frequency: 'anual',
+      kind: 'puntual_o_incierto',
+      includeInAnnualEstimate: false,
+    },
+  ];
+  const detSummary = computeMemberIncomeSummary(detailedA);
+  assert.equal(detSummary.ordinaryAnnual, 18000);
+  assert.equal(detSummary.extrasAnnual, 3000);
+  assert.equal(detSummary.otherRecurringAnnual, 1200);
+  assert.equal(detSummary.otherUncertainIncludedAnnual, 0);
+  assert.equal(detSummary.otherUncertainExcludedAnnual, 1200);
+  assert.equal(detSummary.estimatedAnnualNet, 22200);
+  assert.equal(detSummary.monthlyAverageEquivalent, 1850);
+  assert.equal(detSummary.warnings.length, 0);
+
+  // Al marcar explícitamente incluir el bonus incierto, se suma al total anual y mensual
+  detailedA.otherIncomes[1].includeInAnnualEstimate = true;
+  const detSummaryWithBonus = computeMemberIncomeSummary(detailedA);
+  assert.equal(detSummaryWithBonus.estimatedAnnualNet, 23400);
+  assert.equal(detSummaryWithBonus.monthlyAverageEquivalent, 1950);
+  assert.equal(detSummaryWithBonus.otherUncertainIncludedAnnual, 1200);
+  assert.equal(detSummaryWithBonus.otherUncertainExcludedAnnual, 0);
+
+  // 3) Protección contra doble conteo: 14 ordinarias + extras separadas activa aviso explícito
+  const doubleCountProfile = {
+    ...detailedA,
+    ordinaryPayCount: 14,
+  };
+  const warnSummary = computeMemberIncomeSummary(doubleCountProfile);
+  assert.ok(warnSummary.warnings.length > 0);
+  assert.ok(warnSummary.warnings.some((w) => w.includes('14 pagas')));
+
+  // 4) Preset 12 prorrateadas limpia pagas extras para evitar confusión
+  const prorated = applyPaycheckPreset(detailedA, '12_prorrateadas');
+  assert.equal(prorated.ordinaryPayCount, 12);
+  assert.equal(prorated.extraPaychecks.length, 0);
+
+  // 5) Reparto proporcional desde ingresos detallados (1.800 €/mes vs 1.200 €/mes -> 60% / 40%)
+  const resolved = resolveEffectiveMonthlyIncomes(
+    {
+      incomeA: 0,
+      incomeB: 0,
+    },
+    {
+      memberA: {
+        ...createDefaultMemberIncomeProfile(1500),
+        mode: 'detallada',
+        ordinaryPayAmount: 1500,
+        ordinaryPayCount: 12,
+        extraPaychecks: [
+          { id: 'e1', label: 'Extra 1', amount: 1800, expectedMonth: 6 },
+          { id: 'e2', label: 'Extra 2', amount: 1800, expectedMonth: 12 },
+        ],
+        otherIncomes: [],
+      }, // 21.600 €/año = 1.800 €/mes
+      memberB: createDefaultMemberIncomeProfile(1200), // 1.200 €/mes
+      updatedBy: 'uid_alex',
+      updatedAt: '2026-11-25T10:00:00.000Z',
+    }
+  );
+  assert.equal(resolved.incomeA, 1800);
+  assert.equal(resolved.incomeB, 1200);
+  const effectivePctA = computeEffectiveSplitPctA({
+    splitMode: 'income',
+    presetA: 50,
+    presetB: 50,
+    incomeA: resolved.incomeA,
+    incomeB: resolved.incomeB,
+    currency: 'EUR',
+  });
+  assert.equal(effectivePctA, 60);
+});
+
+test('61. Dos cifras mensuales separadas (aceptación exacta): 1.200 € Cuenta común + 300 € ahorro al 60/40', () => {
+  const monthKey = '2026-11';
+  const refDateISO = '2026-11-10';
+
+  const recurring: RecurringExpense[] = [
+    {
+      id: 'rec_alquiler',
+      concept: 'Alquiler',
+      category: 'alquiler',
+      amount: 1200,
+      frequency: 'mensual',
+      dayOfMonth: 5,
+      splitOverride: null,
+      paidByDefault: COMMON_ACCOUNT_ID,
+      active: true,
+      startMonth: '2026-01',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+  ];
+  const radar = computeCommonAccountRadar(monthKey, [], recurring, 60, { todayISO: refDateISO });
+  assert.equal(radar.totalMonthlyNeed, 1200);
+  assert.equal(radar.monthlyShareA, 720);
+  assert.equal(radar.monthlyShareB, 480);
+
+  const goals: SavingsGoal[] = [
+    {
+      id: 'g_colchon',
+      name: 'Colchón de emergencia',
+      icon: 'shield',
+      color: '#15803D',
+      targetAmount: 120,
+      targetDate: '',
+      type: 'emergencia',
+      archived: false,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'g_comun',
+      name: 'Ahorro común',
+      icon: 'piggy-bank',
+      color: '#0E5A64',
+      targetAmount: 5000,
+      targetDate: '',
+      type: 'ahorro_comun',
+      archived: false,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+  ];
+
+  // Plan habitual de 300 € aplicado virtualmente -> 120 € Colchón + 180 € Ahorro común
+  const habitual: HabitualSavingsPlan = {
+    monthlyAmount: 300,
+    priorityGoalIds: ['g_colchon', 'g_comun'],
+    updatedBy: 'uid_alex',
+    updatedAt: '2026-11-01T00:00:00.000Z',
+  };
+  const resolved = resolveEffectiveMonthSavingsPlan({
+    monthKey,
+    savedPlan: null,
+    habitualPlan: habitual,
+    goals,
+    movements: [],
+    refDateISO,
+  });
+  assert.equal(resolved.source, 'habitual');
+  assert.deepEqual(
+    resolved.plan?.allocations.map((a) => [a.goalId, a.plannedAmount]),
+    [
+      ['g_colchon', 120],
+      ['g_comun', 180],
+    ]
+  );
+
+  // Con una aportación previa de Persona A (50 €) y retirada de Persona B (-20 €) este mes:
+  const movements: GoalMovement[] = [
+    {
+      id: 'gm_1',
+      goalId: 'g_colchon',
+      amount: 50,
+      by: 'uid_alex',
+      date: '2026-11-03',
+      note: 'Primer ingreso',
+      createdAt: '2026-11-03T10:00:00.000Z',
+    },
+    {
+      id: 'gm_w',
+      goalId: 'g_comun',
+      amount: -20,
+      by: 'uid_marta',
+      date: '2026-11-04',
+      note: 'Imprevisto',
+      createdAt: '2026-11-04T10:00:00.000Z',
+    },
+  ];
+
+  const evaluation = evaluateMonthlySavingsPlan({
+    monthKey,
+    plan: resolved.plan,
+    planSource: resolved.source,
+    goals,
+    movements,
+    refDateISO,
+  });
+
+  const contributions = computeMonthlyHouseholdContributions({
+    monthKey,
+    commonAccountRadar: radar,
+    savingsEvaluation: evaluation,
+    effectiveSplitPctA: 60,
+    goalMovements: movements,
+    memberAUid: 'uid_alex',
+    memberBUid: 'uid_marta',
+  });
+
+  // Bloque A — Gastos de Cuenta común: 720,00 € / 480,00 € (reconcilia exacto)
+  assert.equal(contributions.expenses.total, 1200);
+  assert.equal(contributions.expenses.shareA, 720);
+  assert.equal(contributions.expenses.shareB, 480);
+  assert.equal(
+    roundCents(contributions.expenses.shareA + contributions.expenses.shareB),
+    contributions.expenses.total
+  );
+
+  // Bloque B — Ahorro: 180,00 € / 120,00 € (separado, reconcilia exacto)
+  assert.equal(contributions.savings.totalPlanned, 300);
+  assert.equal(contributions.savings.shareA, 180);
+  assert.equal(contributions.savings.shareB, 120);
+  assert.equal(
+    roundCents(contributions.savings.shareA + contributions.savings.shareB),
+    contributions.savings.totalPlanned
+  );
+  // Aportado y retirado por persona separados
+  assert.equal(contributions.savings.contributedA, 50);
+  assert.equal(contributions.savings.pendingA, 130);
+  assert.equal(contributions.savings.contributedB, 0);
+  assert.equal(contributions.savings.pendingB, 120);
+  assert.equal(contributions.savings.withdrawnB, 20);
+});
+
+test('62. Plan habitual (prioridad por defecto Colchón -> Ahorro común -> resto), excepción mensual y ahorro extra sin doble conteo', () => {
+  const refDateISO = '2026-11-10';
+  const goals: SavingsGoal[] = [
+    {
+      id: 'g_viaje',
+      name: 'Viaje',
+      icon: 'plane',
+      color: '#0E5A64',
+      targetAmount: 1000,
+      targetDate: '',
+      type: 'viajes',
+      archived: false,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'g_comun',
+      name: 'Ahorro común',
+      icon: 'piggy-bank',
+      color: '#0E5A64',
+      targetAmount: 3000,
+      targetDate: '',
+      type: 'ahorro_comun',
+      archived: false,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'g_colchon',
+      name: 'Colchón de emergencia',
+      icon: 'shield',
+      color: '#15803D',
+      targetAmount: 500,
+      targetDate: '',
+      type: 'emergencia',
+      archived: false,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+  ];
+
+  // Orden por defecto cuando no hay prioridad guardada: emergencia -> ahorro_comun -> resto
+  const defaultOrder = sortGoalsByHabitualPriority(goals, null, null);
+  assert.deepEqual(
+    defaultOrder.map((g) => g.id),
+    ['g_colchon', 'g_comun', 'g_viaje']
+  );
+
+  // Orden guardado se respeta estrictamente
+  const customOrder = sortGoalsByHabitualPriority(goals, ['g_viaje', 'g_colchon', 'g_comun'], null);
+  assert.deepEqual(
+    customOrder.map((g) => g.id),
+    ['g_viaje', 'g_colchon', 'g_comun']
+  );
+
+  // Ahorro extra sobre un plan habitual de 300 € (Colchón 300 €, Ahorro común 0 €)
+  // Si añadimos 200 € extra y los asignamos a Viaje, el resultado es 500 € total:
+  // Colchón sigue en 300 € (NO se duplica) y Viaje sube de 0 € a 200 €.
+  const habitual: HabitualSavingsPlan = {
+    monthlyAmount: 300,
+    priorityGoalIds: ['g_colchon', 'g_comun', 'g_viaje'],
+    updatedBy: 'uid_alex',
+    updatedAt: '2026-11-01T00:00:00.000Z',
+  };
+  const virtualBase = buildVirtualPlanFromHabitual({
+    monthKey: '2026-11',
+    habitualPlan: habitual,
+    goals,
+    movements: [],
+    refDateISO,
+  }).plan;
+
+  const extraResult = buildExtraSavingsPlan({
+    basePlan: virtualBase,
+    extraAmount: 200,
+    extraAllocationsByGoalId: { g_viaje: 200 },
+    goals,
+  });
+  assert.equal(extraResult.beforeTarget, 300);
+  assert.equal(extraResult.extraAmount, 200);
+  assert.equal(extraResult.afterTarget, 500);
+  assert.equal(extraResult.extraAssigned, 200);
+  assert.equal(extraResult.extraUnassigned, 0);
+  assert.deepEqual(
+    extraResult.mergedAllocations.map((a) => [a.goalId, a.plannedAmount]),
+    [
+      ['g_colchon', 300],
+      ['g_comun', 0],
+      ['g_viaje', 200],
+    ]
+  );
+
+  // Un mes guardado con excepción no reescribe otro mes sin guardar (que sigue usando habitual)
+  const savedNov: MonthlySavingsPlan = {
+    monthKey: '2026-11',
+    targetAmount: 500,
+    allocations: extraResult.mergedAllocations,
+    adjustmentKind: 'extra',
+    extraAmount: 200,
+    updatedBy: 'uid_alex',
+    updatedAt: '2026-11-10T10:00:00.000Z',
+  };
+  const resolvedNov = resolveEffectiveMonthSavingsPlan({
+    monthKey: '2026-11',
+    savedPlan: savedNov,
+    habitualPlan: habitual,
+    goals,
+    movements: [],
+    refDateISO,
+  });
+  const resolvedDec = resolveEffectiveMonthSavingsPlan({
+    monthKey: '2026-12',
+    savedPlan: null,
+    habitualPlan: habitual,
+    goals,
+    movements: [],
+    refDateISO,
+  });
+  assert.equal(resolvedNov.source, 'saved');
+  assert.equal(resolvedNov.plan?.targetAmount, 500);
+  assert.equal(resolvedDec.source, 'habitual');
+  assert.equal(resolvedDec.plan?.targetAmount, 300);
+});
+
+test('63. DemoHouseholdRepository y backup round-trip para incomeConfig, habitualSavingsPlan y ahorro extra + compatibilidad con backups antiguos', async () => {
+  const demo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const alex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+  let currentHousehold: Household | null = null;
+  let currentPlans: MonthlySavingsPlan[] = [];
+  let currentMovements: GoalMovement[] = [];
+  let currentActivity: { summary: string }[] = [];
+
+  const unsubH = demo.subscribeHousehold(hid, (h) => { currentHousehold = h; });
+  const unsubP = demo.subscribeSavingsPlans(hid, (p) => { currentPlans = p; });
+  const unsubM = demo.subscribeGoalMovements(hid, (m) => { currentMovements = m; });
+  const unsubA = demo.subscribeActivity(hid, 20, (a) => { currentActivity = a; });
+
+  const initialMovementsCount = currentMovements.length;
+
+  // 1) Guardar ingresos detallados + reparto sin filtrar salarios en actividad
+  const incomeConfig = sanitizeHouseholdIncomeConfig(
+    {
+      memberA: {
+        mode: 'detallada',
+        quickMonthlyNet: 1850,
+        ordinaryPayAmount: 1500,
+        ordinaryPayCount: 12,
+        extraPaychecks: [
+          { id: 'ex_1', label: 'Extra verano', amount: 1400, expectedMonth: 6 },
+          { id: 'ex_2', label: 'Extra Navidad', amount: 1600, expectedMonth: 12 },
+        ],
+        otherIncomes: [
+          {
+            id: 'oth_1',
+            concept: 'Bonus',
+            amount: 1200,
+            frequency: 'anual',
+            kind: 'puntual_o_incierto',
+            includeInAnnualEstimate: false,
+          },
+        ],
+      },
+      memberB: createDefaultMemberIncomeProfile(1400),
+      updatedBy: alex.uid,
+      updatedAt: '2026-11-25T10:00:00.000Z',
+    },
+    { incomeA: 1750, incomeB: 1400 }
+  );
+
+  await demo.updateSettings(
+    hid,
+    {
+      splitMode: 'income',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 1750,
+      incomeB: 1400,
+      currency: 'EUR',
+    },
+    alex,
+    'Actualizó la configuración de reparto e ingresos',
+    { incomeConfig }
+  );
+
+  assert.equal((currentHousehold as Household | null)?.incomeConfig?.memberA.mode, 'detallada');
+  assert.equal((currentHousehold as Household | null)?.incomeConfig?.memberA.extraPaychecks.length, 2);
+  // Privacidad: los logs de actividad no deben contener cifras de salario
+  assert.ok(
+    !currentActivity.some((a) => a.summary.includes('1500') || a.summary.includes('1750') || a.summary.includes('1400')),
+    'Los registros de actividad no deben filtrar importes de salario'
+  );
+
+  // 2) Guardar plan habitual y plan mensual con ahorro extra: NO crea movimientos de ahorro
+  await demo.saveHabitualSavingsPlan(
+    hid,
+    { monthlyAmount: 350, priorityGoalIds: ['goal_1', 'goal_2'] },
+    alex
+  );
+  assert.equal((currentHousehold as Household | null)?.habitualSavingsPlan?.monthlyAmount, 350);
+
+  await demo.saveSavingsPlan(
+    hid,
+    {
+      monthKey: '2027-01',
+      targetAmount: 550,
+      allocations: [
+        { goalId: 'goal_1', plannedAmount: 350, priority: 0, goalNameSnapshot: 'Colchón' },
+        { goalId: 'goal_2', plannedAmount: 200, priority: 1, goalNameSnapshot: 'Ahorro común' },
+      ],
+      adjustmentKind: 'extra',
+      extraAmount: 200,
+    },
+    alex
+  );
+  assert.equal(currentMovements.length, initialMovementsCount, 'Guardar plan habitual o mensual nunca crea movimientos');
+  const savedJan = currentPlans.find((p) => p.monthKey === '2027-01');
+  assert.equal(savedJan?.adjustmentKind, 'extra');
+  assert.equal(savedJan?.extraAmount, 200);
+
+  // 3) Exportar e importar backup preserva todos los nuevos campos
+  const exported = await demo.exportBackup(hid, alex.uid);
+  assert.equal(exported.incomeConfig?.memberA.mode, 'detallada');
+  assert.equal(exported.habitualSavingsPlan?.monthlyAmount, 350);
+  assert.equal(
+    exported.savingsPlans?.find((p) => p.monthKey === '2027-01')?.adjustmentKind,
+    'extra'
+  );
+  const validated = validateAndMigrateBackup(exported);
+  assert.equal(validated.incomeConfig?.memberA.extraPaychecks.length, 2);
+  assert.equal(validated.habitualSavingsPlan?.monthlyAmount, 350);
+
+  // 4) Compatibilidad hacia atrás: backup antiguo SIN incomeConfig ni habitualSavingsPlan sigue importando sin error
+  const legacyObj = { ...exported } as Record<string, unknown>;
+  delete legacyObj.incomeConfig;
+  delete legacyObj.habitualSavingsPlan;
+  const validatedLegacy = validateAndMigrateBackup(legacyObj);
+  assert.equal(validatedLegacy.incomeConfig, undefined);
+  assert.equal(validatedLegacy.habitualSavingsPlan, undefined);
+  await demo.importBackup(hid, validatedLegacy, alex);
+
+  // Restaurar el backup completo vuelve a cargar incomeConfig y habitualSavingsPlan
+  await demo.importBackup(hid, validated, alex);
+  assert.equal((currentHousehold as Household | null)?.habitualSavingsPlan?.monthlyAmount, 350);
+  assert.equal((currentHousehold as Household | null)?.incomeConfig?.memberA.mode, 'detallada');
+
+  // Limpiar borrando el plan de prueba
+  await demo.deleteSavingsPlan(hid, '2027-01', alex);
+  assert.equal(currentPlans.find((p) => p.monthKey === '2027-01'), undefined);
+
+  unsubH();
+  unsubP();
+  unsubM();
+  unsubA();
+});
+
 
 
 

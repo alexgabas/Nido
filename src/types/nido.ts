@@ -39,6 +39,49 @@ export interface HouseholdSettings {
   currency: 'EUR';
 }
 
+export type MemberIncomeMode = 'rapida' | 'detallada';
+export type OtherIncomeFrequency = 'mensual' | 'trimestral' | 'semestral' | 'anual' | 'puntual';
+export type OtherIncomeKind = 'recurrente' | 'puntual_o_incierto';
+
+export interface ExtraPaycheckItem {
+  id: string;
+  label: string;
+  amount: number; // neto € (>= 0)
+  expectedMonth?: number | null; // 1..12 opcional
+}
+
+export interface OtherIncomeItem {
+  id: string;
+  concept: string;
+  amount: number; // neto € por cobro (>= 0)
+  frequency: OtherIncomeFrequency;
+  kind: OtherIncomeKind;
+  includeInAnnualEstimate: boolean;
+}
+
+export interface MemberIncomeProfile {
+  mode: MemberIncomeMode;
+  quickMonthlyNet: number; // neto mensual en modo rápido (>= 0)
+  ordinaryPayAmount: number; // neto de una paga ordinaria (>= 0)
+  ordinaryPayCount: number; // número de pagas ordinarias al año (0..24, habitual 12)
+  extraPaychecks: ExtraPaycheckItem[];
+  otherIncomes: OtherIncomeItem[];
+}
+
+export interface HouseholdIncomeConfig {
+  memberA: MemberIncomeProfile;
+  memberB: MemberIncomeProfile;
+  updatedBy: string;
+  updatedAt: string;
+}
+
+export interface HabitualSavingsPlan {
+  monthlyAmount: number; // >= 0, importe mensual elegido manualmente
+  priorityGoalIds: string[]; // orden de prioridad de metas (llenado por orden)
+  updatedBy: string;
+  updatedAt: string;
+}
+
 export const SYSTEM_EXPENSE_CATEGORIES = [
   'alquiler',
   'luz',
@@ -104,6 +147,8 @@ export interface Household {
   memberUids: string[];
   inviteCode: string;
   settings: HouseholdSettings;
+  incomeConfig?: HouseholdIncomeConfig | null;
+  habitualSavingsPlan?: HabitualSavingsPlan | null;
   csvKeywords?: CsvCategoryKeywords;
   categoryColors?: CategoryColorMap;
   commonAccountPlannedCategories?: string[];
@@ -320,10 +365,14 @@ export interface SavingsPlanAllocation {
   goalNameSnapshot?: string;
 }
 
+export type SavingsPlanAdjustmentKind = 'ajuste' | 'extra';
+
 export interface MonthlySavingsPlan {
   monthKey: string; // YYYY-MM
   targetAmount: number; // >= 0, manual amount reserved for the month
   allocations: SavingsPlanAllocation[];
+  adjustmentKind?: SavingsPlanAdjustmentKind;
+  extraAmount?: number; // >= 0, explicit extra added on top of base plan
   updatedBy: string; // uid
   updatedAt: string; // ISO string
 }
@@ -441,6 +490,8 @@ export interface NidoBackupV1 {
   exportedAt: string;
   householdName: string;
   settings: HouseholdSettings;
+  incomeConfig?: HouseholdIncomeConfig | null;
+  habitualSavingsPlan?: HabitualSavingsPlan | null;
   mudanzaCompleted?: boolean;
   mudanzaCompletedAt?: string | null;
   mudanzaCompletedBy?: string | null;

@@ -171,8 +171,11 @@ interface NidoContextValue {
   categoryBudgets: CategoryBudgetLimit[];
   monthClosures: MonthClosure[];
   goals: SavingsGoal[];
+  goalsLoaded: boolean;
   goalMovements: GoalMovement[];
   savingsPlans: MonthlySavingsPlan[];
+  savingsPlansLoading: boolean;
+  savingsPlansError: string | null;
   shoppingItems: ShoppingItem[];
   shoppingCatalog: ShoppingCatalogItem[];
   shoppingTemplates: ShoppingListTemplate[];
@@ -236,8 +239,11 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [memberPrefsLoaded, setMemberPrefsLoaded] = useState(false);
   const [monthClosures, setMonthClosures] = useState<MonthClosure[]>([]);
   const [goals, setGoals] = useState<SavingsGoal[]>([]);
+  const [goalsLoaded, setGoalsLoaded] = useState(false);
   const [goalMovements, setGoalMovements] = useState<GoalMovement[]>([]);
   const [savingsPlans, setSavingsPlans] = useState<MonthlySavingsPlan[]>([]);
+  const [savingsPlansLoading, setSavingsPlansLoading] = useState(false);
+  const [savingsPlansError, setSavingsPlansError] = useState<string | null>(null);
   const [shoppingItems, setShoppingItems] = useState<ShoppingItem[]>([]);
   const [shoppingCatalog, setShoppingCatalog] = useState<ShoppingCatalogItem[]>([]);
   const [shoppingTemplates, setShoppingTemplates] = useState<ShoppingListTemplate[]>([]);
@@ -804,12 +810,23 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     if (!householdId || !viewerUid || (effectiveTab !== 'inicio' && effectiveTab !== 'ahorros')) {
       setGoals([]);
+      setGoalsLoaded(false);
       setGoalMovements([]);
       return;
     }
-    const onErr = (e: Error) =>
+    setGoalsLoaded(false);
+    const onErr = (e: Error) => {
+      setGoalsLoaded(true);
       setHouseholdError(toUserFriendlyErrorMessage(e, 'No se pudieron cargar las metas de ahorro.'));
-    const unsubG = repo.subscribeGoals(householdId, setGoals, onErr);
+    };
+    const unsubG = repo.subscribeGoals(
+      householdId,
+      (items) => {
+        setGoals(items);
+        setGoalsLoaded(true);
+      },
+      onErr
+    );
     const unsubGm = repo.subscribeGoalMovements(householdId, setGoalMovements, onErr);
     return () => {
       unsubG();
@@ -821,13 +838,27 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     if (!householdId || !viewerUid || effectiveTab !== 'ahorros') {
       setSavingsPlans([]);
+      setSavingsPlansLoading(false);
+      setSavingsPlansError(null);
       return;
     }
-    const onErr = (e: Error) =>
-      setHouseholdError(
+    setSavingsPlansLoading(true);
+    setSavingsPlansError(null);
+    const onErr = (e: Error) => {
+      setSavingsPlansLoading(false);
+      setSavingsPlansError(
         toUserFriendlyErrorMessage(e, 'No se pudo cargar el plan de ahorro mensual.')
       );
-    return repo.subscribeSavingsPlans(householdId, setSavingsPlans, onErr);
+    };
+    return repo.subscribeSavingsPlans(
+      householdId,
+      (plans) => {
+        setSavingsPlans(plans);
+        setSavingsPlansLoading(false);
+        setSavingsPlansError(null);
+      },
+      onErr
+    );
   }, [householdId, viewerUid, effectiveTab, repo]);
 
   // 13) Shopping list (Inicio, Compra page, or legacy Shopping drawer)
@@ -1497,8 +1528,11 @@ export const NidoProvider: React.FC<{ children: React.ReactNode }> = ({ children
     categoryBudgets: currentCategoryBudgets,
     monthClosures,
     goals,
+    goalsLoaded,
     goalMovements,
     savingsPlans,
+    savingsPlansLoading,
+    savingsPlansError,
     shoppingItems,
     shoppingCatalog,
     shoppingTemplates,

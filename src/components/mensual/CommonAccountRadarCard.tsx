@@ -470,7 +470,7 @@ export const CommonAccountRadarCard: React.FC<CommonAccountRadarCardProps> = ({
 
           {hasPartner && radar.totalMonthlyNeed > 0 && (
             <p className="text-sm text-slate-700 dark:text-slate-200 tabular-nums pt-0.5">
-              Aportación orientativa del mes:{' '}
+              Aportación prevista para gastos:{' '}
               <strong>
                 {shortNameA} {formatEUR(radar.monthlyShareA)}
               </strong>{' '}
@@ -651,7 +651,7 @@ export const CommonAccountRadarCard: React.FC<CommonAccountRadarCardProps> = ({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="space-y-0.5">
               <p className="text-xs font-bold text-[#0E5A64] dark:text-[#5EEAD4]">
-                Aportación orientativa del mes a la Cuenta común
+                Aportación prevista para gastos (Cuenta común)
               </p>
               {hasPartner ? (
                 <p className="text-sm font-semibold text-[#0F1F24] dark:text-[#F0F5F6] tabular-nums">

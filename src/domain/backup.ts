@@ -2,12 +2,17 @@ import {
   MAX_LENGTHS,
   SHOPPING_SECTIONS,
   type NidoBackupV1,
+  type SavingsPlanAdjustmentKind,
   type SavingsPlanAllocation,
   type ShoppingSection,
   type ShoppingSourceType,
   type ShoppingTemplateItem,
 } from '../types/nido';
-import { MAX_SAVINGS_PLAN_ALLOCATIONS } from './savingsPlan';
+import {
+  MAX_SAVINGS_PLAN_ALLOCATIONS,
+  sanitizeHabitualSavingsPlan,
+} from './savingsPlan';
+import { sanitizeHouseholdIncomeConfig } from './incomeProfile';
 import {
   buildCategoryBudgetDocId,
   isCustomCategoryId,
@@ -166,6 +171,32 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
   }
   const incomeA = assertNonNegNum(s.incomeA, 'settings.incomeA');
   const incomeB = assertNonNegNum(s.incomeB, 'settings.incomeB');
+
+  let incomeConfig: NidoBackupV1['incomeConfig'] = undefined;
+  if (raw.incomeConfig !== undefined) {
+    if (raw.incomeConfig === null) {
+      incomeConfig = null;
+    } else if (isObj(raw.incomeConfig)) {
+      incomeConfig = sanitizeHouseholdIncomeConfig(raw.incomeConfig, { incomeA, incomeB });
+    } else {
+      throw new Error('Campo inválido (incomeConfig) en la copia.');
+    }
+  }
+
+  let habitualSavingsPlan: NidoBackupV1['habitualSavingsPlan'] = undefined;
+  if (raw.habitualSavingsPlan !== undefined) {
+    if (raw.habitualSavingsPlan === null) {
+      habitualSavingsPlan = null;
+    } else if (isObj(raw.habitualSavingsPlan)) {
+      const sanitizedHabitual = sanitizeHabitualSavingsPlan(raw.habitualSavingsPlan);
+      if (!sanitizedHabitual) {
+        throw new Error('Campo inválido (habitualSavingsPlan) en la copia.');
+      }
+      habitualSavingsPlan = sanitizedHabitual;
+    } else {
+      throw new Error('Campo inválido (habitualSavingsPlan) en la copia.');
+    }
+  }
 
   let mudanzaCompleted: boolean | undefined = undefined;
   let mudanzaCompletedAt: string | null | undefined = undefined;
@@ -647,10 +678,22 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       }
       allocations.sort((a, b) => a.priority - b.priority);
       const normalizedAllocations = allocations.map((a, idxPos) => ({ ...a, priority: idxPos }));
+      const adjustmentKindRaw =
+        planItem.adjustmentKind === 'ajuste' || planItem.adjustmentKind === 'extra'
+          ? (planItem.adjustmentKind as SavingsPlanAdjustmentKind)
+          : undefined;
+      const extraAmountRaw =
+        planItem.extraAmount !== undefined && planItem.extraAmount !== null
+          ? roundCents(
+              assertNonNegNum(planItem.extraAmount, `savingsPlans[${idx}].extraAmount`)
+            )
+          : undefined;
       return {
         monthKey,
         targetAmount,
         allocations: normalizedAllocations,
+        ...(adjustmentKindRaw ? { adjustmentKind: adjustmentKindRaw } : {}),
+        ...(extraAmountRaw !== undefined && extraAmountRaw > 0 ? { extraAmount: extraAmountRaw } : {}),
         updatedBy: assertStr(planItem.updatedBy ?? 'backup', `savingsPlans[${idx}].updatedBy`, 128, 1),
       };
     });
@@ -815,6 +858,8 @@ export function validateAndMigrateBackup(raw: unknown): NidoBackupV1 {
       incomeB,
       currency: 'EUR',
     },
+    ...(incomeConfig !== undefined ? { incomeConfig } : {}),
+    ...(habitualSavingsPlan !== undefined ? { habitualSavingsPlan } : {}),
     ...(mudanzaCompleted !== undefined
       ? {
           mudanzaCompleted,

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -16,9 +16,12 @@ import {
   Trash2,
 } from 'lucide-react';
 import { DonutChart } from '../components/Charts';
+import { MonthlyContributionsCard } from '../components/ahorros/MonthlyContributionsCard';
 import { MonthlySavingsPlanSection } from '../components/ahorros/MonthlySavingsPlanSection';
 import { useNido } from '../context/NidoContext';
 import { downloadTextFile, generateSpanishCSV } from '../domain/backup';
+import { mergeMonthlyAndCustomBudgetLimits } from '../domain/categories';
+import { computeCommonAccountRadar } from '../domain/commonAccountRadar';
 import {
   computeEmergencyTarget,
   computeGoalProgress,
@@ -34,12 +37,20 @@ import {
 } from '../domain/finance';
 import { GOAL_TYPE_LABELS } from '../domain/presets';
 import {
+  computeMonthlyHouseholdContributions,
   evaluateMonthlySavingsPlan,
   formatDecimalInputES,
+  resolveEffectiveMonthSavingsPlan,
 } from '../domain/savingsPlan';
 import { toUserFriendlyErrorMessage } from '../services/firebase';
 import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
-import type { GoalType, SavingsGoal, SavingsPlanAllocation } from '../types/nido';
+import type {
+  GoalType,
+  MonthlyBudget,
+  SavingsGoal,
+  SavingsPlanAdjustmentKind,
+  SavingsPlanAllocation,
+} from '../types/nido';
 
 export const AhorrosView: React.FC = () => {
   const {
@@ -52,12 +63,18 @@ export const AhorrosView: React.FC = () => {
     effectiveSplitPctA,
     uiMode,
     goals,
+    goalsLoaded,
     goalMovements,
     savingsPlans,
+    savingsPlansLoading,
+    savingsPlansError,
     recurring,
     recentTransactions,
     monthClosures,
     currentMonthBudget,
+    categoryRegistry,
+    setActiveTab,
+    setSelectedMonthKey,
     repo,
     showToast,
   } = useNido();
@@ -68,7 +85,36 @@ export const AhorrosView: React.FC = () => {
   // Monthly savings plan state
   const [planMonthKey, setPlanMonthKey] = useState(currentMonthKey);
   const [planEditorOpen, setPlanEditorOpen] = useState(false);
-  const [savingPlan, setSavingPlan] = useState(false);
+  const [otherMonthBudget, setOtherMonthBudget] = useState<{
+    monthKey: string;
+    budget: MonthlyBudget | null;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!householdId || planMonthKey === currentMonthKey) return;
+    let cancelled = false;
+    void repo
+      .fetchMonthBudgets(householdId, planMonthKey)
+      .then(({ systemBudget, categoryBudgets }) => {
+        if (cancelled) return;
+        setOtherMonthBudget({
+          monthKey: planMonthKey,
+          budget: mergeMonthlyAndCustomBudgetLimits(systemBudget, categoryBudgets, planMonthKey),
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOtherMonthBudget({ monthKey: planMonthKey, budget: null });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [householdId, planMonthKey, currentMonthKey, repo]);
+
+  const shortNameA = memberA?.displayName?.split(' ')[0] || 'Persona 1';
+  const shortNameB = memberB?.displayName?.split(' ')[0] || 'Persona 2';
+  const hasPartner = Boolean(memberB && memberB.uid !== memberA?.uid);
 
   // Movement modal
   const [moveGoal, setMoveGoal] = useState<SavingsGoal | null>(null);
@@ -116,16 +162,86 @@ export const AhorrosView: React.FC = () => {
     [savingsPlans, planMonthKey]
   );
 
-  const planEvaluation = useMemo(
+  const resolvedMonthPlan = useMemo(
     () =>
-      evaluateMonthlySavingsPlan({
+      resolveEffectiveMonthSavingsPlan({
         monthKey: planMonthKey,
-        plan: selectedPlan,
+        savedPlan: selectedPlan,
+        habitualPlan: household?.habitualSavingsPlan,
         goals,
         movements: goalMovements,
         refDateISO: todayISO,
       }),
-    [planMonthKey, selectedPlan, goals, goalMovements, todayISO]
+    [planMonthKey, selectedPlan, household?.habitualSavingsPlan, goals, goalMovements, todayISO]
+  );
+
+  const planEvaluation = useMemo(
+    () =>
+      evaluateMonthlySavingsPlan({
+        monthKey: planMonthKey,
+        plan: resolvedMonthPlan.plan,
+        planSource: resolvedMonthPlan.source,
+        goals,
+        movements: goalMovements,
+        refDateISO: todayISO,
+      }),
+    [planMonthKey, resolvedMonthPlan, goals, goalMovements, todayISO]
+  );
+
+  const planMonthBudget =
+    planMonthKey === currentMonthKey
+      ? currentMonthBudget
+      : otherMonthBudget?.monthKey === planMonthKey
+        ? otherMonthBudget.budget
+        : null;
+
+  const monthTxsForPlan = useMemo(
+    () => recentTransactions.filter((t) => t.monthKey === planMonthKey),
+    [recentTransactions, planMonthKey]
+  );
+
+  const commonAccountRadar = useMemo(
+    () =>
+      computeCommonAccountRadar(planMonthKey, monthTxsForPlan, recurring, effectiveSplitPctA, {
+        todayISO,
+        manualBalance: household?.commonAccountManualBalance ?? null,
+        budget: planMonthBudget,
+        plannedCommonCategoryIds: household?.commonAccountPlannedCategories ?? [],
+        categoryRegistry,
+      }),
+    [
+      planMonthKey,
+      monthTxsForPlan,
+      recurring,
+      effectiveSplitPctA,
+      todayISO,
+      household?.commonAccountManualBalance,
+      household?.commonAccountPlannedCategories,
+      planMonthBudget,
+      categoryRegistry,
+    ]
+  );
+
+  const monthlyContributions = useMemo(
+    () =>
+      computeMonthlyHouseholdContributions({
+        monthKey: planMonthKey,
+        commonAccountRadar,
+        savingsEvaluation: planEvaluation,
+        effectiveSplitPctA,
+        goalMovements,
+        memberAUid: memberA?.uid || '',
+        memberBUid: memberB?.uid || '',
+      }),
+    [
+      planMonthKey,
+      commonAccountRadar,
+      planEvaluation,
+      effectiveSplitPctA,
+      goalMovements,
+      memberA?.uid,
+      memberB?.uid,
+    ]
   );
 
   const savingsCapacity = useMemo(
@@ -192,14 +308,19 @@ export const AhorrosView: React.FC = () => {
     setMoveDate(initialDate);
   };
 
-  const handleContributePending = (goal: SavingsGoal, pendingAmount: number) => {
+  const handleContributePending = (
+    goal: SavingsGoal,
+    pendingAmount: number,
+    targetMonthKey = planMonthKey
+  ) => {
     const safeDay = String(Math.min(28, Number(todayISO.slice(8, 10)) || 1)).padStart(2, '0');
-    const targetDate = planMonthKey === currentMonthKey ? todayISO : `${planMonthKey}-${safeDay}`;
+    const targetDate =
+      targetMonthKey === currentMonthKey ? todayISO : `${targetMonthKey}-${safeDay}`;
     openMovementModal(
       goal,
       'add',
       formatDecimalInputES(pendingAmount),
-      `Plan de ahorro ${formatMonthLabelES(planMonthKey)}`,
+      `Plan de ahorro ${formatMonthLabelES(targetMonthKey)}`,
       targetDate
     );
   };
@@ -208,44 +329,77 @@ export const AhorrosView: React.FC = () => {
     monthKey: string;
     targetAmount: number;
     allocations: SavingsPlanAllocation[];
+    adjustmentKind?: SavingsPlanAdjustmentKind;
+    extraAmount?: number;
   }) => {
-    if (!householdId || !currentUserProfile) return;
-    setSavingPlan(true);
+    if (!householdId || !currentUserProfile) {
+      throw new Error('No se ha encontrado un hogar activo para guardar el plan.');
+    }
     try {
       await repo.saveSavingsPlan(householdId, payload, currentUserProfile);
-      setPlanEditorOpen(false);
       showToast(
-        `Plan de ahorro de ${formatMonthLabelES(payload.monthKey)} guardado (no registra aportaciones)`
+        payload.adjustmentKind === 'extra'
+          ? `Ahorro extra de ${formatMonthLabelES(payload.monthKey)} guardado (no registra aportaciones)`
+          : `Plan de ahorro de ${formatMonthLabelES(payload.monthKey)} guardado (no registra aportaciones)`
       );
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el plan de ahorro mensual.'));
-    } finally {
-      setSavingPlan(false);
+      throw err;
     }
   };
 
   const handleDeleteSavingsPlan = async (monthKey: string) => {
-    if (!householdId || !currentUserProfile) return;
-    setSavingPlan(true);
+    if (!householdId || !currentUserProfile) {
+      throw new Error('No se ha encontrado un hogar activo.');
+    }
     try {
       await repo.deleteSavingsPlan(householdId, monthKey, currentUserProfile);
-      setPlanEditorOpen(false);
-      showToast(`Plan de ahorro de ${formatMonthLabelES(monthKey)} eliminado`);
+      showToast(
+        household?.habitualSavingsPlan && household.habitualSavingsPlan.monthlyAmount > 0
+          ? `${formatMonthLabelES(monthKey)} vuelve al plan habitual`
+          : `Plan de ahorro de ${formatMonthLabelES(monthKey)} eliminado`
+      );
     } catch (err) {
-      showToast(toUserFriendlyErrorMessage(err, 'No se pudo eliminar el plan de ahorro mensual.'));
-    } finally {
-      setSavingPlan(false);
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo quitar el ajuste de este mes.'));
+      throw err;
+    }
+  };
+
+  const handleSaveHabitualPlan = async (
+    plan: { monthlyAmount: number; priorityGoalIds: string[] } | null
+  ) => {
+    if (!householdId || !currentUserProfile) {
+      throw new Error('No se ha encontrado un hogar activo.');
+    }
+    try {
+      await repo.saveHabitualSavingsPlan(householdId, plan, currentUserProfile);
+      showToast(
+        plan
+          ? `Plan habitual guardado (${formatEUR(plan.monthlyAmount)}/mes · no registra aportaciones)`
+          : 'Plan habitual eliminado'
+      );
+    } catch (err) {
+      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el plan habitual de ahorro.'));
+      throw err;
     }
   };
 
   const handleOpenPlanEditorFromHeader = () => {
     setPlanEditorOpen(true);
-    window.requestAnimationFrame(() => {
+    const prefersReduced =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    window.setTimeout(() => {
       document.getElementById('savings-plan-section')?.scrollIntoView({
-        behavior: 'smooth',
+        behavior: prefersReduced ? 'auto' : 'smooth',
         block: 'start',
       });
-    });
+    }, 60);
+  };
+
+  const handleOpenMensualFromContributions = () => {
+    setSelectedMonthKey(planMonthKey);
+    setActiveTab('mensual');
   };
 
   const handleSaveMovement = async (e: React.FormEvent) => {
@@ -560,22 +714,42 @@ export const AhorrosView: React.FC = () => {
           )}
         </section>
 
+        {/* Cuánto pone cada uno (gastos de Cuenta común y ahorro separados) */}
+        <MonthlyContributionsCard
+          contributions={monthlyContributions}
+          shortNameA={shortNameA}
+          shortNameB={shortNameB}
+          hasPartner={hasPartner}
+          uiMode="sencillo"
+          onOpenMensual={handleOpenMensualFromContributions}
+          onOpenPlanEditor={handleOpenPlanEditorFromHeader}
+        />
+
         {/* Plan de ahorro mensual (Modo Sencillo) */}
         <MonthlySavingsPlanSection
           uiMode="sencillo"
           planMonthKey={planMonthKey}
           onChangeMonthKey={setPlanMonthKey}
-          evaluation={planEvaluation}
-          existingPlan={selectedPlan}
-          allPlans={savingsPlans}
           goals={goals}
+          goalsLoaded={goalsLoaded}
           goalMovements={goalMovements}
-          savingsCapacity={savingsCapacity}
+          savingsPlans={savingsPlans}
+          savingsPlansLoading={savingsPlansLoading}
+          savingsPlansError={savingsPlansError}
+          habitualPlan={household?.habitualSavingsPlan}
+          evaluation={planEvaluation}
+          effectivePlan={resolvedMonthPlan.plan}
+          effectiveSplitPctA={effectiveSplitPctA}
+          shortNameA={shortNameA}
+          shortNameB={shortNameB}
+          hasPartner={hasPartner}
+          savingsCapacityRef={savingsCapacity?.capacity ?? 0}
+          hasIncomeConfigured={Boolean(savingsCapacity?.hasIncomeConfigured)}
           editorOpen={planEditorOpen}
           onSetEditorOpen={setPlanEditorOpen}
-          saving={savingPlan}
           onSavePlan={handleSaveSavingsPlan}
           onDeletePlan={handleDeleteSavingsPlan}
+          onSaveHabitualPlan={handleSaveHabitualPlan}
           onContributePending={handleContributePending}
         />
 
@@ -844,6 +1018,45 @@ export const AhorrosView: React.FC = () => {
         </div>
       )}
 
+      {/* Cuánto pone cada uno este mes (gastos Cuenta común vs ahorro separados) */}
+      <MonthlyContributionsCard
+        contributions={monthlyContributions}
+        shortNameA={shortNameA}
+        shortNameB={shortNameB}
+        hasPartner={hasPartner}
+        uiMode="avanzado"
+        onOpenMensual={handleOpenMensualFromContributions}
+        onOpenPlanEditor={handleOpenPlanEditorFromHeader}
+      />
+
+      {/* Plan de ahorro mensual y plan habitual (arriba para abrirse siempre a la vista) */}
+      <MonthlySavingsPlanSection
+        uiMode="avanzado"
+        planMonthKey={planMonthKey}
+        onChangeMonthKey={setPlanMonthKey}
+        goals={goals}
+        goalsLoaded={goalsLoaded}
+        goalMovements={goalMovements}
+        savingsPlans={savingsPlans}
+        savingsPlansLoading={savingsPlansLoading}
+        savingsPlansError={savingsPlansError}
+        habitualPlan={household?.habitualSavingsPlan}
+        evaluation={planEvaluation}
+        effectivePlan={resolvedMonthPlan.plan}
+        effectiveSplitPctA={effectiveSplitPctA}
+        shortNameA={shortNameA}
+        shortNameB={shortNameB}
+        hasPartner={hasPartner}
+        savingsCapacityRef={savingsCapacity?.capacity ?? 0}
+        hasIncomeConfigured={Boolean(savingsCapacity?.hasIncomeConfigured)}
+        editorOpen={planEditorOpen}
+        onSetEditorOpen={setPlanEditorOpen}
+        onSavePlan={handleSaveSavingsPlan}
+        onDeletePlan={handleDeleteSavingsPlan}
+        onSaveHabitualPlan={handleSaveHabitualPlan}
+        onContributePending={handleContributePending}
+      />
+
       {/* Consolidated Overview + Donut + Member Split */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <section className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#132025] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
@@ -944,24 +1157,6 @@ export const AhorrosView: React.FC = () => {
         </section>
       )}
 
-      {/* Plan de ahorro mensual (Modo Avanzado) */}
-      <MonthlySavingsPlanSection
-        uiMode="avanzado"
-        planMonthKey={planMonthKey}
-        onChangeMonthKey={setPlanMonthKey}
-        evaluation={planEvaluation}
-        existingPlan={selectedPlan}
-        allPlans={savingsPlans}
-        goals={goals}
-        goalMovements={goalMovements}
-        savingsCapacity={savingsCapacity}
-        editorOpen={planEditorOpen}
-        onSetEditorOpen={setPlanEditorOpen}
-        saving={savingPlan}
-        onSavePlan={handleSaveSavingsPlan}
-        onDeletePlan={handleDeleteSavingsPlan}
-        onContributePending={handleContributePending}
-      />
 
       {/* Goal Cards */}
       {goalsProgress.length === 0 ? (

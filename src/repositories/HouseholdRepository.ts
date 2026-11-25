@@ -18,6 +18,7 @@ import type {
   FurnitureStatus,
   GoalMovement,
   Household,
+  HouseholdIncomeConfig,
   HouseholdMember,
   HouseholdSettings,
   InitialCost,
@@ -29,6 +30,7 @@ import type {
   PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  SavingsPlanAdjustmentKind,
   SavingsPlanAllocation,
   ShoppingCatalogItem,
   ShoppingItem,
@@ -235,7 +237,13 @@ export interface HouseholdRepository {
     householdId: string,
     settings: HouseholdSettings,
     actor: UserProfileInput,
-    summary: string
+    summary: string,
+    options?: { incomeConfig?: HouseholdIncomeConfig | null }
+  ): Promise<void>;
+  saveHabitualSavingsPlan(
+    householdId: string,
+    plan: { monthlyAmount: number; priorityGoalIds: string[] } | null,
+    actor: UserProfileInput
   ): Promise<void>;
   updateHouseholdName(
     householdId: string,
@@ -476,6 +484,8 @@ export interface HouseholdRepository {
       monthKey: string;
       targetAmount: number;
       allocations: SavingsPlanAllocation[];
+      adjustmentKind?: SavingsPlanAdjustmentKind;
+      extraAmount?: number;
     },
     actor: UserProfileInput
   ): Promise<void>;

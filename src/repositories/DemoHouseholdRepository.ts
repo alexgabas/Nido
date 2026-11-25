@@ -42,7 +42,11 @@ import {
   isValidMonthKey,
   sanitizeSkippedMonths,
 } from '../domain/recurrence';
-import { sanitizeSavingsPlanAllocations } from '../domain/savingsPlan';
+import {
+  sanitizeHabitualSavingsPlan,
+  sanitizeSavingsPlanAllocations,
+} from '../domain/savingsPlan';
+import { sanitizeHouseholdIncomeConfig } from '../domain/incomeProfile';
 import {
   DEFAULT_CHECKLIST_CATALUNYA,
   DEFAULT_FURNITURE_ITEMS,
@@ -79,6 +83,7 @@ import type {
   FurnitureStatus,
   GoalMovement,
   Household,
+  HouseholdIncomeConfig,
   HouseholdMember,
   HouseholdSettings,
   InitialCost,
@@ -90,6 +95,7 @@ import type {
   PendingShoppingCheckout,
   RecurringExpense,
   SavingsGoal,
+  SavingsPlanAdjustmentKind,
   SavingsPlanAllocation,
   ShoppingCatalogItem,
   ShoppingItem,
@@ -890,12 +896,68 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     hid: string,
     settings: HouseholdSettings,
     actor: UserProfileInput,
-    summary: string
+    summary: string,
+    options?: { incomeConfig?: HouseholdIncomeConfig | null }
   ): Promise<void> {
+    const now = new Date().toISOString();
     const { presetA, presetB } = normalizeSplitPair(settings.presetA);
-    this.state.household.settings = { ...settings, presetA, presetB, currency: 'EUR' };
-    this.state.household.updatedAt = new Date().toISOString();
+    this.state.household.settings = {
+      ...settings,
+      presetA,
+      presetB,
+      incomeA: roundCents(Math.max(0, Number(settings.incomeA) || 0)),
+      incomeB: roundCents(Math.max(0, Number(settings.incomeB) || 0)),
+      currency: 'EUR',
+    };
+    if (options && Object.prototype.hasOwnProperty.call(options, 'incomeConfig')) {
+      if (options.incomeConfig === null) {
+        this.state.household.incomeConfig = null;
+      } else if (options.incomeConfig) {
+        const cleanCfg = sanitizeHouseholdIncomeConfig(options.incomeConfig, {
+          incomeA: this.state.household.settings.incomeA,
+          incomeB: this.state.household.settings.incomeB,
+        });
+        this.state.household.incomeConfig = cleanCfg
+          ? { ...cleanCfg, updatedBy: actor.uid, updatedAt: now }
+          : null;
+      }
+    }
+    this.state.household.updatedAt = now;
     this.logActivity(actor, 'update', 'reparto', hid, summary);
+    this.emit();
+  }
+
+  async saveHabitualSavingsPlan(
+    hid: string,
+    plan: { monthlyAmount: number; priorityGoalIds: string[] } | null,
+    actor: UserProfileInput
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    if (plan === null) {
+      this.state.household.habitualSavingsPlan = null;
+      this.state.household.updatedAt = now;
+      this.logActivity(actor, 'delete', 'plan_ahorro', hid, 'Eliminó el plan de ahorro habitual');
+      this.emit();
+      return;
+    }
+    const clean = sanitizeHabitualSavingsPlan({
+      monthlyAmount: plan.monthlyAmount,
+      priorityGoalIds: plan.priorityGoalIds,
+      updatedBy: actor.uid,
+      updatedAt: now,
+    });
+    if (!clean) {
+      throw new Error('Datos inválidos para el plan de ahorro habitual.');
+    }
+    this.state.household.habitualSavingsPlan = clean;
+    this.state.household.updatedAt = now;
+    this.logActivity(
+      actor,
+      'update',
+      'plan_ahorro',
+      hid,
+      `Actualizó el plan de ahorro habitual (${clean.monthlyAmount} €/mes)`
+    );
     this.emit();
   }
 
@@ -1808,6 +1870,8 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       monthKey: string;
       targetAmount: number;
       allocations: SavingsPlanAllocation[];
+      adjustmentKind?: SavingsPlanAdjustmentKind;
+      extraAmount?: number;
     },
     actor: UserProfileInput
   ): Promise<void> {
@@ -1817,6 +1881,14 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     const goalsById = new Map(this.state.goals.map((g) => [g.id, g]));
     const cleanTarget = roundCents(Math.max(0, Number(plan.targetAmount) || 0));
     const cleanAllocations = sanitizeSavingsPlanAllocations(plan.allocations, goalsById);
+    const cleanKind =
+      plan.adjustmentKind === 'ajuste' || plan.adjustmentKind === 'extra'
+        ? plan.adjustmentKind
+        : undefined;
+    const cleanExtra =
+      typeof plan.extraAmount === 'number' && Number.isFinite(plan.extraAmount) && plan.extraAmount > 0
+        ? roundCents(plan.extraAmount)
+        : undefined;
     const isUpdate = Boolean(this.state.savingsPlans[plan.monthKey]);
     this.state.savingsPlans = {
       ...this.state.savingsPlans,
@@ -1824,6 +1896,8 @@ export class DemoHouseholdRepository implements HouseholdRepository {
         monthKey: plan.monthKey,
         targetAmount: cleanTarget,
         allocations: cleanAllocations,
+        ...(cleanKind ? { adjustmentKind: cleanKind } : {}),
+        ...(cleanExtra ? { extraAmount: cleanExtra } : {}),
         updatedBy: actor.uid,
         updatedAt: new Date().toISOString(),
       },
@@ -2368,6 +2442,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
       exportedAt: new Date().toISOString(),
       householdName: this.state.household.name,
       settings: this.state.household.settings,
+      ...(this.state.household.incomeConfig !== undefined
+        ? { incomeConfig: this.state.household.incomeConfig }
+        : {}),
+      ...(this.state.household.habitualSavingsPlan !== undefined
+        ? { habitualSavingsPlan: this.state.household.habitualSavingsPlan }
+        : {}),
       ...(typeof this.state.household.mudanzaCompleted === 'boolean'
         ? {
             mudanzaCompleted: this.state.household.mudanzaCompleted,
@@ -2445,6 +2525,18 @@ export class DemoHouseholdRepository implements HouseholdRepository {
     const now = new Date().toISOString();
     this.state.household.name = backup.householdName;
     this.state.household.settings = backup.settings;
+    if (backup.incomeConfig !== undefined) {
+      this.state.household.incomeConfig =
+        backup.incomeConfig === null
+          ? null
+          : sanitizeHouseholdIncomeConfig(backup.incomeConfig, backup.settings);
+    }
+    if (backup.habitualSavingsPlan !== undefined) {
+      this.state.household.habitualSavingsPlan =
+        backup.habitualSavingsPlan === null
+          ? null
+          : sanitizeHabitualSavingsPlan(backup.habitualSavingsPlan);
+    }
     if (typeof backup.mudanzaCompleted === 'boolean') {
       this.state.household.mudanzaCompleted = backup.mudanzaCompleted;
       this.state.household.mudanzaCompletedAt = backup.mudanzaCompleted
@@ -2572,6 +2664,12 @@ export class DemoHouseholdRepository implements HouseholdRepository {
           monthKey: sp.monthKey,
           targetAmount: roundCents(Math.max(0, Number(sp.targetAmount) || 0)),
           allocations: sanitizeSavingsPlanAllocations(sp.allocations, goalsById),
+          ...(sp.adjustmentKind === 'ajuste' || sp.adjustmentKind === 'extra'
+            ? { adjustmentKind: sp.adjustmentKind }
+            : {}),
+          ...(typeof sp.extraAmount === 'number' && sp.extraAmount > 0
+            ? { extraAmount: roundCents(sp.extraAmount) }
+            : {}),
           updatedBy: sp.updatedBy || actor.uid,
           updatedAt: now,
         };
