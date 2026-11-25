@@ -93,7 +93,8 @@ export function sanitizeExtraPaycheckItem(
   const idRaw = typeof r.id === 'string' && r.id.trim() ? r.id.trim().slice(0, 48) : `extra_${idx + 1}`;
   const labelRaw = typeof r.label === 'string' ? r.label.trim().slice(0, 60) : '';
   const amountNum = Number(r.amount);
-  const amount = Number.isFinite(amountNum) && amountNum >= 0 ? roundCents(amountNum) : 0;
+  const cleanAmount = Number.isFinite(amountNum) && amountNum >= 0 ? roundCents(amountNum) : 0;
+  const amount = cleanAmount === 0 ? 0 : cleanAmount;
   let expectedMonth: number | null = null;
   if (r.expectedMonth !== undefined && r.expectedMonth !== null && r.expectedMonth !== '') {
     const m = Math.round(Number(r.expectedMonth));
@@ -127,7 +128,8 @@ export function sanitizeOtherIncomeItem(
   const idRaw = typeof r.id === 'string' && r.id.trim() ? r.id.trim().slice(0, 48) : `other_${idx + 1}`;
   const conceptRaw = typeof r.concept === 'string' ? r.concept.trim().slice(0, 80) : '';
   const amountNum = Number(r.amount);
-  const amount = Number.isFinite(amountNum) && amountNum >= 0 ? roundCents(amountNum) : 0;
+  const cleanAmount = Number.isFinite(amountNum) && amountNum >= 0 ? roundCents(amountNum) : 0;
+  const amount = cleanAmount === 0 ? 0 : cleanAmount;
   const freqRaw = String(r.frequency ?? 'mensual') as OtherIncomeFrequency;
   const frequency: OtherIncomeFrequency = VALID_FREQS.has(freqRaw) ? freqRaw : 'mensual';
   const kindRaw = String(r.kind ?? 'recurrente') as OtherIncomeKind;
@@ -154,19 +156,21 @@ export function sanitizeMemberIncomeProfile(
   if (!raw || typeof raw !== 'object') return base;
   const r = raw as Record<string, unknown>;
   const mode: MemberIncomeMode = r.mode === 'detallada' ? 'detallada' : 'rapida';
-  const quickMonthlyNet =
+  const rawQuick =
     typeof r.quickMonthlyNet === 'number' && Number.isFinite(r.quickMonthlyNet) && r.quickMonthlyNet >= 0
       ? roundCents(r.quickMonthlyNet)
       : base.quickMonthlyNet;
-  const ordinaryPayAmount =
+  const quickMonthlyNet = rawQuick === 0 ? 0 : rawQuick;
+  const rawOrdinary =
     typeof r.ordinaryPayAmount === 'number' && Number.isFinite(r.ordinaryPayAmount) && r.ordinaryPayAmount >= 0
       ? roundCents(r.ordinaryPayAmount)
       : quickMonthlyNet;
+  const ordinaryPayAmount = rawOrdinary === 0 ? 0 : rawOrdinary;
   const rawCount = Number(r.ordinaryPayCount);
-  const ordinaryPayCount =
-    Number.isFinite(rawCount)
-      ? Math.max(0, Math.min(MAX_ORDINARY_PAY_COUNT, Math.round(rawCount)))
-      : 12;
+  const clampedCount = Number.isFinite(rawCount)
+    ? Math.max(0, Math.min(MAX_ORDINARY_PAY_COUNT, Math.round(rawCount)))
+    : 12;
+  const ordinaryPayCount = clampedCount === 0 ? 0 : clampedCount;
 
   const extraPaychecks: ExtraPaycheckItem[] = Array.isArray(r.extraPaychecks)
     ? r.extraPaychecks

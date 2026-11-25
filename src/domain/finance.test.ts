@@ -112,6 +112,13 @@ import {
   resolveEffectiveMonthlyIncomes,
   sanitizeHouseholdIncomeConfig,
 } from './incomeProfile';
+import {
+  buildSafeFirestoreErrorInfo,
+  FirestoreAppError,
+  formatFirestoreFailureForUser,
+  OperationType,
+  sanitizeFirestorePath,
+} from '../services/firestoreError';
 import { buildRecurringIcsCalendar } from './icsExport';
 import { getDueNotificationsForDevice } from './localNotifications';
 import {
@@ -7841,6 +7848,289 @@ test('63. DemoHouseholdRepository y backup round-trip para incomeConfig, habitua
   unsubP();
   unsubM();
   unsubA();
+});
+
+test('64. Payload serializado de Detallado/Rápido y conservación del desglose al alternar Rápido <-> Detallado', async () => {
+  const demo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const alex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+  let latestHousehold: Household | null = null;
+  const unsub = demo.subscribeHousehold(hid, (h) => {
+    latestHousehold = h;
+  });
+
+  // 1) Payload Detallado exacto: A con 12 x 1.500 + 2 x 1.800 (21.600 €/año = 1.800 €/mes) + otro ingreso opcional
+  const memberA = {
+    ...applyPaycheckPreset(createDefaultMemberIncomeProfile(1500), '14_pagas'),
+    ordinaryPayAmount: 1500,
+    ordinaryPayCount: 12,
+    extraPaychecks: [
+      { id: 'ex_1', label: 'Paga extra verano', amount: 1800, expectedMonth: 6 },
+      { id: 'ex_2', label: 'Paga extra Navidad', amount: 1800, expectedMonth: null },
+    ],
+    otherIncomes: [
+      {
+        id: 'oth_1',
+        concept: '',
+        amount: -0,
+        frequency: 'anual' as const,
+        kind: 'puntual_o_incierto' as const,
+        includeInAnnualEstimate: false,
+      },
+    ],
+  };
+  const memberB = createDefaultMemberIncomeProfile(1200);
+  const sumA = computeMemberIncomeSummary(memberA);
+  const sumB = computeMemberIncomeSummary(memberB);
+  assert.equal(sumA.estimatedAnnualNet, 21600);
+  assert.equal(sumA.monthlyAverageEquivalent, 1800);
+  assert.equal(sumB.monthlyAverageEquivalent, 1200);
+
+  const sanitizedCfg = sanitizeHouseholdIncomeConfig(
+    {
+      memberA,
+      memberB,
+      updatedBy: alex.uid,
+      updatedAt: '2026-11-25T12:00:00.000Z',
+    },
+    { incomeA: sumA.monthlyAverageEquivalent, incomeB: sumB.monthlyAverageEquivalent }
+  );
+  assert.ok(sanitizedCfg);
+  assert.equal(sanitizedCfg.memberA.mode, 'detallada');
+  assert.ok(Number.isInteger(sanitizedCfg.memberA.ordinaryPayCount));
+  assert.ok(!Object.is(sanitizedCfg.memberA.ordinaryPayCount, -0));
+  assert.equal(sanitizedCfg.memberA.extraPaychecks[0].expectedMonth, 6);
+  assert.equal(sanitizedCfg.memberA.extraPaychecks[1].expectedMonth, null);
+  assert.equal(sanitizedCfg.memberA.otherIncomes[0].concept, 'Otro ingreso 1');
+  assert.ok(!Object.is(sanitizedCfg.memberA.otherIncomes[0].amount, -0));
+  assert.deepEqual(Object.keys(sanitizedCfg).sort(), ['memberA', 'memberB', 'updatedAt', 'updatedBy']);
+  assert.deepEqual(Object.keys(sanitizedCfg.memberA).sort(), [
+    'extraPaychecks',
+    'mode',
+    'ordinaryPayAmount',
+    'ordinaryPayCount',
+    'otherIncomes',
+    'quickMonthlyNet',
+  ]);
+
+  await demo.updateSettings(
+    hid,
+    {
+      splitMode: 'income',
+      presetA: 50,
+      presetB: 50,
+      incomeA: sumA.monthlyAverageEquivalent,
+      incomeB: sumB.monthlyAverageEquivalent,
+      currency: 'EUR',
+    },
+    alex,
+    'Actualizó el reparto a 60% / 40% (proporcional a ingresos)',
+    { incomeConfig: sanitizedCfg }
+  );
+
+  const h1 = latestHousehold as Household | null;
+  assert.ok(h1);
+  assert.equal(h1.settings.incomeA, 1800);
+  assert.equal(h1.settings.incomeB, 1200);
+  assert.equal(computeEffectiveSplitPctA(h1.settings), 60);
+
+  // 2) Cambiar A a Rápido (p. ej. 2.000 €) conserva su desglose detallado intacto
+  const switchedQuickA = {
+    ...h1.incomeConfig!.memberA,
+    mode: 'rapida' as const,
+    quickMonthlyNet: 2000,
+  };
+  await demo.updateSettings(
+    hid,
+    {
+      splitMode: 'income',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 2000,
+      incomeB: 1200,
+      currency: 'EUR',
+    },
+    alex,
+    'Actualizó el reparto a 62,5% / 37,5% (proporcional a ingresos)',
+    {
+      incomeConfig: {
+        memberA: switchedQuickA,
+        memberB: h1.incomeConfig!.memberB,
+        updatedBy: alex.uid,
+        updatedAt: '2026-11-25T12:05:00.000Z',
+      },
+    }
+  );
+
+  const afterQuick = (latestHousehold as Household | null)!.incomeConfig!.memberA;
+  assert.equal(afterQuick.mode, 'rapida');
+  assert.equal(afterQuick.quickMonthlyNet, 2000);
+  assert.equal(afterQuick.ordinaryPayAmount, 1500);
+  assert.equal(afterQuick.ordinaryPayCount, 12);
+  assert.equal(afterQuick.extraPaychecks.length, 2);
+  assert.equal(afterQuick.otherIncomes.length, 1);
+
+  unsub();
+});
+
+test('65. Propagación financiera exacta (60/40), respeto a splitOverride, modo manual/preset sin sobrescritura e histórico intacto', async () => {
+  const demo = new DemoHouseholdRepository();
+  const hid = 'demo_hogar_santsadurni';
+  const alex = { uid: 'demo_alex', displayName: 'Alex', photoURL: '' };
+
+  let currentTxs: Transaction[] = [];
+  let currentHousehold: Household | null = null;
+  const unsubH = demo.subscribeHousehold(hid, (h) => {
+    currentHousehold = h;
+  });
+  const unsubT = demo.subscribeTransactionsRecentMonths(hid, alex.uid, '2025-01', (txs) => {
+    currentTxs = txs;
+  });
+
+  const historicalBefore = currentTxs.map((t) => ({ id: t.id, splitPctA: t.splitPctA }));
+  assert.ok(historicalBefore.length > 0);
+
+  // Caso exacto: 1.200 € Cuenta común (900 € según reparto 60/40 + 300 € con splitOverride 50/50)
+  // Verificamos primero reparto uniforme 1.200 € -> 720/480 € y luego respeto a splitOverride
+  const radarUniform = computeCommonAccountRadar(
+    '2027-03',
+    [],
+    [
+      {
+        id: 'rec_uniforme',
+        concept: 'Alquiler',
+        category: 'alquiler',
+        amount: 1200,
+        frequency: 'mensual',
+        dayOfMonth: 1,
+        startMonth: '2027-01',
+        splitOverride: null,
+        paidByDefault: COMMON_ACCOUNT_ID,
+        active: true,
+        createdAt: '2027-01-01T00:00:00.000Z',
+        updatedAt: '2027-01-01T00:00:00.000Z',
+      },
+    ],
+    60
+  );
+  assert.equal(radarUniform.totalMonthlyNeed, 1200);
+  assert.equal(radarUniform.monthlyShareA, 720);
+  assert.equal(radarUniform.monthlyShareB, 480);
+
+  const radarWithOverride = computeCommonAccountRadar(
+    '2027-03',
+    [],
+    [
+      {
+        id: 'rec_base',
+        concept: 'Alquiler',
+        category: 'alquiler',
+        amount: 900,
+        frequency: 'mensual',
+        dayOfMonth: 1,
+        startMonth: '2027-01',
+        splitOverride: null,
+        paidByDefault: COMMON_ACCOUNT_ID,
+        active: true,
+        createdAt: '2027-01-01T00:00:00.000Z',
+        updatedAt: '2027-01-01T00:00:00.000Z',
+      },
+      {
+        id: 'rec_override',
+        concept: 'Garaje a medias',
+        category: 'transporte',
+        amount: 300,
+        frequency: 'mensual',
+        dayOfMonth: 5,
+        startMonth: '2027-01',
+        splitOverride: 50,
+        paidByDefault: COMMON_ACCOUNT_ID,
+        active: true,
+        createdAt: '2027-01-01T00:00:00.000Z',
+        updatedAt: '2027-01-01T00:00:00.000Z',
+      },
+    ],
+    60
+  );
+  // 900 * 60% = 540/360 + 300 * 50% = 150/150 => 690/510 (respeta splitOverride)
+  assert.equal(radarWithOverride.totalMonthlyNeed, 1200);
+  assert.equal(radarWithOverride.monthlyShareA, 690);
+  assert.equal(radarWithOverride.monthlyShareB, 510);
+  assert.equal(radarWithOverride.hasCustomSplitOverrides, true);
+
+  // En modo manual ('custom') o 'preset', actualizar ingresos NO altera el reparto configurado
+  await demo.updateSettings(
+    hid,
+    {
+      splitMode: 'custom',
+      presetA: 70,
+      presetB: 30,
+      incomeA: 1800,
+      incomeB: 1200,
+      currency: 'EUR',
+    },
+    alex,
+    'Actualizó el reparto a 70% / 30% (personalizado)'
+  );
+  assert.equal(computeEffectiveSplitPctA((currentHousehold as Household | null)!.settings), 70);
+
+  await demo.updateSettings(
+    hid,
+    {
+      splitMode: 'preset',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 2400,
+      incomeB: 1200,
+      currency: 'EUR',
+    },
+    alex,
+    'Actualizó el reparto a 50% / 50% (predefinido)'
+  );
+  assert.equal(computeEffectiveSplitPctA((currentHousehold as Household | null)!.settings), 50);
+
+  // Los movimientos históricos conservan intacto su splitPctA original
+  const historicalAfter = new Map(currentTxs.map((t) => [t.id, t.splitPctA]));
+  for (const prev of historicalBefore) {
+    assert.equal(historicalAfter.get(prev.id), prev.splitPctA);
+  }
+
+  unsubH();
+  unsubT();
+});
+
+test('66. Diagnóstico de errores de Firestore sin PII (sin emails, UIDs, JSON auth ni IDs reales de hogar)', () => {
+  const fakeErr = {
+    code: 'permission-denied',
+    message:
+      '7 PERMISSION_DENIED: Missing or insufficient permissions for user alice@example.com in households/hid_secreto_999',
+  };
+  const info = buildSafeFirestoreErrorInfo(
+    fakeErr,
+    OperationType.UPDATE,
+    'households/hid_secreto_999',
+    { isSignedIn: true, emailVerified: true }
+  );
+
+  assert.equal(info.code, 'permission-denied');
+  assert.equal(info.operationType, OperationType.UPDATE);
+  assert.equal(info.path, 'households/{id}');
+  assert.ok(!JSON.stringify(info).includes('alice@example.com'));
+  assert.ok(!JSON.stringify(info).includes('hid_secreto_999'));
+  assert.ok(!('authInfo' in info));
+
+  const appErr = new FirestoreAppError(
+    'No tienes permisos para realizar esta acción o alguno de los datos no es válido.',
+    info
+  );
+  const formatted = formatFirestoreFailureForUser(appErr, 'Fallback');
+  assert.ok(formatted.includes('código: permission-denied'));
+  assert.ok(formatted.includes('operación: update'));
+  assert.ok(formatted.includes('ruta: households/{id}'));
+  assert.ok(!formatted.includes('hid_secreto_999'));
+  assert.ok(!formatted.includes('alice@example.com'));
+  assert.equal(sanitizeFirestorePath('households/abc/activity/xyz'), 'households/{id}/activity/{id}');
 });
 
 

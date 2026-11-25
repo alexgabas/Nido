@@ -367,20 +367,38 @@ export const InicioView: React.FC = () => {
   const handleSaveIncomes = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!household || !householdId || !currentUserProfile) return;
-    const incA = Math.max(0, Number(draftIncomeA.replace(',', '.')) || 0);
-    const incB = Math.max(0, Number(draftIncomeB.replace(',', '.')) || 0);
+    const incA = roundCents(Math.max(0, Number(draftIncomeA.replace(',', '.')) || 0));
+    const incB = roundCents(Math.max(0, Number(draftIncomeB.replace(',', '.')) || 0));
     setSavingIncomes(true);
     setIncomeError(null);
     try {
+      const nextIncomeConfig = household.incomeConfig
+        ? {
+            ...household.incomeConfig,
+            memberA: {
+              ...household.incomeConfig.memberA,
+              mode: 'rapida' as const,
+              quickMonthlyNet: incA,
+            },
+            memberB: {
+              ...household.incomeConfig.memberB,
+              mode: 'rapida' as const,
+              quickMonthlyNet: incB,
+            },
+            updatedBy: currentUserProfile.uid,
+            updatedAt: new Date().toISOString(),
+          }
+        : undefined;
       await repo.updateSettings(
         householdId,
         {
           ...household.settings,
-          incomeA: roundCents(incA),
-          incomeB: roundCents(incB),
+          incomeA: incA,
+          incomeB: incB,
         },
         currentUserProfile,
-        `Actualizó ingresos mensuales (${formatEUR(incA)} / ${formatEUR(incB)})`
+        'Actualizó los ingresos mensuales del hogar',
+        nextIncomeConfig ? { incomeConfig: nextIncomeConfig } : undefined
       );
       setIncomeModalOpen(false);
       showToast('Ingresos guardados');

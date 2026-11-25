@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Plus, Trash2 } from 'lucide-react';
 import { formatEUR } from '../../domain/finance';
 import {
@@ -48,6 +48,14 @@ export const DetailedIncomeEditor: React.FC<DetailedIncomeEditorProps> = ({
 }) => {
   const summary = computeMemberIncomeSummary(profile, profile.quickMonthlyNet);
   const inputIdPrefix = `income-${memberKey}`;
+  const [quickInputText, setQuickInputText] = useState(() => numToInputStr(profile.quickMonthlyNet));
+  const quickFocusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!quickFocusedRef.current) {
+      setQuickInputText(numToInputStr(profile.quickMonthlyNet));
+    }
+  }, [profile.quickMonthlyNet, profile.mode]);
 
   const handleModeChange = (mode: MemberIncomeMode) => {
     if (mode === profile.mode) return;
@@ -198,14 +206,22 @@ export const DetailedIncomeEditor: React.FC<DetailedIncomeEditorProps> = ({
             id={inputIdPrefix}
             type="text"
             inputMode="decimal"
-            defaultValue={numToInputStr(profile.quickMonthlyNet)}
-            key={`${inputIdPrefix}-quick-${profile.mode}`}
-            onChange={(e) =>
+            value={quickInputText}
+            onFocus={() => {
+              quickFocusedRef.current = true;
+            }}
+            onBlur={() => {
+              quickFocusedRef.current = false;
+              setQuickInputText(numToInputStr(profile.quickMonthlyNet));
+            }}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setQuickInputText(raw);
               onChange({
                 ...profile,
-                quickMonthlyNet: parseNonNegDecimal(e.target.value),
-              })
-            }
+                quickMonthlyNet: parseNonNegDecimal(raw),
+              });
+            }}
             placeholder="Ej. 1800"
             className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-num text-base font-semibold"
           />

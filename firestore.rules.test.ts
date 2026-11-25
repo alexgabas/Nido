@@ -2964,6 +2964,224 @@ test('28. incomeConfig, habitualSavingsPlan y savingsPlans (ajuste/extra): valid
   );
 });
 
+// ─── 29. writeBatch exacto de updateSettings (Rápido <-> Detallado + activity) ─
+test('29. updateSettings writeBatch exacto (Rápido -> Detallado, expectedMonth null/1..12, otherIncomes, Detallado -> Rápido) y rechazos', async () => {
+  await seedHouseholdPhaseA('uid_alex', 'h1', 'INC29B');
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  const dbAlex = dbForUser('uid_alex', true);
+  const dbMarta = dbForUser('uid_marta', true);
+  const dbIntruder = dbForUser('uid_intruder', true);
+  const dbAnon = testEnv.unauthenticatedContext().firestore();
+
+  const joinBatch = dbMarta.batch();
+  joinBatch.set(dbMarta.doc('users/uid_marta'), {
+    householdId: 'h1',
+    updatedAt: ts,
+  });
+  joinBatch.set(dbMarta.doc('households/h1/members/uid_marta'), {
+    displayName: 'Marta',
+    photoURL: '',
+    role: 'member_b',
+    uiMode: 'sencillo',
+    joinedAt: ts,
+    updatedAt: ts,
+  });
+  joinBatch.update(dbMarta.doc('households/h1'), {
+    memberUids: ['uid_alex', 'uid_marta'],
+    updatedAt: ts,
+  });
+  await assertSucceeds(joinBatch.commit());
+
+  // 1) Rápido inicial
+  const rapidBatch = dbAlex.batch();
+  rapidBatch.update(dbAlex.doc('households/h1'), {
+    settings: {
+      splitMode: 'income',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 1500,
+      incomeB: 1200,
+      currency: 'EUR',
+    },
+    incomeConfig: {
+      memberA: {
+        mode: 'rapida',
+        quickMonthlyNet: 1500,
+        ordinaryPayAmount: 1500,
+        ordinaryPayCount: 12,
+        extraPaychecks: [],
+        otherIncomes: [],
+      },
+      memberB: {
+        mode: 'rapida',
+        quickMonthlyNet: 1200,
+        ordinaryPayAmount: 1200,
+        ordinaryPayCount: 12,
+        extraPaychecks: [],
+        otherIncomes: [],
+      },
+      updatedBy: 'uid_alex',
+      updatedAt: '2026-11-25T13:00:00.000Z',
+    },
+    updatedAt: ts,
+  });
+  rapidBatch.set(dbAlex.doc('households/h1/activity/act_r1'), {
+    uid: 'uid_alex',
+    actorName: 'Alex',
+    action: 'update',
+    entity: 'reparto',
+    entityId: 'h1',
+    summary: 'Actualizó el reparto a 55,6% / 44,4% (proporcional a ingresos)',
+    timestamp: ts,
+  });
+  await assertSucceeds(rapidBatch.commit());
+
+  // 2) Rápido -> Detallado exacto (12x1500 + 2x1800 = 1800/mes, B=1200/mes -> 60/40) + expectedMonth null y 1..12 + otherIncomes
+  const detailedConfig = {
+    memberA: {
+      mode: 'detallada',
+      quickMonthlyNet: 1500,
+      ordinaryPayAmount: 1500,
+      ordinaryPayCount: 12,
+      extraPaychecks: [
+        { id: 'extra_verano', label: 'Paga extra verano', amount: 1800, expectedMonth: 6 },
+        { id: 'extra_navidad', label: 'Paga extra Navidad', amount: 1800, expectedMonth: null },
+      ],
+      otherIncomes: [
+        {
+          id: 'other_1',
+          concept: 'Bonus anual',
+          amount: 0,
+          frequency: 'anual',
+          kind: 'puntual_o_incierto',
+          includeInAnnualEstimate: false,
+        },
+      ],
+    },
+    memberB: {
+      mode: 'rapida',
+      quickMonthlyNet: 1200,
+      ordinaryPayAmount: 1200,
+      ordinaryPayCount: 12,
+      extraPaychecks: [],
+      otherIncomes: [],
+    },
+    updatedBy: 'uid_alex',
+    updatedAt: '2026-11-25T13:05:00.000Z',
+  };
+  const detailedBatch = dbAlex.batch();
+  detailedBatch.update(dbAlex.doc('households/h1'), {
+    settings: {
+      splitMode: 'income',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 1800,
+      incomeB: 1200,
+      currency: 'EUR',
+    },
+    incomeConfig: detailedConfig,
+    updatedAt: ts,
+  });
+  detailedBatch.set(dbAlex.doc('households/h1/activity/act_d1'), {
+    uid: 'uid_alex',
+    actorName: 'Alex',
+    action: 'update',
+    entity: 'reparto',
+    entityId: 'h1',
+    summary: 'Actualizó el reparto a 60% / 40% (proporcional a ingresos)',
+    timestamp: ts,
+  });
+  await assertSucceeds(detailedBatch.commit());
+
+  // 3) Detallado -> Rápido conservando desglose detallado y cambiando a preset 50/50
+  const backToQuickBatch = dbMarta.batch();
+  backToQuickBatch.update(dbMarta.doc('households/h1'), {
+    settings: {
+      splitMode: 'preset',
+      presetA: 50,
+      presetB: 50,
+      incomeA: 2000,
+      incomeB: 1200,
+      currency: 'EUR',
+    },
+    incomeConfig: {
+      ...detailedConfig,
+      memberA: {
+        ...detailedConfig.memberA,
+        mode: 'rapida',
+        quickMonthlyNet: 2000,
+      },
+      updatedBy: 'uid_marta',
+      updatedAt: '2026-11-25T13:10:00.000Z',
+    },
+    updatedAt: ts,
+  });
+  backToQuickBatch.set(dbMarta.doc('households/h1/activity/act_q2'), {
+    uid: 'uid_marta',
+    actorName: 'Marta',
+    action: 'update',
+    entity: 'reparto',
+    entityId: 'h1',
+    summary: 'Actualizó el reparto a 50% / 50% (predefinido)',
+    timestamp: ts,
+  });
+  await assertSucceeds(backToQuickBatch.commit());
+
+  // 4) Rechazos obligatorios: no miembro, no autenticado, updatedBy suplantado, expectedMonth inválido, ordinaryPayCount decimal, presetA+presetB!=100
+  await assertFails(
+    dbIntruder.doc('households/h1').update({
+      incomeConfig: { ...detailedConfig, updatedBy: 'uid_intruder' },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAnon.doc('households/h1').update({
+      incomeConfig: detailedConfig,
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbMarta.doc('households/h1').update({
+      incomeConfig: { ...detailedConfig, updatedBy: 'uid_alex' },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      incomeConfig: {
+        ...detailedConfig,
+        memberA: {
+          ...detailedConfig.memberA,
+          extraPaychecks: [{ id: 'ex_bad', label: 'Extra', amount: 1000, expectedMonth: 13 }],
+        },
+      },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      incomeConfig: {
+        ...detailedConfig,
+        memberA: { ...detailedConfig.memberA, ordinaryPayCount: 12.5 },
+      },
+      updatedAt: ts,
+    })
+  );
+  await assertFails(
+    dbAlex.doc('households/h1').update({
+      settings: {
+        splitMode: 'custom',
+        presetA: 60,
+        presetB: 30,
+        incomeA: 1800,
+        incomeB: 1200,
+        currency: 'EUR',
+      },
+      updatedAt: ts,
+    })
+  );
+});
+
 
 
 

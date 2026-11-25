@@ -137,17 +137,23 @@ async function run() {
     await dPage.getByRole('button', { name: /Ajustes/i }).click();
     await dPage.locator('[data-testid="income-editor-a"]').waitFor({ state: 'visible', timeout: 8000 });
 
+    // Seleccionar reparto "Por salario" para verificar propagación proporcional 60/40
+    await dPage.getByRole('button', { name: 'Por salario', exact: true }).click();
+
     const editorA = dPage.locator('[data-testid="income-editor-a"]');
+    const editorB = dPage.locator('[data-testid="income-editor-b"]');
     await editorA.getByRole('button', { name: 'Detallada' }).click();
     await editorA.getByRole('button', { name: /14 pagas \(12 ordinarias \+ 2 extras\)/i }).click();
 
-    // Fijar 1.500 € en paga ordinaria y verificar resumen anual + equivalente mensual
+    // Fijar 12 x 1.500 € + 2 x 1.800 € = 21.600 €/año = 1.800,00 €/mes; B = 1.200 €/mes Rápido => 60/40
     await editorA.getByLabel(/Importe neto de 1 paga ordinaria/i).fill('1500');
-    await editorA.getByLabel(/Importe neto paga extra 1/i).fill('1400');
-    await editorA.getByLabel(/Importe neto paga extra 2/i).fill('1600');
-    // 18.000 + 3.000 = 21.000 €/año = 1.750,00 €/mes
-    await editorA.getByText(/21\.000,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
-    await editorA.getByText(/1\.750,00\s*€\/mes/i).waitFor({ state: 'visible', timeout: 5000 });
+    await editorA.getByLabel(/Importe neto paga extra 1/i).fill('1800');
+    await editorA.getByLabel(/Importe neto paga extra 2/i).fill('1800');
+    await editorA.getByText(/21\.600,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
+    await editorA.getByText(/1\.800,00\s*€\/mes/i).waitFor({ state: 'visible', timeout: 5000 });
+
+    await editorB.getByRole('button', { name: 'Rápida' }).click();
+    await editorB.locator('#income-b').fill('1200');
 
     // Añadir un otro ingreso puntual/incierto -> excluido por defecto del reparto
     await editorA.getByRole('button', { name: /Añadir otro ingreso/i }).click();
@@ -155,8 +161,11 @@ async function run() {
     await editorA.getByLabel(/Importe otro ingreso 1/i).fill('1200');
     await editorA.getByLabel(/Frecuencia otro ingreso 1/i).selectOption('anual');
     await editorA.getByLabel(/Tipo otro ingreso 1/i).selectOption('puntual_o_incierto');
-    // Sigue en 21.000 € / 1.750 € porque es incierto y no está incluido
-    await editorA.getByText(/1\.750,00\s*€\/mes/i).waitFor({ state: 'visible', timeout: 5000 });
+    // Sigue en 21.600 € / 1.800 € porque es incierto y no está incluido
+    await editorA.getByText(/1\.800,00\s*€\/mes/i).waitFor({ state: 'visible', timeout: 5000 });
+
+    // Vista previa 60 € / 40 € antes de guardar
+    await dPage.getByText(/De cada 100 €, 60 € .* \/ 40 € /i).waitFor({ state: 'visible', timeout: 5000 });
 
     // Guardar configuración de ingresos y reparto
     await dPage.getByRole('button', { name: 'Guardar reparto', exact: true }).click();
@@ -185,11 +194,11 @@ async function run() {
     const planSection = dPage.locator('[data-testid="monthly-savings-plan-section"]');
     await planSection.getByText(/Propuesta del plan habitual/i).waitFor({ state: 'visible', timeout: 5000 });
 
-    // Bloque 3 (Avanzado): Cuánto pone cada uno muestra ambos bloques separados con el plan habitual de 300 €
+    // Bloque 3 (Avanzado): Cuánto pone cada uno muestra ambos bloques separados con 300 € al 60/40 (180,00 € / 120,00 €)
     await dPage.locator('[data-testid="contribution-expenses-block"]').waitFor({ state: 'visible', timeout: 5000 });
     const savingsCardText = await dPage.locator('[data-testid="contribution-savings-block"]').innerText();
-    if (!/300,00\s*€/i.test(savingsCardText)) {
-      throw new Error(`Bloque ahorro debía mostrar 300,00 € del plan habitual. Texto:\n${savingsCardText}`);
+    if (!/300,00\s*€/i.test(savingsCardText) || !/180,00\s*€/.test(savingsCardText) || !/120,00\s*€/.test(savingsCardText)) {
+      throw new Error(`Bloque ahorro debía mostrar 300,00 € repartidos 180,00 € / 120,00 € (60/40). Texto:\n${savingsCardText}`);
     }
 
     // Bloque 5A: «Añadir ahorro extra» (+200 € a Viajes) -> previsualización Antes -> Después sin doble conteo (300 -> 500)
@@ -227,6 +236,19 @@ async function run() {
     const historyHeadingAfter = await dPage.getByRole('heading', { name: /Historial de movimientos \(\d+\)/i }).innerText();
     if (historyHeadingBefore !== historyHeadingAfter) {
       throw new Error(`Volver al plan habitual no debe borrar movimientos: antes="${historyHeadingBefore}", después="${historyHeadingAfter}"`);
+    }
+
+    // Bloque 6 extra: Volver a Ajustes y confirmar persistencia de Detallado + conservación del desglose al alternar Rápida <-> Detallada
+    await dPage.getByRole('button', { name: /Menú de /i }).click();
+    await dPage.getByRole('button', { name: /Ajustes/i }).click();
+    const editorARecheck = dPage.locator('[data-testid="income-editor-a"]');
+    await editorARecheck.waitFor({ state: 'visible', timeout: 8000 });
+    await editorARecheck.getByText(/21\.600,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
+    await editorARecheck.getByRole('button', { name: 'Rápida' }).click();
+    await editorARecheck.getByRole('button', { name: 'Detallada' }).click();
+    await editorARecheck.getByText(/21\.600,00\s*€/i).waitFor({ state: 'visible', timeout: 5000 });
+    if ((await editorARecheck.getByLabel(/Concepto otro ingreso 1/i).inputValue()) !== 'Bonus anual') {
+      throw new Error('Al alternar Rápida <-> Detallada se debía conservar el otro ingreso guardado');
     }
 
     if (dErrors.length > 0) {

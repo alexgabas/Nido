@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
   Archive,
   Bell,
   Check,
@@ -64,7 +65,7 @@ import {
 } from '../domain/incomeProfile';
 import { SPLIT_PRESETS } from '../domain/presets';
 import { HouseholdSwitchConfirmationRequiredError } from '../repositories/HouseholdRepository';
-import { toUserFriendlyErrorMessage } from '../services/firebase';
+import { formatFirestoreFailureForUser, toUserFriendlyErrorMessage } from '../services/firebase';
 import { loadAndExportNidoPDF } from '../services/pdfExportLoader';
 import type {
   HouseholdIncomeConfig,
@@ -121,6 +122,11 @@ export const AjustesView: React.FC = () => {
   const [colorModalOpen, setColorModalOpen] = useState(false);
   const [completeMudanzaConfirmOpen, setCompleteMudanzaConfirmOpen] = useState(false);
   const [togglingMudanzaStage, setTogglingMudanzaStage] = useState(false);
+  const [savingSplit, setSavingSplit] = useState(false);
+  const [splitSaveError, setSplitSaveError] = useState<string | null>(null);
+  const hydratedHouseholdIdRef = useRef<string | null>(null);
+  const splitDirtyRef = useRef(false);
+  const nameDirtyRef = useRef(false);
 
   const mudanzaCompleted = isMudanzaCompleted(household);
   const pendingMudanzaCounts = countPendingMudanzaItems(furnitureItems, checklist);
@@ -195,14 +201,25 @@ export const AjustesView: React.FC = () => {
 
   useEffect(() => {
     if (!household) return;
-    setSplitMode(household.settings.splitMode);
-    setPresetA(household.settings.presetA);
-    const resolvedConfig =
-      sanitizeHouseholdIncomeConfig(household.incomeConfig, household.settings) ??
-      createDefaultHouseholdIncomeConfig(household.settings);
-    setIncomeProfileA(resolvedConfig.memberA);
-    setIncomeProfileB(resolvedConfig.memberB);
-    setHouseholdName(household.name);
+    const householdChanged = hydratedHouseholdIdRef.current !== household.id;
+    if (householdChanged) {
+      hydratedHouseholdIdRef.current = household.id;
+      splitDirtyRef.current = false;
+      nameDirtyRef.current = false;
+      setSplitSaveError(null);
+    }
+    if (householdChanged || !splitDirtyRef.current) {
+      setSplitMode(household.settings.splitMode);
+      setPresetA(household.settings.presetA);
+      const resolvedConfig =
+        sanitizeHouseholdIncomeConfig(household.incomeConfig, household.settings) ??
+        createDefaultHouseholdIncomeConfig(household.settings);
+      setIncomeProfileA(resolvedConfig.memberA);
+      setIncomeProfileB(resolvedConfig.memberB);
+    }
+    if (householdChanged || !nameDirtyRef.current) {
+      setHouseholdName(household.name);
+    }
   }, [household]);
 
   const incomeSummaryA = computeMemberIncomeSummary(incomeProfileA, incomeProfileA.quickMonthlyNet);
@@ -231,22 +248,39 @@ export const AjustesView: React.FC = () => {
   const nameB = memberB?.displayName?.split(' ')[0] || 'tu pareja';
 
   const handleSaveSplit = async () => {
-    if (!householdId || !currentUserProfile) return;
+    if (!householdId || !currentUserProfile || savingSplit) return;
+    setSavingSplit(true);
+    setSplitSaveError(null);
     try {
-      const nextIncomeConfig: HouseholdIncomeConfig = {
+      const rawIncomeConfig: HouseholdIncomeConfig = {
         memberA: incomeProfileA,
         memberB: incomeProfileB,
         updatedBy: currentUserProfile.uid,
         updatedAt: new Date().toISOString(),
       };
+      const nextIncomeConfig =
+        sanitizeHouseholdIncomeConfig(rawIncomeConfig, {
+          incomeA: draftSettings.incomeA,
+          incomeB: draftSettings.incomeB,
+        }) ?? rawIncomeConfig;
       // Privacidad: nunca registrar cifras ni desglose de ingresos en el log de actividad
       const summary = `Actualizó el reparto a ${previewPctA}% / ${previewPctB}% (${splitMode === 'income' ? 'proporcional a ingresos' : splitMode === 'preset' ? 'predefinido' : 'personalizado'})`;
       await repo.updateSettings(householdId, draftSettings, currentUserProfile, summary, {
         incomeConfig: nextIncomeConfig,
       });
+      setIncomeProfileA(nextIncomeConfig.memberA);
+      setIncomeProfileB(nextIncomeConfig.memberB);
+      splitDirtyRef.current = false;
       showToast('Ingresos y reparto guardados y sincronizados');
     } catch (err) {
-      showToast(toUserFriendlyErrorMessage(err, 'No se pudo guardar el reparto. Inténtalo de nuevo.'));
+      const safeError = formatFirestoreFailureForUser(
+        err,
+        'No se pudo guardar el reparto. Inténtalo de nuevo.'
+      );
+      setSplitSaveError(safeError);
+      showToast(safeError);
+    } finally {
+      setSavingSplit(false);
     }
   };
 
@@ -255,6 +289,7 @@ export const AjustesView: React.FC = () => {
     if (!householdId || !currentUserProfile || !householdName.trim()) return;
     try {
       await repo.updateHouseholdName(householdId, householdName.trim(), currentUserProfile);
+      nameDirtyRef.current = false;
       showToast('Nombre del hogar actualizado');
     } catch (err) {
       showToast(toUserFriendlyErrorMessage(err, 'No se pudo actualizar el nombre del hogar.'));
@@ -493,6 +528,8 @@ export const AjustesView: React.FC = () => {
                 key={tab.id}
                 type="button"
                 onClick={() => {
+                  splitDirtyRef.current = true;
+                  setSplitSaveError(null);
                   setSplitMode(tab.id);
                   if (tab.id === 'preset' && !SPLIT_PRESETS.some((p) => p.a === presetA)) {
                     setPresetA(50);
@@ -517,7 +554,11 @@ export const AjustesView: React.FC = () => {
                   <button
                     key={p.label}
                     type="button"
-                    onClick={() => setPresetA(p.a)}
+                    onClick={() => {
+                      splitDirtyRef.current = true;
+                      setSplitSaveError(null);
+                      setPresetA(p.a);
+                    }}
                     className={`min-h-[44px] rounded-xl text-sm font-bold tabular-nums border transition-colors ${
                       active
                         ? 'border-[#0E5A64] bg-[#0E5A64] text-white'
@@ -548,7 +589,11 @@ export const AjustesView: React.FC = () => {
                 max={100}
                 step={0.5}
                 value={presetA}
-                onChange={(e) => setPresetA(Number(e.target.value))}
+                onChange={(e) => {
+                  splitDirtyRef.current = true;
+                  setSplitSaveError(null);
+                  setPresetA(Number(e.target.value));
+                }}
                 className="w-full accent-[#0E5A64]"
               />
             </div>
@@ -571,13 +616,21 @@ export const AjustesView: React.FC = () => {
                 memberKey="a"
                 memberName={nameA}
                 profile={incomeProfileA}
-                onChange={setIncomeProfileA}
+                onChange={(next) => {
+                  splitDirtyRef.current = true;
+                  setSplitSaveError(null);
+                  setIncomeProfileA(next);
+                }}
               />
               <DetailedIncomeEditor
                 memberKey="b"
                 memberName={nameB}
                 profile={incomeProfileB}
-                onChange={setIncomeProfileB}
+                onChange={(next) => {
+                  splitDirtyRef.current = true;
+                  setSplitSaveError(null);
+                  setIncomeProfileB(next);
+                }}
               />
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
@@ -617,12 +670,24 @@ export const AjustesView: React.FC = () => {
             </p>
           </div>
 
+          {splitSaveError && (
+            <div
+              role="alert"
+              data-testid="split-save-error"
+              className="rounded-xl bg-[#B42318]/10 border border-[#B42318]/30 text-[#B42318] dark:text-[#FCA5A5] px-3.5 py-3 text-xs font-medium flex items-start gap-2"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{splitSaveError}</span>
+            </div>
+          )}
+
           <button
             type="button"
+            disabled={savingSplit}
             onClick={() => void handleSaveSplit()}
-            className="w-full sm:w-auto min-h-[44px] px-6 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] text-white text-sm font-semibold transition-colors"
+            className="w-full sm:w-auto min-h-[44px] px-6 rounded-xl bg-[#0E5A64] hover:bg-[#0A464E] disabled:opacity-50 text-white text-sm font-semibold transition-colors"
           >
-            Guardar reparto
+            {savingSplit ? 'Guardando...' : 'Guardar reparto'}
           </button>
         </section>
 
@@ -780,7 +845,10 @@ export const AjustesView: React.FC = () => {
                 type="text"
                 maxLength={80}
                 value={householdName}
-                onChange={(e) => setHouseholdName(e.target.value)}
+                onChange={(e) => {
+                  nameDirtyRef.current = true;
+                  setHouseholdName(e.target.value);
+                }}
                 className="flex-1 min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
               />
               <button
